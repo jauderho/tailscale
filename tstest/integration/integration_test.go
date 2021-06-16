@@ -317,62 +317,64 @@ func TestTwoNodeConnectivity(t *testing.T) {
 	n2.AwaitRunning(t)
 	if err := tstest.WaitFor(20*time.Second, func() error {
 		const sub = `SOCK-TEST : `
+		logStr := env.LogCatcher.logsString()
+
 		if !env.LogCatcher.logsContains(mem.S(sub)) {
 			return fmt.Errorf("log catcher didn't see %#q; got %s", sub, env.LogCatcher.logsString())
 		}
+
+		firstIndex := env.LogCatcher.logsIndex(mem.S(sub))
+		secondIndex := env.LogCatcher.logsIndexLast(mem.S(sub))
+
+		if firstIndex == -1 {
+			return fmt.Errorf("cold not find tcp listener")
+		}
+
+		if secondIndex == -1 {
+			return fmt.Errorf("cold not find tcp listener for second node")
+		}
+
+		if firstIndex == secondIndex {
+			return fmt.Errorf("exected %d TCP listeners, got %d", 2, strings.Count(logStr, sub))
+		}
+
+		// Takes the index and tries to seek and obtain a proper netaddr with PORT.
+		retrieveAddressFromString := func(logString string, index int) (netaddr.IPPort, error) {
+			firstAddrSplit := strings.Fields(logString[index+len(sub) : index+len(sub)+20])
+
+			if len(firstAddrSplit) == 0 {
+				err := fmt.Errorf("could not parse the tcp listener address from %v", firstAddrSplit)
+				return netaddr.IPPort{}, err
+			}
+			// Build the proper address for parsing
+			addr := ""
+			for _, c := range firstAddrSplit[0] {
+				if unicode.IsDigit(c) || c == '.' || c == ':' {
+					addr += string(c)
+				}
+			}
+			t.Logf("Processed address : %v", addr)
+			return netaddr.ParseIPPort(addr)
+		}
+
+		n1Addr, err := retrieveAddressFromString(logStr, firstIndex)
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+
+		n2Addr, err := retrieveAddressFromString(logStr, secondIndex)
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+
+		t.Logf("Node 1 TCP Listener : %v, Node 2 TCP Listener : %v\n", n1Addr, n2Addr)
 		return nil
 	}); err != nil {
 		t.Error(err)
 	}
-	logStr := env.LogCatcher.logsString()
-	targetString := "SOCK-TEST : "
-	t.Logf("logStr: %v\n", logStr)
-	firstIndex := strings.Index(logStr, targetString)
-	secondIndex := strings.LastIndex(logStr, targetString)
 
-	if firstIndex == -1 {
-		t.Errorf("could not find tcp listener")
-	}
-
-	if secondIndex == -1 {
-		t.Errorf("could not find tcp listener for second node")
-	}
-
-	if firstIndex == secondIndex {
-		t.Errorf("expected %d TCP listeners, got 1", 2)
-	}
-
-	// t.Logf("First index : %d, Second Index : %d\n", firstIndex, secondIndex)
-	// Find the proper addresses for the TCP listeners.
-	retrieveAddressFromString := func(logString string, index int) (netaddr.IPPort, error) {
-		// r := regexp.MustCompile("[0-9]{3}.[0-9]{3}.[0-9]{3}.[0-9]{3}:[0-9]{5}")
-		firstAddrSplit := strings.Fields(logString[index+len(targetString) : index+len(targetString)+20])
-
-		if len(firstAddrSplit) == 0 {
-			err := errors.New(fmt.Sprintf("could not parse the tcp listener address from %v", firstAddrSplit))
-			return netaddr.IPPort{}, err
-		}
-		addr := ""
-		for _, c := range firstAddrSplit[0] {
-			if unicode.IsDigit(c) || c == '.' || c == ':' {
-				addr += string(c)
-			}
-		}
-		t.Log("FOUND: ", addr)
-
-		return netaddr.ParseIPPort(firstAddrSplit[0])
-	}
-
-	n1Addr, err := retrieveAddressFromString(logStr, firstIndex)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	n2Addr, err := retrieveAddressFromString(logStr, secondIndex)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("Node 1 TCP Listener : %v, Node 2 TCP Listener : %v\n", n1Addr, n2Addr)
+	d1.MustCleanShutdown(t)
+	d2.MustCleanShutdown(t)
 }
 
 // testEnv contains the test environment (set of servers) used by one
@@ -695,6 +697,18 @@ func (lc *logCatcher) logsContains(sub mem.RO) bool {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	return mem.Contains(mem.B(lc.buf.Bytes()), sub)
+}
+
+func (lc *logCatcher) logsIndex(sub mem.RO) int {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return mem.Index(mem.B(lc.buf.Bytes()), sub)
+}
+
+func (lc *logCatcher) logsIndexLast(sub mem.RO) int {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return mem.LastIndex(mem.B(lc.buf.Bytes()), sub)
 }
 
 func (lc *logCatcher) numRequests() int {

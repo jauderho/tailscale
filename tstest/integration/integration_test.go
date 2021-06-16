@@ -26,8 +26,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
 
 	"go4.org/mem"
+<<<<<<< HEAD
+=======
+	"inet.af/netaddr"
+	"tailscale.com/derp"
+	"tailscale.com/derp/derphttp"
+>>>>>>> daf4917a42... increased tests
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
@@ -286,6 +293,88 @@ func TestAddPingRequest(t *testing.T) {
 	t.Error("all ping attempts failed")
 }
 
+func TestTwoNodeConnectivity(t *testing.T) {
+	t.Parallel()
+	bins := BuildTestBinaries(t)
+
+	env := newTestEnv(t, bins)
+	defer env.Close()
+
+	// Create two nodes:
+	n1 := newTestNode(t, env)
+	d1 := n1.StartDaemon(t)
+	defer d1.Kill()
+
+	n2 := newTestNode(t, env)
+	d2 := n2.StartDaemon(t)
+	defer d2.Kill()
+
+	n1.AwaitListening(t)
+	n2.AwaitListening(t)
+	n1.MustUp()
+	n2.MustUp()
+	n1.AwaitRunning(t)
+	n2.AwaitRunning(t)
+	if err := tstest.WaitFor(20*time.Second, func() error {
+		const sub = `SOCK-TEST : `
+		if !env.LogCatcher.logsContains(mem.S(sub)) {
+			return fmt.Errorf("log catcher didn't see %#q; got %s", sub, env.LogCatcher.logsString())
+		}
+		return nil
+	}); err != nil {
+		t.Error(err)
+	}
+	logStr := env.LogCatcher.logsString()
+	targetString := "SOCK-TEST : "
+	t.Logf("logStr: %v\n", logStr)
+	firstIndex := strings.Index(logStr, targetString)
+	secondIndex := strings.LastIndex(logStr, targetString)
+
+	if firstIndex == -1 {
+		t.Errorf("could not find tcp listener")
+	}
+
+	if secondIndex == -1 {
+		t.Errorf("could not find tcp listener for second node")
+	}
+
+	if firstIndex == secondIndex {
+		t.Errorf("expected %d TCP listeners, got 1", 2)
+	}
+
+	// t.Logf("First index : %d, Second Index : %d\n", firstIndex, secondIndex)
+	// Find the proper addresses for the TCP listeners.
+	retrieveAddressFromString := func(logString string, index int) (netaddr.IPPort, error) {
+		// r := regexp.MustCompile("[0-9]{3}.[0-9]{3}.[0-9]{3}.[0-9]{3}:[0-9]{5}")
+		firstAddrSplit := strings.Fields(logString[index+len(targetString) : index+len(targetString)+20])
+
+		if len(firstAddrSplit) == 0 {
+			err := errors.New(fmt.Sprintf("could not parse the tcp listener address from %v", firstAddrSplit))
+			return netaddr.IPPort{}, err
+		}
+		addr := ""
+		for _, c := range firstAddrSplit[0] {
+			if unicode.IsDigit(c) || c == '.' || c == ':' {
+				addr += string(c)
+			}
+		}
+		t.Log("FOUND: ", addr)
+
+		return netaddr.ParseIPPort(firstAddrSplit[0])
+	}
+
+	n1Addr, err := retrieveAddressFromString(logStr, firstIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n2Addr, err := retrieveAddressFromString(logStr, secondIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Node 1 TCP Listener : %v, Node 2 TCP Listener : %v\n", n1Addr, n2Addr)
+}
+
 // testEnv contains the test environment (set of servers) used by one
 // or more nodes.
 type testEnv struct {
@@ -487,7 +576,7 @@ func (n *testNode) StartDaemon(t testing.TB) *Daemon {
 		"--tun=userspace-networking",
 		"--state="+n.stateFile,
 		"--socket="+n.sockFile,
-		"--socks5-server=localhost:0",
+		"--socks5-server="+"localhost:0",
 	)
 	cmd.Env = append(os.Environ(),
 		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,

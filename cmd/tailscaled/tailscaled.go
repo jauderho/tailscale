@@ -221,6 +221,8 @@ func run() error {
 	if args.socksAddr != "" {
 		var err error
 		socksListener, err = net.Listen("tcp", args.socksAddr)
+		// log.Println("SIMENG-TEST : ", socksListener.Addr())
+		logf("SOCK-TEST : %v\n", socksListener.Addr())
 		if err != nil {
 			log.Fatalf("SOCKS5 listener: %v", err)
 		}

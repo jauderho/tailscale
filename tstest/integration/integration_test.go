@@ -302,12 +302,13 @@ func TestTwoNodeConnectivity(t *testing.T) {
 
 	if err := tstest.WaitFor(20*time.Second, func() error {
 		// Create two nodes and hope that logs come out correctly
+		socks5Arg := "--socks5-server=" + "localhost:0"
 		n1 := newTestNode(t, env)
-		d1 := n1.StartDaemon(t)
+		d1 := n1.StartDaemon(t, socks5Arg)
 		defer d1.Kill()
 
 		n2 := newTestNode(t, env)
-		d2 := n2.StartDaemon(t)
+		d2 := n2.StartDaemon(t, socks5Arg)
 		defer d2.Kill()
 
 		n1.AwaitListening(t)
@@ -586,13 +587,27 @@ func (d *Daemon) MustCleanShutdown(t testing.TB) {
 
 // StartDaemon starts the node's tailscaled, failing if it fails to
 // start.
-func (n *testNode) StartDaemon(t testing.TB) *Daemon {
-	cmd := exec.Command(n.env.Binaries.Daemon,
-		"--tun=userspace-networking",
-		"--state="+n.stateFile,
-		"--socket="+n.sockFile,
-		"--socks5-server="+"localhost:0",
-	)
+// Additional flags to tailscaled can be passed through specialArgs
+func (n *testNode) StartDaemon(t testing.TB, specialArgs ...string) *Daemon {
+	var cmd *exec.Cmd
+	// Support additional flags in starting up tailscaled
+	if len(specialArgs) > 0 {
+		flags := []string{
+			"--tun=userspace-networking",
+			"--state=" + n.stateFile,
+			"--socket=" + n.sockFile,
+		}
+		flags = append(flags, specialArgs...)
+
+		cmd = exec.Command(n.env.Binaries.Daemon, flags...)
+	} else {
+		cmd = exec.Command(n.env.Binaries.Daemon,
+			"--tun=userspace-networking",
+			"--state="+n.stateFile,
+			"--socket="+n.sockFile,
+		)
+
+	}
 	cmd.Env = append(os.Environ(),
 		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
 		"HTTP_PROXY="+n.env.TrafficTrapServer.URL,

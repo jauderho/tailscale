@@ -367,7 +367,7 @@ func TestTwoNodeConnectivity(t *testing.T) {
 					addr += string(c)
 				}
 			}
-			t.Logf("Processed address : %v", addr)
+			t.Logf("Processed address : %v, before processing : %v", addr, firstAddrSplit)
 			return netaddr.ParseIPPort(addr)
 		}
 

@@ -316,12 +316,19 @@ func TestTwoNodeConnectivity(t *testing.T) {
 		n2.MustUp()
 		n1.AwaitRunning(t)
 		n2.AwaitRunning(t)
-		defer d1.MustCleanShutdown(t)
-		defer d2.MustCleanShutdown(t)
+
+		defer func() {
+			d1.MustCleanShutdown(t)
+			d2.MustCleanShutdown(t)
+			d1.Kill()
+			d2.Kill()
+		}()
+
 		const sub = `SOCK-TEST : `
 		t.Log("Starting Test!")
 		logStr := env.LogCatcher.logsString()
 		subCount := strings.Count(logStr, sub)
+
 		if subCount < 2 {
 			return fmt.Errorf("expected %d SOCK-TEST addresses, got %d addresses", 2, subCount)
 		}
@@ -375,13 +382,12 @@ func TestTwoNodeConnectivity(t *testing.T) {
 		}
 
 		t.Logf("Node 1 TCP Listener : %v, Node 2 TCP Listener : %v\n", n1Addr, n2Addr)
+
+		// Try communicating with the two addresss.
 		return nil
 	}); err != nil {
 		t.Error(err)
 	}
-
-	// d1.MustCleanShutdown(t)
-	// d2.MustCleanShutdown(t)
 }
 
 // testEnv contains the test environment (set of servers) used by one

@@ -300,25 +300,26 @@ func TestTwoNodeConnectivity(t *testing.T) {
 	env := newTestEnv(t, bins)
 	defer env.Close()
 
-	// Create two nodes:
-	n1 := newTestNode(t, env)
-	d1 := n1.StartDaemon(t)
-	defer d1.Kill()
-
-	n2 := newTestNode(t, env)
-	d2 := n2.StartDaemon(t)
-	defer d2.Kill()
-
-	n1.AwaitListening(t)
-	n2.AwaitListening(t)
-	n1.MustUp()
-	n2.MustUp()
-	n1.AwaitRunning(t)
-	n2.AwaitRunning(t)
-	time.Sleep(3 * time.Second)
-
 	if err := tstest.WaitFor(20*time.Second, func() error {
+		// Create two nodes and hope that logs come out correctly
+		n1 := newTestNode(t, env)
+		d1 := n1.StartDaemon(t)
+		defer d1.Kill()
+
+		n2 := newTestNode(t, env)
+		d2 := n2.StartDaemon(t)
+		defer d2.Kill()
+
+		n1.AwaitListening(t)
+		n2.AwaitListening(t)
+		n1.MustUp()
+		n2.MustUp()
+		n1.AwaitRunning(t)
+		n2.AwaitRunning(t)
+		defer d1.MustCleanShutdown(t)
+		defer d2.MustCleanShutdown(t)
 		const sub = `SOCK-TEST : `
+		t.Log("Starting Test!")
 		logStr := env.LogCatcher.logsString()
 		subCount := strings.Count(logStr, sub)
 		if subCount < 2 {
@@ -379,8 +380,8 @@ func TestTwoNodeConnectivity(t *testing.T) {
 		t.Error(err)
 	}
 
-	d1.MustCleanShutdown(t)
-	d2.MustCleanShutdown(t)
+	// d1.MustCleanShutdown(t)
+	// d2.MustCleanShutdown(t)
 }
 
 // testEnv contains the test environment (set of servers) used by one

@@ -315,9 +315,15 @@ func TestTwoNodeConnectivity(t *testing.T) {
 	n2.MustUp()
 	n1.AwaitRunning(t)
 	n2.AwaitRunning(t)
+	time.Sleep(3 * time.Second)
+
 	if err := tstest.WaitFor(20*time.Second, func() error {
 		const sub = `SOCK-TEST : `
 		logStr := env.LogCatcher.logsString()
+		subCount := strings.Count(logStr, sub)
+		if subCount < 2 {
+			return fmt.Errorf("expected %d SOCK-TEST addresses, got %d addresses", 2, subCount)
+		}
 
 		if !env.LogCatcher.logsContains(mem.S(sub)) {
 			return fmt.Errorf("log catcher didn't see %#q; got %s", sub, env.LogCatcher.logsString())

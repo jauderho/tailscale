@@ -37,7 +37,7 @@ func TestClientProbe(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 		}
 		res, err := c.Probe(context.Background())
-		t.Logf("Got: %+v, %v", res, err)
+		t.Logf("Got(t=%dms): %+v, %v", i*100, res, err)
 	}
 }
 

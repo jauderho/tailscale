@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,7 +31,11 @@ import (
 
 	"go4.org/mem"
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+	"golang.org/x/net/proxy"
+>>>>>>> 574e88e911... dialer issue
 	"inet.af/netaddr"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
@@ -317,6 +322,8 @@ func TestTwoNodeConnectivity(t *testing.T) {
 		n2.MustUp()
 		n1.AwaitRunning(t)
 		n2.AwaitRunning(t)
+		// n1IP := n1.AwaitIP(t)
+		n2IP := n2.AwaitIP(t)
 
 		defer func() {
 			d1.MustCleanShutdown(t)
@@ -385,6 +392,48 @@ func TestTwoNodeConnectivity(t *testing.T) {
 		t.Logf("Node 1 TCP Listener : %v, Node 2 TCP Listener : %v\n", n1Addr, n2Addr)
 
 		// Try communicating with the two addresss.
+		l, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Dial this conn.addr
+		go func() {
+			conn, err := l.Accept()
+			if err != nil {
+				t.Error(err)
+			}
+			defer conn.Close()
+			conn.Write([]byte("TestString"))
+
+		}()
+
+		t.Log(n1Addr.IP().StringExpanded(), n2IP)
+		dialer, err := proxy.SOCKS5("tcp", n1Addr.String(), nil, nil)
+		if err != nil {
+			t.Error(err)
+		}
+		port := l.Addr().(*net.TCPAddr)
+
+		ipString := strings.ReplaceAll(net.JoinHostPort(n2IP, strconv.Itoa(port.Port)), "\n", "")
+		t.Log(ipString)
+		dialerConn, err := dialer.Dial("tcp", ipString)
+		if err != nil {
+			t.Error(err)
+		}
+		t.Log(dialerConn)
+
+		// data, err := io.ReadAll(dialerConn)
+		// if err != nil {
+		// 	t.Error(err)
+		// }
+		// t.Log(data)
+
+		// _, err = dialerConn.Write([]byte("TestTest"))
+		// if err != nil {
+		// 	t.Error(err)
+		// }
+
 		return nil
 	}); err != nil {
 		t.Error(err)

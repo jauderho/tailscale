@@ -299,7 +299,7 @@ func TestAddPingRequest(t *testing.T) {
 }
 
 func TestTwoNodeConnectivity(t *testing.T) {
-	t.Parallel()
+	// t.Parallel()
 	bins := BuildTestBinaries(t)
 
 	env := newTestEnv(t, bins)
@@ -323,7 +323,7 @@ func TestTwoNodeConnectivity(t *testing.T) {
 		n1.AwaitRunning(t)
 		n2.AwaitRunning(t)
 		// n1IP := n1.AwaitIP(t)
-		n2IP := n2.AwaitIP(t)
+		// n2IP := n2.AwaitIP(t)
 
 		defer func() {
 			d1.MustCleanShutdown(t)
@@ -404,36 +404,42 @@ func TestTwoNodeConnectivity(t *testing.T) {
 				t.Error(err)
 			}
 			defer conn.Close()
-			conn.Write([]byte("TestString"))
-
+			_, err = conn.Write([]byte("TestString"))
+			if err != nil {
+				t.Error(err)
+			}
+			t.Logf("Wrote string from %v to %v\n", conn.LocalAddr(), conn.RemoteAddr())
 		}()
 
-		t.Log(n1Addr.IP().StringExpanded(), n2IP)
 		dialer, err := proxy.SOCKS5("tcp", n1Addr.String(), nil, nil)
 		if err != nil {
 			t.Error(err)
 		}
-		port := l.Addr().(*net.TCPAddr)
 
-		ipString := strings.ReplaceAll(net.JoinHostPort(n2IP, strconv.Itoa(port.Port)), "\n", "")
-		t.Log(ipString)
-		dialerConn, err := dialer.Dial("tcp", ipString)
+		port := l.Addr().(*net.TCPAddr)
+		testIP := net.JoinHostPort(n2Addr.IP().String(), strconv.Itoa(port.Port))
+		t.Log("Dialing : ", testIP)
+		dialerConn, err := dialer.Dial("tcp", testIP)
+
 		if err != nil {
 			t.Error(err)
 		}
-		t.Log(dialerConn)
+		defer dialerConn.Close()
 
-		// data, err := io.ReadAll(dialerConn)
-		// if err != nil {
-		// 	t.Error(err)
-		// }
-		// t.Log(data)
+		t.Logf("Dialer Connection Established at %v", dialerConn.LocalAddr())
+		_, err = dialerConn.Write([]byte("TestTest"))
+		if err != nil {
+			t.Error(err)
+		}
 
-		// _, err = dialerConn.Write([]byte("TestTest"))
-		// if err != nil {
-		// 	t.Error(err)
-		// }
+		// Read the bytes in
+		p := make([]byte, 1024)
+		n, err := dialerConn.Read(p)
+		if err != nil {
+			t.Error(err)
+		}
 
+		t.Log(n, string(p))
 		return nil
 	}); err != nil {
 		t.Error(err)

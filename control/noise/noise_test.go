@@ -5,55 +5,29 @@
 package noise
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
-	"sync"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"golang.org/x/net/nettest"
 	tsnettest "tailscale.com/net/nettest"
 	"tailscale.com/types/key"
 )
 
-type inMemoryPSKStore struct {
-	sync.Mutex
-	keys map[key.Public][]PSK
-}
-
-func (s *inMemoryPSKStore) GetPSKs(k key.Public) ([]PSK, error) {
-	s.Lock()
-	defer s.Unlock()
-	if s.keys == nil {
-		s.keys = map[key.Public][]PSK{}
-	}
-	return s.keys[k], nil
-}
-
-func (s *inMemoryPSKStore) SetPSKs(k key.Public, psks []PSK) error {
-	s.Lock()
-	defer s.Unlock()
-	if s.keys == nil {
-		s.keys = map[key.Public][]PSK{}
-	}
-	s.keys[k] = psks
-	return nil
-}
-
 func TestConnect(t *testing.T) {
 	s1, s2 := tsnettest.NewConn("noise", 4096)
 	controlKey := key.NewPrivate()
 	machineKey := key.NewPrivate()
-	store := &inMemoryPSKStore{}
 	var client, server *Conn
 	serverErr := make(chan error, 1)
 	serverBytes := make(chan []byte, 1)
 	go func() {
 		var err error
-		server, err = Server(context.Background(), s2, controlKey, store)
+		server, err = Server(context.Background(), s2, controlKey)
 		serverErr <- err
 		if err != nil {
 			return
@@ -63,7 +37,7 @@ func TestConnect(t *testing.T) {
 		serverErr <- err
 		serverBytes <- bs
 	}()
-	client, newPSK, err := Client(context.Background(), s1, machineKey, controlKey.Public(), PSK{})
+	client, err := Client(context.Background(), s1, machineKey, controlKey.Public())
 	if err != nil {
 		t.Fatalf("client connection failed: %v", err)
 	}
@@ -71,13 +45,19 @@ func TestConnect(t *testing.T) {
 		t.Fatalf("server connection failed: %v", err)
 	}
 
-	serverPSKs, err := store.GetPSKs(machineKey.Public())
-	if err != nil {
-		t.Fatalf("PSK fetch failed: %v", err)
+	ch, sh := client.HandshakeHash(), server.HandshakeHash()
+	if !bytes.Equal(ch[:], sh[:]) {
+		t.Fatal("mismatched handshake hashes on client and server")
 	}
-	wantPSKs := []PSK{newPSK, PSK{}}
-	if diff := cmp.Diff(serverPSKs, wantPSKs); diff != "" {
-		t.Fatalf("Stored PSK mismatch (-got+want):\n%s", diff)
+
+	cpk, spk := client.Peer(), server.Peer()
+	controlKeyPub := controlKey.Public()
+	if !bytes.Equal(cpk[:], controlKeyPub[:]) {
+		t.Fatal("client peer isn't controlKey")
+	}
+	machineKeyPub := machineKey.Public()
+	if !bytes.Equal(spk[:], machineKeyPub[:]) {
+		t.Fatal("server peer isn't machineKey")
 	}
 
 	if _, err := io.WriteString(client, "test"); err != nil {
@@ -102,10 +82,10 @@ func TestNoise(t *testing.T) {
 		serverErr := make(chan error, 1)
 		go func() {
 			var err error
-			c2, err = Server(context.Background(), s2, controlKey, &inMemoryPSKStore{})
+			c2, err = Server(context.Background(), s2, controlKey)
 			serverErr <- err
 		}()
-		c1, _, err = Client(context.Background(), s1, machineKey, controlKey.Public(), PSK{})
+		c1, err = Client(context.Background(), s1, machineKey, controlKey.Public())
 		if err != nil {
 			s1.Close()
 			s2.Close()

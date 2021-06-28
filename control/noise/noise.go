@@ -5,19 +5,14 @@
 // Package noise implements the base transport of the Tailscale 2021
 // control protocol.
 //
-// The base transport implements Noise IKpsk1, instantiated with
+// The base transport implements Noise IK, instantiated with
 // Curve25519, ChaCha20Poly1305 and BLAKE2s.
-//
-// The PSK is initially zero, and ratchets to a new value after each
-// successful handshake. The PSK ratchet enables detection of machine
-// key cloning.
 package noise
 
 import (
 	"context"
 	"crypto/cipher"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -34,26 +29,21 @@ import (
 )
 
 const (
-	protocolName      = "Noise_IKpsk1_25519_ChaChaPoly_BLAKE2s"
+	protocolName      = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
 	invalidNonce      = ^uint64(0)
 	maxCiphertextSize = 65535
 	maxPlaintextSize  = maxCiphertextSize - poly1305.TagSize
 )
 
-// PSK is a Noise pre-shared key.
-type PSK [32]byte
-
 // Client initiates a Noise client handshake, returning the resulting
-// Noise connection and new pre-shared key to use for future
-// connections.
+// Noise connection.
 //
 // The context deadline, if any, covers the entire handshaking
-// process. The new PSK must be persisted to durable storage before
-// any Conn.Write calls to avoid potential lockout.
-func Client(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public, psk PSK) (*Conn, PSK, error) {
+// process.
+func Client(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public) (*Conn, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, PSK{}, fmt.Errorf("setting conn deadline: %w", err)
+			return nil, fmt.Errorf("setting conn deadline: %w", err)
 		}
 		defer func() {
 			conn.SetDeadline(time.Time{})
@@ -68,76 +58,59 @@ func Client(ctx context.Context, conn net.Conn, machineKey key.Private, controlK
 	s.MixHash(controlKey[:])
 
 	var init initiationMessage
-	// -> e, es, s, ss, psk
+	// -> e, es, s, ss
 	machineEphemeral := key.NewPrivate()
 	machineEphemeralPub := machineEphemeral.Public()
 	copy(init.MachineEphemeralPub(), machineEphemeralPub[:])
 	s.MixHash(machineEphemeralPub[:])
 	if err := s.MixDH(machineEphemeral, controlKey); err != nil {
-		return nil, PSK{}, fmt.Errorf("computing es: %w", err)
+		return nil, fmt.Errorf("computing es: %w", err)
 	}
 	machineKeyPub := machineKey.Public()
 	copy(init.MachinePub(), s.EncryptAndHash(machineKeyPub[:]))
 	if err := s.MixDH(machineKey, controlKey); err != nil {
-		return nil, PSK{}, fmt.Errorf("computing ss: %w", err)
+		return nil, fmt.Errorf("computing ss: %w", err)
 	}
-	s.MixKeyAndHash(psk)
-	copy(init.Tag(), s.EncryptAndHash(nil))
+	copy(init.Tag(), s.EncryptAndHash(nil)) // empty message payload
 
 	if _, err := conn.Write(init[:]); err != nil {
-		return nil, PSK{}, fmt.Errorf("writing initiation: %w", err)
+		return nil, fmt.Errorf("writing initiation: %w", err)
 	}
 
 	// <- e, ee, se
 	var resp responseMessage
 	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return nil, PSK{}, fmt.Errorf("reading response: %w", err)
+		return nil, fmt.Errorf("reading response: %w", err)
 	}
 
 	re, err := s.DecryptAndHash(resp.ControlEphemeralPub())
 	if err != nil {
-		return nil, PSK{}, fmt.Errorf("decrypting control ephemeral key: %w", err)
+		return nil, fmt.Errorf("decrypting control ephemeral key: %w", err)
 	}
 	var controlEphemeralPub key.Public
-	copy(controlEphemeralPub[:], re)
+	copy(controlEphemeralPub[:], re) // TODO: change DecryptAndHash signature to avoid this copy
 	if err := s.MixDH(machineEphemeral, controlEphemeralPub); err != nil {
-		return nil, PSK{}, fmt.Errorf("computing ee: %w", err)
+		return nil, fmt.Errorf("computing ee: %w", err)
 	}
 	if err := s.MixDH(machineKey, controlEphemeralPub); err != nil {
-		return nil, PSK{}, fmt.Errorf("computing se: %w", err)
+		return nil, fmt.Errorf("computing se: %w", err)
 	}
 	if _, err := s.DecryptAndHash(resp.Tag()); err != nil {
-		return nil, PSK{}, fmt.Errorf("decrypting payload: %w", err)
+		return nil, fmt.Errorf("decrypting payload: %w", err)
 	}
 
 	c1, c2, err := s.Split()
 	if err != nil {
-		return nil, PSK{}, fmt.Errorf("finalizing handshake: %w", err)
+		return nil, fmt.Errorf("finalizing handshake: %w", err)
 	}
 
 	return &Conn{
 		conn:          conn,
+		peer:          controlKey,
 		handshakeHash: s.h,
 		tx:            c1,
 		rx:            c2,
-	}, PSK(s.h), nil
-}
-
-// PSKStore allows storing and retrieving PSKs for a machine key.
-type PSKStore interface {
-	// GetPSKs returns all acceptable PSKs for the given machineKey,
-	// ordered from most to least preferred.
-	//
-	// GetPSKs should only return an error if the store is
-	// malfunctioning. It is not an error to have no PSKs for a
-	// machineKey.
-	GetPSKs(machineKey key.Public) ([]PSK, error)
-	// SetPSKs updates the acceptable PSKs for the given machineKey,
-	// ordered from most to least preferred.
-	//
-	// SetPSKs returns successfully only if the new PSKs were
-	// persisted to durable storage.
-	SetPSKs(machineKey key.Public, psks []PSK) error
+	}, nil
 }
 
 // Server initiates a Noise server handshake, returning the resulting
@@ -145,7 +118,7 @@ type PSKStore interface {
 //
 // The context deadline, if any, covers the entire handshaking
 // process.
-func Server(ctx context.Context, conn net.Conn, controlKey key.Private, store PSKStore) (*Conn, error) {
+func Server(ctx context.Context, conn net.Conn, controlKey key.Private) (*Conn, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
 			return nil, fmt.Errorf("setting conn deadline: %w", err)
@@ -163,7 +136,7 @@ func Server(ctx context.Context, conn net.Conn, controlKey key.Private, store PS
 	controlKeyPub := controlKey.Public()
 	s.MixHash(controlKeyPub[:])
 
-	// -> e, es, s, ss, psk
+	// -> e, es, s, ss
 	var init initiationMessage
 	if _, err := io.ReadFull(conn, init[:]); err != nil {
 		return nil, fmt.Errorf("reading initiation: %w", err)
@@ -184,36 +157,8 @@ func Server(ctx context.Context, conn net.Conn, controlKey key.Private, store PS
 	if err := s.MixDH(controlKey, machineKey); err != nil {
 		return nil, fmt.Errorf("computing ss: %w", err)
 	}
-	psks, err := store.GetPSKs(machineKey)
-	if err != nil {
-		return nil, fmt.Errorf("getting PSK: %w", err)
-	}
-	if len(psks) == 0 {
-		// If no PSKs are known, this is a new machine key, and it's
-		// using an all-zero PSK.
-		psks = []PSK{PSK{}}
-	}
-	// We have to try several PSK values. If we don't get it right
-	// the first time, we need to reset to this step in the handshake
-	// processing.
-	backupState := s
-	var correctPSK *PSK
-	for _, psk := range psks {
-		s.MixKeyAndHash(psk)
-		if _, err := s.DecryptAndHash(init.Tag()); err != nil {
-			// Likely the wrong PSK, try another.
-			s = backupState
-			continue
-		}
-		correctPSK = &psk
-		break
-	}
-	if correctPSK == nil {
-		// None of the PSKs we know of match this handshake. This very
-		// likely means the machine key was cloned.
-		// TODO: we should return a specific "machine key cloned"
-		// error here, so Control can do remediation.
-		return nil, errors.New("invalid PSK")
+	if _, err := s.DecryptAndHash(init.Tag()); err != nil {
+		return nil, fmt.Errorf("decrypting initiation tag: %w", err)
 	}
 
 	// <- e, ee, se
@@ -227,45 +172,24 @@ func Server(ctx context.Context, conn net.Conn, controlKey key.Private, store PS
 	if err := s.MixDH(controlEphemeral, machineKey); err != nil {
 		return nil, fmt.Errorf("computing se: %w", err)
 	}
-	copy(resp.Tag(), s.EncryptAndHash(nil))
+	copy(resp.Tag(), s.EncryptAndHash(nil)) // empty message payload
 
 	c1, c2, err := s.Split()
 	if err != nil {
 		return nil, fmt.Errorf("finalizing handshake: %w", err)
 	}
 
-	// Handshake is complete, but we must persist the new PSK before
-	// we respond to the client. Otherwise the client might learn a
-	// new PSK that we forget, which will unrecoverably break the
-	// ratcheting.
-	//
-	// Remember both the new PSK, and the one used in this handshake
-	// (which the client clearly knows). We only drop the older PSK
-	// once the client sends us its first message on this connection,
-	// because the contract for Client states that they will have
-	// persisted the new PSK before transmitting.
-	newPSKs := []PSK{s.h, *correctPSK}
-	if err := store.SetPSKs(machineKey, newPSKs); err != nil {
-		// Failed to store new values, can't safely complete handshake.
-		return nil, fmt.Errorf("saving new ratchets: %w", err)
-	}
-
-	ret := &Conn{
-		conn:          conn,
-		peer:          machineKey,
-		handshakeHash: s.h,
-		confirmPSK: func() error {
-			return store.SetPSKs(machineKey, []PSK{PSK(s.h)})
-		},
-		tx: c2,
-		rx: c1,
-	}
-
 	if _, err := conn.Write(resp[:]); err != nil {
 		return nil, err
 	}
 
-	return ret, nil
+	return &Conn{
+		conn:          conn,
+		peer:          machineKey,
+		handshakeHash: s.h,
+		tx:            c2,
+		rx:            c1,
+	}, nil
 }
 
 // initiationMessage is the Noise protocol message sent from a client
@@ -328,6 +252,16 @@ func (s *symmetricState) MixHash(data []byte) {
 // two private keys, or two public keys), and thus producing the wrong
 // calculation.
 func (s *symmetricState) MixDH(priv key.Private, pub key.Public) error {
+	// TODO(danderson): check that this operation is correct. The docs
+	// for X25519 say that the 2nd arg must be either Basepoint or the
+	// output of another X25519 call.
+	//
+	// I think this is correct, because pub is the result of a
+	// ScalarBaseMult on the private key, and our private key
+	// generation code clamps keys to avoid low order points. I
+	// believe that makes pub equivalent to the output of
+	// X25519(privateKey, Basepoint), and so the contract is
+	// respected.
 	keyData, err := curve25519.X25519(priv[:], pub[:])
 	if err != nil {
 		return fmt.Errorf("computing X25519: %w", err)
@@ -344,30 +278,12 @@ func (s *symmetricState) MixDH(priv key.Private, pub key.Public) error {
 	return nil
 }
 
-// MixKeyAndHash updates s.k, s.ck and s.h with the value of psk.
-func (s *symmetricState) MixKeyAndHash(psk [32]byte) error {
-	r := hkdf.New(newBLAKE2s, psk[:], s.ck[:], nil)
-	if _, err := io.ReadFull(r, s.ck[:]); err != nil {
-		return fmt.Errorf("extracting ck: %w", err)
-	}
-	var temph [blake2s.Size]byte
-	if _, err := io.ReadFull(r, temph[:]); err != nil {
-		return fmt.Errorf("extracting temp_h: %w", err)
-	}
-	s.MixHash(temph[:])
-	if _, err := io.ReadFull(r, s.k[:]); err != nil {
-		return fmt.Errorf("extracting k: %w", err)
-	}
-	s.n = 0
-	return nil
-}
-
 // EncryptAndHash encrypts the given plaintext using the current s.k,
 // mixes the ciphertext into s.h, and returns the ciphertext.
 func (s *symmetricState) EncryptAndHash(plaintext []byte) []byte {
 	if s.n == invalidNonce {
 		// Noise in general permits writing "ciphertext" without a
-		// key, but in IKpsk1 it cannot happen.
+		// key, but in IK it cannot happen.
 		panic("attempted encryption with uninitialized key")
 	}
 	aead := newCHP(s.k)
@@ -385,7 +301,7 @@ func (s *symmetricState) EncryptAndHash(plaintext []byte) []byte {
 func (s *symmetricState) DecryptAndHash(ciphertext []byte) ([]byte, error) {
 	if s.n == invalidNonce {
 		// Noise in general permits "ciphertext" without a key, but in
-		// IKpsk1 it cannot happen.
+		// IK it cannot happen.
 		panic("attempted encryption with uninitialized key")
 	}
 	aead := newCHP(s.k)
@@ -460,8 +376,6 @@ type Conn struct {
 	// TODO: reuse buffers to avoid allocations. Currently allocates
 	// fresh for every packet.
 	buf []byte // previously decrypted bytes
-	// if non-nil, invoked on the first successful Read to lock in the new PSK.
-	confirmPSK func() error
 
 	writeMu sync.Mutex
 	tx      cipher.AEAD
@@ -507,10 +421,6 @@ func (c *Conn) refillLocked() error {
 	}
 
 	c.buf = plaintext
-	if c.confirmPSK != nil {
-		c.confirmPSK()
-		c.confirmPSK = nil
-	}
 	return nil
 }
 

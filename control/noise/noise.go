@@ -1,3 +1,7 @@
+// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Package noise implements the base transport of the Tailscale 2021
 // control protocol.
 //
@@ -28,25 +32,34 @@ import (
 	"tailscale.com/types/key"
 )
 
-type PSK [32]byte
-
 const (
-	protocolName   = "Noise_IKpsk1_25519_ChaChaPoly_BLAKE2s"
-	invalidNonce   = ^uint64(0)
-	maxMessageSize = 65535 // max allowed size of a Noise message
+	protocolName     = "Noise_IKpsk1_25519_ChaChaPoly_BLAKE2s"
+	invalidNonce     = ^uint64(0)
+	maxMessageSize   = 65535 // max allowed size of a Noise message
+	maxPlaintextSize = maxMessageSize - poly1305.TagSize
 )
 
+// psk is a Noise IKpsk1 pre-shared key.
+type psk [32]byte
+
+// initiationMessage is the Noise protocol message sent from a client
+// machine to a control server.
 type initiationMessage [96]byte
 
 func (m *initiationMessage) MachineEphemeralPub() []byte { return m[:32] }
 func (m *initiationMessage) MachinePub() []byte          { return m[32:80] }
 func (m *initiationMessage) Tag() []byte                 { return m[80:] }
 
+// responseMessage is the Noise protocol message sent from a control
+// server to a client machine.
 type responseMessage [64]byte
 
 func (m *responseMessage) ControlEphemeralPub() []byte { return m[:48] }
 func (m *responseMessage) Tag() []byte                 { return m[48:] }
 
+// symmetricState is the SymmetricState object from the Noise protocol
+// spec. It contains all the symmetric cipher state of an in-flight
+// handshake. Field names match the variable names in the spec.
 type symmetricState struct {
 	h  [blake2s.Size]byte
 	ck [blake2s.Size]byte
@@ -57,16 +70,8 @@ type symmetricState struct {
 	mixer hash.Hash // for updating h
 }
 
-func (s *symmetricState) Clone() *symmetricState {
-	return &symmetricState{
-		h:     s.h,
-		ck:    s.ck,
-		k:     s.k,
-		n:     s.n,
-		mixer: newBLAKE2s(),
-	}
-}
-
+// Initialize sets s to the initial handshake state, prior to
+// processing any Noise messages.
 func (s *symmetricState) Initialize() {
 	if s.mixer != nil {
 		panic("symmetricState cannot be reused")
@@ -80,6 +85,8 @@ func (s *symmetricState) Initialize() {
 	s.MixHash(nil)
 }
 
+// MixHash updates s.h to be BLAKE2s(s.h || data), where || is
+// concatenation.
 func (s *symmetricState) MixHash(data []byte) {
 	s.mixer.Reset()
 	s.mixer.Write(s.h[:])
@@ -87,7 +94,13 @@ func (s *symmetricState) MixHash(data []byte) {
 	s.mixer.Sum(s.h[:0]) // TODO: check this actually updates s.h correctly...
 }
 
-// Combo of MixKey(DH(...)), with types that avoid public/private key confusion.
+// MixDH updates s.ck and s.k with the result of X25519(priv, pub).
+//
+// MixDH corresponds to MixKey(X25519(...))) in the spec. Implementing
+// it as a single function allows for strongly-typed arguments that
+// reduce the risk of error in the caller (e.g. invoking X25519 with
+// two private keys, or two public keys), and thus producing the wrong
+// calculation.
 func (s *symmetricState) MixDH(priv key.Private, pub key.Public) error {
 	keyData, err := curve25519.X25519(priv[:], pub[:])
 	if err != nil {
@@ -105,7 +118,8 @@ func (s *symmetricState) MixDH(priv key.Private, pub key.Public) error {
 	return nil
 }
 
-func (s *symmetricState) MixKeyAndHash(psk PSK) error {
+// MixKeyAndHash updates s.k, s.ck and s.h with the value of psk.
+func (s *symmetricState) MixKeyAndHash(psk psk) error {
 	r := hkdf.New(newBLAKE2s, psk[:], s.ck[:], nil)
 	if _, err := io.ReadFull(r, s.ck[:]); err != nil {
 		return fmt.Errorf("computing HKDF: %w", err)
@@ -122,10 +136,12 @@ func (s *symmetricState) MixKeyAndHash(psk PSK) error {
 	return nil
 }
 
+// EncryptAndHash encrypts the given plaintext using the current s.k,
+// mixes the ciphertext into s.h, and returns the ciphertext.
 func (s *symmetricState) EncryptAndHash(plaintext []byte) []byte {
 	if s.n == invalidNonce {
-		// Technically, Noise in general permits writing "ciphertext"
-		// without a key, but in IKpsk1 it cannot happen.
+		// Noise in general permits writing "ciphertext" without a
+		// key, but in IKpsk1 it cannot happen.
 		panic("attempted encryption with uninitialized key")
 	}
 	aead := newCHP(s.k)
@@ -137,10 +153,13 @@ func (s *symmetricState) EncryptAndHash(plaintext []byte) []byte {
 	return ret
 }
 
+// DecryptAndHash decrypts the given ciphertext using the current
+// s.k. If decryption is successful, it mixes the ciphertext into s.h
+// and returns the plaintext.
 func (s *symmetricState) DecryptAndHash(ciphertext []byte) ([]byte, error) {
 	if s.n == invalidNonce {
-		// Technically, Noise in general permits writing "ciphertext"
-		// without a key, but in IKpsk1 it cannot happen.
+		// Noise in general permits "ciphertext" without a key, but in
+		// IKpsk1 it cannot happen.
 		panic("attempted encryption with uninitialized key")
 	}
 	aead := newCHP(s.k)
@@ -155,6 +174,9 @@ func (s *symmetricState) DecryptAndHash(ciphertext []byte) ([]byte, error) {
 	return ret, nil
 }
 
+// Split returns two ChaCha20Poly1305 ciphers with keys derives from
+// the current handshake state. Methods on s must not be used again
+// after calling Split().
 func (s *symmetricState) Split() (c1, c2 cipher.AEAD, err error) {
 	var k1, k2 [chp.KeySize]byte
 	r := hkdf.New(newBLAKE2s, nil, s.ck[:], nil)
@@ -175,13 +197,10 @@ func (s *symmetricState) Split() (c1, c2 cipher.AEAD, err error) {
 	return c1, c2, nil
 }
 
-// Initiate runs the IKpsk1 handshake from the initiator's perspective
-// (i.e. the client talking to Control). If the handshake is
-// successful, returns a wrapper net.Conn that implements the
-// transport encryption. Returns an error and closes conn if the
-// handshake fails, to avoid any chance of accidental unauthenticated
-// use.
-func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public, ratchet PSK) (*Conn, error) {
+// Initiate executes an IKpsk1 handshake from the initiator's
+// perspective (i.e. the client talking to Control), returning the
+// resulting Noise connection.
+func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public, ratchet psk) (*Conn, error) {
 	var s symmetricState
 	s.Initialize()
 
@@ -254,10 +273,13 @@ func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, contro
 }
 
 type RatchetStore interface {
-	GetRatchets(machineKey key.Public) ([]PSK, error)
-	SetRatchets(machineKey key.Public, psks []PSK) error
+	GetRatchets(machineKey key.Public) ([]psk, error)
+	SetRatchets(machineKey key.Public, psks []psk) error
 }
 
+// Respond executes an IKpsk1 handshake from the responder's
+// perspective (i.e. control talking to a client), returning the
+// resulting Noise connection.
 func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore RatchetStore) (*Conn, error) {
 	var s symmetricState
 	s.Initialize()
@@ -305,7 +327,7 @@ func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore 
 	// the first time, we need to reset to this step in the handshake
 	// processing.
 	backupState := s
-	var correctPSK *PSK
+	var correctPSK *psk
 	for _, ratchet := range ratchets {
 		s.MixKeyAndHash(ratchet)
 		if _, err := s.DecryptAndHash(init.Tag()); err != nil {
@@ -352,7 +374,7 @@ func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore 
 	// next connection. We also remember the ratchet value used by the
 	// current connection, to allow for the client crashing before it
 	// persists the new PSK.
-	newRatchets := []PSK{PSK(s.h), *correctPSK}
+	newRatchets := []psk{psk(s.h), *correctPSK}
 	if err := rstore.SetRatchets(machineKey, newRatchets); err != nil {
 		// Failed to store new values, can't safely complete handshake.
 		return nil, fmt.Errorf("saving new ratchets: %w", err)
@@ -365,6 +387,8 @@ func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore 
 	return ret, nil
 }
 
+// newBLAKE2s returns a hash.Hash implementing BLAKE2s, or panics on
+// error.
 func newBLAKE2s() hash.Hash {
 	h, err := blake2s.New256(nil)
 	if err != nil {
@@ -375,16 +399,20 @@ func newBLAKE2s() hash.Hash {
 	return h
 }
 
+// newCHP returns a cipher.AEAD implementing ChaCha20Poly1305, or
+// panics on error.
 func newCHP(key [chp.KeySize]byte) cipher.AEAD {
 	aead, err := chp.New(key[:])
 	if err != nil {
-		// Can only happen if we passed a key of the wrong length. We
-		// should never go that wrong.
+		// Can only happen if we passed a key of the wrong length. The
+		// function signature prevents that.
 		panic(fmt.Sprintf("chacha20poly1305 construction: %v", err))
 	}
 	return aead
 }
 
+// A Conn represents a secured Noise connection. It implements the
+// net.Conn interface.
 type Conn struct {
 	conn net.Conn
 	// TODO: reuse buffers to avoid allocations. Currently allocates
@@ -408,10 +436,12 @@ func (c *Conn) HandshakeHash() [blake2s.Size]byte {
 	return c.handshakeHash
 }
 
+// Peer returns the peer's long-term public key.
 func (c *Conn) Peer() key.Public {
 	return c.peer
 }
 
+// refill reads one Noise message and decrypts it into c.buf.
 func (c *Conn) refill() error {
 	var sz [2]byte
 	if _, err := io.ReadFull(c.conn, sz[:]); err != nil {
@@ -469,23 +499,36 @@ func (c *Conn) Write(bs []byte) (int, error) {
 	if c.tx == nil {
 		return 0, net.ErrClosed
 	}
-	if c.rxN == invalidNonce {
-		// Somehow sent 2^64-1 messages on this cipher
-		// state. Connection is no longer usable.
-		c.scorch()
-		return 0, net.ErrClosed
+
+	var sent int
+	for len(bs) > 0 {
+		if c.rxN == invalidNonce {
+			// Somehow sent 2^64-1 messages on this cipher
+			// state. Connection is no longer usable.
+			c.scorch()
+			return 0, net.ErrClosed
+		}
+
+		toSend := bs
+		if len(toSend) > maxPlaintextSize {
+			toSend = bs[:maxPlaintextSize]
+		}
+		bs = bs[len(toSend):]
+
+		// TODO: reuse buffers, be less wasteful.
+		ciphertext := make([]byte, len(toSend)+poly1305.TagSize+2)
+		binary.BigEndian.PutUint16(ciphertext[:2], uint16(len(ciphertext)-2))
+		var nonce [chp.NonceSize]byte
+		binary.BigEndian.PutUint64(nonce[4:], c.txN)
+		c.txN++
+		c.tx.Seal(ciphertext[:2], nonce[:], toSend, nil)
+		if _, err := c.conn.Write(ciphertext); err != nil {
+			c.scorch()
+			return sent, err
+		}
+		sent += len(toSend)
 	}
-	ciphertext := make([]byte, len(bs)+poly1305.TagSize+2)
-	var nonce [chp.NonceSize]byte
-	binary.BigEndian.PutUint64(nonce[4:], c.txN)
-	c.txN++
-	c.tx.Seal(ciphertext[:2], nonce[:], bs, nil)
-	binary.BigEndian.PutUint16(ciphertext[:2], uint16(len(ciphertext)-2))
-	if _, err := c.conn.Write(ciphertext); err != nil {
-		c.scorch()
-		return 0, err
-	}
-	return len(bs), nil
+	return sent, nil
 }
 
 func (c *Conn) Close() error {

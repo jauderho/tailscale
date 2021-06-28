@@ -462,14 +462,16 @@ func (s *Server) accept(nc Conn, brw *bufio.ReadWriter, remoteAddr string, connN
 	if err != nil {
 		return fmt.Errorf("receive client key: %v", err)
 	}
-	if err := s.verifyClient(clientKey, clientInfo); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.verifyClient(ctx, clientKey, clientInfo); err != nil {
 		return fmt.Errorf("client %x rejected: %v", clientKey, err)
 	}
 
 	// At this point we trust the client so we don't time out.
 	nc.SetDeadline(time.Time{})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
 	remoteIPPort, _ := netaddr.ParseIPPort(remoteAddr)
@@ -781,11 +783,11 @@ func (c *sclient) requestMeshUpdate() {
 	}
 }
 
-func (s *Server) verifyClient(clientKey key.Public, info *clientInfo) error {
+func (s *Server) verifyClient(ctx context.Context, clientKey key.Public, info *clientInfo) error {
 	if !s.verifyClients {
 		return nil
 	}
-	status, err := tailscale.Status(context.TODO())
+	status, err := tailscale.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to query local tailscaled status: %w", err)
 	}

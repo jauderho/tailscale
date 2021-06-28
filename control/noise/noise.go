@@ -39,8 +39,195 @@ const (
 	maxPlaintextSize = maxMessageSize - poly1305.TagSize
 )
 
-// psk is a Noise IKpsk1 pre-shared key.
-type psk [32]byte
+// Initiate executes an IKpsk1 handshake from the initiator's
+// perspective (i.e. the client talking to Control), returning the
+// resulting Noise connection.
+func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public, psk [32]byte) (*Conn, error) {
+	var s symmetricState
+	s.Initialize()
+
+	// <- s
+	// ...
+	s.MixHash(controlKey[:])
+
+	var init initiationMessage
+	// -> e, es, s, ss, psk
+	machineEphemeral := key.NewPrivate()
+	machineEphemeralPub := machineEphemeral.Public()
+	copy(init.MachineEphemeralPub(), machineEphemeralPub[:])
+	s.MixHash(machineEphemeralPub[:])
+	if err := s.MixDH(machineEphemeral, controlKey); err != nil {
+		return nil, fmt.Errorf("computing es: %w", err)
+	}
+	machineKeyPub := machineKey.Public()
+	copy(init.MachinePub(), s.EncryptAndHash(machineKeyPub[:]))
+	if err := s.MixDH(machineKey, controlKey); err != nil {
+		return nil, fmt.Errorf("computing ss: %w", err)
+	}
+	s.MixKeyAndHash(psk)
+	copy(init.Tag(), s.EncryptAndHash(nil))
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("setting connection deadline: %w", err)
+		}
+		defer func() {
+			conn.SetDeadline(time.Time{})
+		}()
+	}
+	if _, err := conn.Write(init[:]); err != nil {
+		return nil, fmt.Errorf("writing initiation: %w", err)
+	}
+
+	// <- e, ee, se
+	var resp responseMessage
+	if _, err := io.ReadFull(conn, resp[:]); err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	re, err := s.DecryptAndHash(resp.ControlEphemeralPub())
+	if err != nil {
+		return nil, fmt.Errorf("decrypting control ephemeral key: %w", err)
+	}
+	var controlEphemeralPub key.Public
+	copy(controlEphemeralPub[:], re)
+	if err := s.MixDH(machineEphemeral, controlEphemeralPub); err != nil {
+		return nil, fmt.Errorf("computing ee: %w", err)
+	}
+	if err := s.MixDH(machineKey, controlEphemeralPub); err != nil {
+		return nil, fmt.Errorf("computing se: %w", err)
+	}
+	if _, err := s.DecryptAndHash(resp.Tag()); err != nil {
+		return nil, fmt.Errorf("decrypting payload: %w", err)
+	}
+
+	c1, c2, err := s.Split()
+	if err != nil {
+		return nil, fmt.Errorf("finalizing handshake: %w", err)
+	}
+
+	return &Conn{
+		conn:          conn,
+		handshakeHash: s.h,
+		tx:            c1,
+		rx:            c2,
+	}, nil
+}
+
+type PSKStore interface {
+	GetPSKs(machineKey key.Public) ([][32]byte, error)
+	SetPSKs(machineKey key.Public, psks [][32]byte) error
+}
+
+// Respond executes an IKpsk1 handshake from the responder's
+// perspective (i.e. control talking to a client), returning the
+// resulting Noise connection.
+func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore PSKStore) (*Conn, error) {
+	var s symmetricState
+	s.Initialize()
+
+	// <- s
+	// ...
+	controlKeyPub := controlKey.Public()
+	s.MixHash(controlKeyPub[:])
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("setting connection deadline: %w", err)
+		}
+		defer func() {
+			conn.SetDeadline(time.Time{})
+		}()
+	}
+
+	// -> e, es, s, ss, psk
+	var init initiationMessage
+	if _, err := io.ReadFull(conn, init[:]); err != nil {
+		return nil, fmt.Errorf("reading initiation: %w", err)
+	}
+
+	var machineEphemeralPub key.Public
+	copy(machineEphemeralPub[:], init.MachineEphemeralPub())
+	s.MixHash(machineEphemeralPub[:])
+	if err := s.MixDH(controlKey, machineEphemeralPub); err != nil {
+		return nil, fmt.Errorf("computing es: %w", err)
+	}
+	var machineKey key.Public
+	rs, err := s.DecryptAndHash(init.MachinePub())
+	if err != nil {
+		return nil, fmt.Errorf("decrypting machine key: %w", err)
+	}
+	copy(machineKey[:], rs)
+	if err := s.MixDH(controlKey, machineKey); err != nil {
+		return nil, fmt.Errorf("computing ss: %w", err)
+	}
+	psks, err := rstore.GetPSKs(machineKey)
+	if err != nil {
+		return nil, fmt.Errorf("getting PSK: %w", err)
+	}
+	// We have to try several PSK values. If we don't get it right
+	// the first time, we need to reset to this step in the handshake
+	// processing.
+	backupState := s
+	var correctPSK *[32]byte
+	for _, psk := range psks {
+		s.MixKeyAndHash(psk)
+		if _, err := s.DecryptAndHash(init.Tag()); err != nil {
+			// Likely the wrong PSK, try another.
+			s = backupState
+			continue
+		}
+		correctPSK = &psk
+		break
+	}
+	if correctPSK == nil {
+		// None of the PSKs we know of match this handshake. This very
+		// likely means the machine key was cloned.
+		// TODO: we should return a specific "machine key cloned"
+		// error here, so Control can do remediation.
+		return nil, errors.New("invalid PSK")
+	}
+
+	// <- e, ee, se
+	var resp responseMessage
+	controlEphemeral := key.NewPrivate()
+	controlEphemeralPub := controlEphemeral.Public()
+	copy(resp.ControlEphemeralPub(), controlEphemeralPub[:])
+	if err := s.MixDH(controlEphemeral, machineEphemeralPub); err != nil {
+		return nil, fmt.Errorf("computing ee: %w", err)
+	}
+	if err := s.MixDH(controlEphemeral, machineKey); err != nil {
+		return nil, fmt.Errorf("computing se: %w", err)
+	}
+	copy(resp.Tag(), s.EncryptAndHash(nil))
+
+	c1, c2, err := s.Split()
+	if err != nil {
+		return nil, fmt.Errorf("finalizing handshake: %w", err)
+	}
+	ret := &Conn{
+		conn:          conn,
+		handshakeHash: s.h,
+		tx:            c2,
+		rx:            c1,
+	}
+
+	// Handshake is complete, so we create a new ratchet value for the
+	// next connection. We also remember the ratchet value used by the
+	// current connection, to allow for the client crashing before it
+	// persists the new PSK.
+	newPSKs := [][32]byte{s.h, *correctPSK}
+	if err := rstore.SetPSKs(machineKey, newPSKs); err != nil {
+		// Failed to store new values, can't safely complete handshake.
+		return nil, fmt.Errorf("saving new ratchets: %w", err)
+	}
+
+	if _, err := conn.Write(resp[:]); err != nil {
+		return nil, err
+	}
+
+	return ret, nil
+}
 
 // initiationMessage is the Noise protocol message sent from a client
 // machine to a control server.
@@ -119,7 +306,7 @@ func (s *symmetricState) MixDH(priv key.Private, pub key.Public) error {
 }
 
 // MixKeyAndHash updates s.k, s.ck and s.h with the value of psk.
-func (s *symmetricState) MixKeyAndHash(psk psk) error {
+func (s *symmetricState) MixKeyAndHash(psk [32]byte) error {
 	r := hkdf.New(newBLAKE2s, psk[:], s.ck[:], nil)
 	if _, err := io.ReadFull(r, s.ck[:]); err != nil {
 		return fmt.Errorf("computing HKDF: %w", err)
@@ -195,196 +382,6 @@ func (s *symmetricState) Split() (c1, c2 cipher.AEAD, err error) {
 		return nil, nil, fmt.Errorf("constructing AEAD: %w", err)
 	}
 	return c1, c2, nil
-}
-
-// Initiate executes an IKpsk1 handshake from the initiator's
-// perspective (i.e. the client talking to Control), returning the
-// resulting Noise connection.
-func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public, ratchet psk) (*Conn, error) {
-	var s symmetricState
-	s.Initialize()
-
-	// <- s
-	// ...
-	s.MixHash(controlKey[:])
-
-	var init initiationMessage
-	// -> e, es, s, ss, psk
-	machineEphemeral := key.NewPrivate()
-	machineEphemeralPub := machineEphemeral.Public()
-	copy(init.MachineEphemeralPub(), machineEphemeralPub[:])
-	s.MixHash(machineEphemeralPub[:])
-	if err := s.MixDH(machineEphemeral, controlKey); err != nil {
-		return nil, fmt.Errorf("computing es: %w", err)
-	}
-	machineKeyPub := machineKey.Public()
-	copy(init.MachinePub(), s.EncryptAndHash(machineKeyPub[:]))
-	if err := s.MixDH(machineKey, controlKey); err != nil {
-		return nil, fmt.Errorf("computing ss: %w", err)
-	}
-	s.MixKeyAndHash(ratchet)
-	copy(init.Tag(), s.EncryptAndHash(nil))
-
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("setting connection deadline: %w", err)
-		}
-		defer func() {
-			conn.SetDeadline(time.Time{})
-		}()
-	}
-	if _, err := conn.Write(init[:]); err != nil {
-		return nil, fmt.Errorf("writing initiation: %w", err)
-	}
-
-	// <- e, ee, se
-	var resp responseMessage
-	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
-
-	re, err := s.DecryptAndHash(resp.ControlEphemeralPub())
-	if err != nil {
-		return nil, fmt.Errorf("decrypting control ephemeral key: %w", err)
-	}
-	var controlEphemeralPub key.Public
-	copy(controlEphemeralPub[:], re)
-	if err := s.MixDH(machineEphemeral, controlEphemeralPub); err != nil {
-		return nil, fmt.Errorf("computing ee: %w", err)
-	}
-	if err := s.MixDH(machineKey, controlEphemeralPub); err != nil {
-		return nil, fmt.Errorf("computing se: %w", err)
-	}
-	if _, err := s.DecryptAndHash(resp.Tag()); err != nil {
-		return nil, fmt.Errorf("decrypting payload: %w", err)
-	}
-
-	c1, c2, err := s.Split()
-	if err != nil {
-		return nil, fmt.Errorf("finalizing handshake: %w", err)
-	}
-
-	return &Conn{
-		conn:          conn,
-		handshakeHash: s.h,
-		tx:            c1,
-		rx:            c2,
-	}, nil
-}
-
-type RatchetStore interface {
-	GetRatchets(machineKey key.Public) ([]psk, error)
-	SetRatchets(machineKey key.Public, psks []psk) error
-}
-
-// Respond executes an IKpsk1 handshake from the responder's
-// perspective (i.e. control talking to a client), returning the
-// resulting Noise connection.
-func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore RatchetStore) (*Conn, error) {
-	var s symmetricState
-	s.Initialize()
-
-	// <- s
-	// ...
-	controlKeyPub := controlKey.Public()
-	s.MixHash(controlKeyPub[:])
-
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("setting connection deadline: %w", err)
-		}
-		defer func() {
-			conn.SetDeadline(time.Time{})
-		}()
-	}
-
-	// -> e, es, s, ss, psk
-	var init initiationMessage
-	if _, err := io.ReadFull(conn, init[:]); err != nil {
-		return nil, fmt.Errorf("reading initiation: %w", err)
-	}
-
-	var machineEphemeralPub key.Public
-	copy(machineEphemeralPub[:], init.MachineEphemeralPub())
-	s.MixHash(machineEphemeralPub[:])
-	if err := s.MixDH(controlKey, machineEphemeralPub); err != nil {
-		return nil, fmt.Errorf("computing es: %w", err)
-	}
-	var machineKey key.Public
-	rs, err := s.DecryptAndHash(init.MachinePub())
-	if err != nil {
-		return nil, fmt.Errorf("decrypting machine key: %w", err)
-	}
-	copy(machineKey[:], rs)
-	if err := s.MixDH(controlKey, machineKey); err != nil {
-		return nil, fmt.Errorf("computing ss: %w", err)
-	}
-	ratchets, err := rstore.GetRatchets(machineKey)
-	if err != nil {
-		return nil, fmt.Errorf("getting PSK: %w", err)
-	}
-	// We have to try several ratchet values. If we don't get it right
-	// the first time, we need to reset to this step in the handshake
-	// processing.
-	backupState := s
-	var correctPSK *psk
-	for _, ratchet := range ratchets {
-		s.MixKeyAndHash(ratchet)
-		if _, err := s.DecryptAndHash(init.Tag()); err != nil {
-			// Likely the wrong PSK, try another.
-			s = backupState
-			continue
-		}
-		correctPSK = &ratchet
-		break
-	}
-	if correctPSK == nil {
-		// None of the ratchets we know of match this handshake. This
-		// very likely means the machine key was cloned.
-		// TODO: we should return a specific "machine key cloned"
-		// error here, so Control can do remediation.
-		return nil, errors.New("invalid ratchet value")
-	}
-
-	// <- e, ee, se
-	var resp responseMessage
-	controlEphemeral := key.NewPrivate()
-	controlEphemeralPub := controlEphemeral.Public()
-	copy(resp.ControlEphemeralPub(), controlEphemeralPub[:])
-	if err := s.MixDH(controlEphemeral, machineEphemeralPub); err != nil {
-		return nil, fmt.Errorf("computing ee: %w", err)
-	}
-	if err := s.MixDH(controlEphemeral, machineKey); err != nil {
-		return nil, fmt.Errorf("computing se: %w", err)
-	}
-	copy(resp.Tag(), s.EncryptAndHash(nil))
-
-	c1, c2, err := s.Split()
-	if err != nil {
-		return nil, fmt.Errorf("finalizing handshake: %w", err)
-	}
-	ret := &Conn{
-		conn:          conn,
-		handshakeHash: s.h,
-		tx:            c2,
-		rx:            c1,
-	}
-
-	// Handshake is complete, so we create a new ratchet value for the
-	// next connection. We also remember the ratchet value used by the
-	// current connection, to allow for the client crashing before it
-	// persists the new PSK.
-	newRatchets := []psk{psk(s.h), *correctPSK}
-	if err := rstore.SetRatchets(machineKey, newRatchets); err != nil {
-		// Failed to store new values, can't safely complete handshake.
-		return nil, fmt.Errorf("saving new ratchets: %w", err)
-	}
-
-	if _, err := conn.Write(resp[:]); err != nil {
-		return nil, err
-	}
-
-	return ret, nil
 }
 
 // newBLAKE2s returns a hash.Hash implementing BLAKE2s, or panics on

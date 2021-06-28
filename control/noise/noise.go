@@ -22,6 +22,7 @@ import (
 	"hash"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/blake2s"
@@ -33,16 +34,32 @@ import (
 )
 
 const (
-	protocolName     = "Noise_IKpsk1_25519_ChaChaPoly_BLAKE2s"
-	invalidNonce     = ^uint64(0)
-	maxMessageSize   = 65535 // max allowed size of a Noise message
-	maxPlaintextSize = maxMessageSize - poly1305.TagSize
+	protocolName      = "Noise_IKpsk1_25519_ChaChaPoly_BLAKE2s"
+	invalidNonce      = ^uint64(0)
+	maxCiphertextSize = 65535
+	maxPlaintextSize  = maxCiphertextSize - poly1305.TagSize
 )
 
-// Initiate executes an IKpsk1 handshake from the initiator's
-// perspective (i.e. the client talking to Control), returning the
-// resulting Noise connection.
-func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public, psk [32]byte) (*Conn, error) {
+// PSK is a Noise pre-shared key.
+type PSK [32]byte
+
+// Client initiates a Noise client handshake, returning the resulting
+// Noise connection and new pre-shared key to use for future
+// connections.
+//
+// The context deadline, if any, covers the entire handshaking
+// process. The new PSK must be persisted to durable storage before
+// any Conn.Write calls to avoid potential lockout.
+func Client(ctx context.Context, conn net.Conn, machineKey key.Private, controlKey key.Public, psk PSK) (*Conn, PSK, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, PSK{}, fmt.Errorf("setting conn deadline: %w", err)
+		}
+		defer func() {
+			conn.SetDeadline(time.Time{})
+		}()
+	}
+
 	var s symmetricState
 	s.Initialize()
 
@@ -57,53 +74,45 @@ func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, contro
 	copy(init.MachineEphemeralPub(), machineEphemeralPub[:])
 	s.MixHash(machineEphemeralPub[:])
 	if err := s.MixDH(machineEphemeral, controlKey); err != nil {
-		return nil, fmt.Errorf("computing es: %w", err)
+		return nil, PSK{}, fmt.Errorf("computing es: %w", err)
 	}
 	machineKeyPub := machineKey.Public()
 	copy(init.MachinePub(), s.EncryptAndHash(machineKeyPub[:]))
 	if err := s.MixDH(machineKey, controlKey); err != nil {
-		return nil, fmt.Errorf("computing ss: %w", err)
+		return nil, PSK{}, fmt.Errorf("computing ss: %w", err)
 	}
 	s.MixKeyAndHash(psk)
 	copy(init.Tag(), s.EncryptAndHash(nil))
 
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("setting connection deadline: %w", err)
-		}
-		defer func() {
-			conn.SetDeadline(time.Time{})
-		}()
-	}
 	if _, err := conn.Write(init[:]); err != nil {
-		return nil, fmt.Errorf("writing initiation: %w", err)
+		return nil, PSK{}, fmt.Errorf("writing initiation: %w", err)
 	}
 
 	// <- e, ee, se
 	var resp responseMessage
 	if _, err := io.ReadFull(conn, resp[:]); err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return nil, PSK{}, fmt.Errorf("reading response: %w", err)
 	}
 
 	re, err := s.DecryptAndHash(resp.ControlEphemeralPub())
 	if err != nil {
-		return nil, fmt.Errorf("decrypting control ephemeral key: %w", err)
+		return nil, PSK{}, fmt.Errorf("decrypting control ephemeral key: %w", err)
 	}
 	var controlEphemeralPub key.Public
 	copy(controlEphemeralPub[:], re)
 	if err := s.MixDH(machineEphemeral, controlEphemeralPub); err != nil {
-		return nil, fmt.Errorf("computing ee: %w", err)
+		return nil, PSK{}, fmt.Errorf("computing ee: %w", err)
 	}
 	if err := s.MixDH(machineKey, controlEphemeralPub); err != nil {
-		return nil, fmt.Errorf("computing se: %w", err)
+		return nil, PSK{}, fmt.Errorf("computing se: %w", err)
 	}
 	if _, err := s.DecryptAndHash(resp.Tag()); err != nil {
-		return nil, fmt.Errorf("decrypting payload: %w", err)
+		return nil, PSK{}, fmt.Errorf("decrypting payload: %w", err)
 	}
 
 	c1, c2, err := s.Split()
 	if err != nil {
-		return nil, fmt.Errorf("finalizing handshake: %w", err)
+		return nil, PSK{}, fmt.Errorf("finalizing handshake: %w", err)
 	}
 
 	return &Conn{
@@ -111,18 +120,41 @@ func Initiate(ctx context.Context, conn net.Conn, machineKey key.Private, contro
 		handshakeHash: s.h,
 		tx:            c1,
 		rx:            c2,
-	}, nil
+	}, PSK(s.h), nil
 }
 
+// PSKStore allows storing and retrieving PSKs for a machine key.
 type PSKStore interface {
-	GetPSKs(machineKey key.Public) ([][32]byte, error)
-	SetPSKs(machineKey key.Public, psks [][32]byte) error
+	// GetPSKs returns all acceptable PSKs for the given machineKey,
+	// ordered from most to least preferred.
+	//
+	// GetPSKs should only return an error if the store is
+	// malfunctioning. It is not an error to have no PSKs for a
+	// machineKey.
+	GetPSKs(machineKey key.Public) ([]PSK, error)
+	// SetPSKs updates the acceptable PSKs for the given machineKey,
+	// ordered from most to least preferred.
+	//
+	// SetPSKs returns successfully only if the new PSKs were
+	// persisted to durable storage.
+	SetPSKs(machineKey key.Public, psks []PSK) error
 }
 
-// Respond executes an IKpsk1 handshake from the responder's
-// perspective (i.e. control talking to a client), returning the
-// resulting Noise connection.
-func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore PSKStore) (*Conn, error) {
+// Server initiates a Noise server handshake, returning the resulting
+// Noise connection.
+//
+// The context deadline, if any, covers the entire handshaking
+// process.
+func Server(ctx context.Context, conn net.Conn, controlKey key.Private, store PSKStore) (*Conn, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("setting conn deadline: %w", err)
+		}
+		defer func() {
+			conn.SetDeadline(time.Time{})
+		}()
+	}
+
 	var s symmetricState
 	s.Initialize()
 
@@ -130,15 +162,6 @@ func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore 
 	// ...
 	controlKeyPub := controlKey.Public()
 	s.MixHash(controlKeyPub[:])
-
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := conn.SetDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("setting connection deadline: %w", err)
-		}
-		defer func() {
-			conn.SetDeadline(time.Time{})
-		}()
-	}
 
 	// -> e, es, s, ss, psk
 	var init initiationMessage
@@ -161,15 +184,20 @@ func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore 
 	if err := s.MixDH(controlKey, machineKey); err != nil {
 		return nil, fmt.Errorf("computing ss: %w", err)
 	}
-	psks, err := rstore.GetPSKs(machineKey)
+	psks, err := store.GetPSKs(machineKey)
 	if err != nil {
 		return nil, fmt.Errorf("getting PSK: %w", err)
+	}
+	if len(psks) == 0 {
+		// If no PSKs are known, this is a new machine key, and it's
+		// using an all-zero PSK.
+		psks = []PSK{PSK{}}
 	}
 	// We have to try several PSK values. If we don't get it right
 	// the first time, we need to reset to this step in the handshake
 	// processing.
 	backupState := s
-	var correctPSK *[32]byte
+	var correctPSK *PSK
 	for _, psk := range psks {
 		s.MixKeyAndHash(psk)
 		if _, err := s.DecryptAndHash(init.Tag()); err != nil {
@@ -192,7 +220,7 @@ func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore 
 	var resp responseMessage
 	controlEphemeral := key.NewPrivate()
 	controlEphemeralPub := controlEphemeral.Public()
-	copy(resp.ControlEphemeralPub(), controlEphemeralPub[:])
+	copy(resp.ControlEphemeralPub(), s.EncryptAndHash(controlEphemeralPub[:]))
 	if err := s.MixDH(controlEphemeral, machineEphemeralPub); err != nil {
 		return nil, fmt.Errorf("computing ee: %w", err)
 	}
@@ -205,21 +233,32 @@ func Respond(ctx context.Context, conn net.Conn, controlKey key.Private, rstore 
 	if err != nil {
 		return nil, fmt.Errorf("finalizing handshake: %w", err)
 	}
-	ret := &Conn{
-		conn:          conn,
-		handshakeHash: s.h,
-		tx:            c2,
-		rx:            c1,
-	}
 
-	// Handshake is complete, so we create a new ratchet value for the
-	// next connection. We also remember the ratchet value used by the
-	// current connection, to allow for the client crashing before it
-	// persists the new PSK.
-	newPSKs := [][32]byte{s.h, *correctPSK}
-	if err := rstore.SetPSKs(machineKey, newPSKs); err != nil {
+	// Handshake is complete, but we must persist the new PSK before
+	// we respond to the client. Otherwise the client might learn a
+	// new PSK that we forget, which will unrecoverably break the
+	// ratcheting.
+	//
+	// Remember both the new PSK, and the one used in this handshake
+	// (which the client clearly knows). We only drop the older PSK
+	// once the client sends us its first message on this connection,
+	// because the contract for Client states that they will have
+	// persisted the new PSK before transmitting.
+	newPSKs := []PSK{s.h, *correctPSK}
+	if err := store.SetPSKs(machineKey, newPSKs); err != nil {
 		// Failed to store new values, can't safely complete handshake.
 		return nil, fmt.Errorf("saving new ratchets: %w", err)
+	}
+
+	ret := &Conn{
+		conn:          conn,
+		peer:          machineKey,
+		handshakeHash: s.h,
+		confirmPSK: func() error {
+			return store.SetPSKs(machineKey, []PSK{PSK(s.h)})
+		},
+		tx: c2,
+		rx: c1,
 	}
 
 	if _, err := conn.Write(resp[:]); err != nil {
@@ -296,10 +335,10 @@ func (s *symmetricState) MixDH(priv key.Private, pub key.Public) error {
 
 	r := hkdf.New(newBLAKE2s, keyData, s.ck[:], nil)
 	if _, err := io.ReadFull(r, s.ck[:]); err != nil {
-		return fmt.Errorf("computing HKDF: %w", err)
+		return fmt.Errorf("extracting ck: %w", err)
 	}
 	if _, err := io.ReadFull(r, s.k[:]); err != nil {
-		return fmt.Errorf("computing HKDF: %w", err)
+		return fmt.Errorf("extracting k: %w", err)
 	}
 	s.n = 0
 	return nil
@@ -309,15 +348,15 @@ func (s *symmetricState) MixDH(priv key.Private, pub key.Public) error {
 func (s *symmetricState) MixKeyAndHash(psk [32]byte) error {
 	r := hkdf.New(newBLAKE2s, psk[:], s.ck[:], nil)
 	if _, err := io.ReadFull(r, s.ck[:]); err != nil {
-		return fmt.Errorf("computing HKDF: %w", err)
+		return fmt.Errorf("extracting ck: %w", err)
 	}
 	var temph [blake2s.Size]byte
 	if _, err := io.ReadFull(r, temph[:]); err != nil {
-		return fmt.Errorf("computing HKDF: %w", err)
+		return fmt.Errorf("extracting temp_h: %w", err)
 	}
 	s.MixHash(temph[:])
 	if _, err := io.ReadFull(r, s.k[:]); err != nil {
-		return fmt.Errorf("computing HKDF: %w", err)
+		return fmt.Errorf("extracting k: %w", err)
 	}
 	s.n = 0
 	return nil
@@ -368,18 +407,18 @@ func (s *symmetricState) Split() (c1, c2 cipher.AEAD, err error) {
 	var k1, k2 [chp.KeySize]byte
 	r := hkdf.New(newBLAKE2s, nil, s.ck[:], nil)
 	if _, err := io.ReadFull(r, k1[:]); err != nil {
-		return nil, nil, fmt.Errorf("computing HKDF: %w", err)
+		return nil, nil, fmt.Errorf("extracting k1: %w", err)
 	}
 	if _, err := io.ReadFull(r, k2[:]); err != nil {
-		return nil, nil, fmt.Errorf("computing HKDF: %w", err)
+		return nil, nil, fmt.Errorf("extracting k2: %w", err)
 	}
 	c1, err = chp.New(k1[:])
 	if err != nil {
-		return nil, nil, fmt.Errorf("constructing AEAD: %w", err)
+		return nil, nil, fmt.Errorf("constructing AEAD c1: %w", err)
 	}
 	c2, err = chp.New(k2[:])
 	if err != nil {
-		return nil, nil, fmt.Errorf("constructing AEAD: %w", err)
+		return nil, nil, fmt.Errorf("constructing AEAD c2: %w", err)
 	}
 	return c1, c2, nil
 }
@@ -411,18 +450,22 @@ func newCHP(key [chp.KeySize]byte) cipher.AEAD {
 // A Conn represents a secured Noise connection. It implements the
 // net.Conn interface.
 type Conn struct {
-	conn net.Conn
-	// TODO: reuse buffers to avoid allocations. Currently allocates
-	// fresh for every packet.
-	buf []byte // previously decrypted bytes
-
+	conn          net.Conn
 	peer          key.Public
 	handshakeHash [blake2s.Size]byte
 
-	tx  cipher.AEAD
-	txN uint64
-	rx  cipher.AEAD
-	rxN uint64
+	readMu sync.Mutex
+	rx     cipher.AEAD
+	rxN    uint64
+	// TODO: reuse buffers to avoid allocations. Currently allocates
+	// fresh for every packet.
+	buf []byte // previously decrypted bytes
+	// if non-nil, invoked on the first successful Read to lock in the new PSK.
+	confirmPSK func() error
+
+	writeMu sync.Mutex
+	tx      cipher.AEAD
+	txN     uint64
 }
 
 // HandshakeHash returns the Noise handshake hash for the connection,
@@ -439,7 +482,7 @@ func (c *Conn) Peer() key.Public {
 }
 
 // refill reads one Noise message and decrypts it into c.buf.
-func (c *Conn) refill() error {
+func (c *Conn) refillLocked() error {
 	if c.rxN == invalidNonce {
 		// Received 2^64-1 messages on this cipher state. Connection
 		// is no longer usable.
@@ -464,31 +507,31 @@ func (c *Conn) refill() error {
 	}
 
 	c.buf = plaintext
+	if c.confirmPSK != nil {
+		c.confirmPSK()
+		c.confirmPSK = nil
+	}
 	return nil
 }
 
-// scorch deletes the cipher state for c. After scorching, the
-// connection can no longer receive or transmit data.
-func (c *Conn) scorch() {
-	c.tx = nil
-	c.txN = invalidNonce
-	c.rx = nil
-	c.rxN = invalidNonce
-}
-
 func (c *Conn) Read(bs []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
 	if c.rx == nil {
 		return 0, net.ErrClosed
 	}
 	if c.rxN == invalidNonce {
 		// Somehow sent 2^64-1 messages on this cipher
 		// state. Connection is no longer usable.
-		c.scorch()
+		c.conn.Close()
+		c.rx = nil
 		return 0, net.ErrClosed
 	}
 	if len(c.buf) == 0 {
-		if err := c.refill(); err != nil {
-			c.scorch()
+		if err := c.refillLocked(); err != nil {
+			c.conn.Close()
+			c.rx = nil
 			return 0, err
 		}
 	}
@@ -498,6 +541,9 @@ func (c *Conn) Read(bs []byte) (int, error) {
 }
 
 func (c *Conn) Write(bs []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	if c.tx == nil {
 		return 0, net.ErrClosed
 	}
@@ -507,7 +553,8 @@ func (c *Conn) Write(bs []byte) (int, error) {
 		if c.rxN == invalidNonce {
 			// Somehow sent 2^64-1 messages on this cipher
 			// state. Connection is no longer usable.
-			c.scorch()
+			c.conn.Close()
+			c.tx = nil
 			return 0, net.ErrClosed
 		}
 
@@ -525,7 +572,8 @@ func (c *Conn) Write(bs []byte) (int, error) {
 		c.txN++
 		c.tx.Seal(ciphertext[:2], nonce[:], toSend, nil)
 		if _, err := c.conn.Write(ciphertext); err != nil {
-			c.scorch()
+			c.conn.Close()
+			c.tx = nil
 			return sent, err
 		}
 		sent += len(toSend)
@@ -534,8 +582,14 @@ func (c *Conn) Write(bs []byte) (int, error) {
 }
 
 func (c *Conn) Close() error {
-	c.scorch()
-	return c.conn.Close()
+	closeErr := c.conn.Close() // unblocks any waiting reads or writes
+	c.readMu.Lock()
+	c.rx = nil
+	c.readMu.Unlock()
+	c.writeMu.Lock()
+	c.tx = nil
+	c.writeMu.Unlock()
+	return closeErr
 }
 
 func (c *Conn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }

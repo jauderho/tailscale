@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,19 +28,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	"unicode"
 
 	"go4.org/mem"
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-=======
 	"golang.org/x/net/proxy"
->>>>>>> 574e88e911... dialer issue
-	"inet.af/netaddr"
-	"tailscale.com/derp"
-	"tailscale.com/derp/derphttp"
->>>>>>> daf4917a42... increased tests
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
@@ -299,151 +290,91 @@ func TestAddPingRequest(t *testing.T) {
 }
 
 func TestTwoNodeConnectivity(t *testing.T) {
-	// t.Parallel()
 	bins := BuildTestBinaries(t)
-
 	env := newTestEnv(t, bins)
 	defer env.Close()
 
-	if err := tstest.WaitFor(20*time.Second, func() error {
-		// Create two nodes and hope that logs come out correctly
-		socks5Arg := "--socks5-server=" + "localhost:0"
-		n1 := newTestNode(t, env)
-		d1 := n1.StartDaemon(t, socks5Arg)
-		defer d1.Kill()
+	// Create two nodes and hope that logs come out correctly
+	n1 := newTestNode(t, env)
+	n1SocksAddrCh := n1.socks5AddrChan()
+	d1 := n1.StartDaemon(t)
+	defer d1.Kill()
 
-		n2 := newTestNode(t, env)
-		d2 := n2.StartDaemon(t, socks5Arg)
-		defer d2.Kill()
+	n2 := newTestNode(t, env)
+	n2SocksAddrCh := n2.socks5AddrChan()
+	d2 := n2.StartDaemon(t)
+	defer d2.Kill()
 
-		n1.AwaitListening(t)
-		n2.AwaitListening(t)
-		n1.MustUp()
-		n2.MustUp()
-		n1.AwaitRunning(t)
-		n2.AwaitRunning(t)
-		// n1IP := n1.AwaitIP(t)
-		// n2IP := n2.AwaitIP(t)
+	n1Socks := n1.AwaitSocksAddr(t, n1SocksAddrCh)
+	n2Socks := n2.AwaitSocksAddr(t, n2SocksAddrCh)
+	t.Logf("node1 SOCKS5 addr: %v", n1Socks)
+	t.Logf("node2 SOCKS5 addr: %v", n2Socks)
 
-		defer func() {
-			d1.MustCleanShutdown(t)
-			d2.MustCleanShutdown(t)
-			d1.Kill()
-			d2.Kill()
-		}()
+	n1.AwaitListening(t)
+	n2.AwaitListening(t)
+	n1.MustUp()
+	n2.MustUp()
+	n1.AwaitRunning(t)
+	n2.AwaitRunning(t)
+	n2IP := n2.AwaitIP(t)
 
-		const sub = `SOCK-TEST : `
-		t.Log("Starting Test!")
-		logStr := env.LogCatcher.logsString()
-		subCount := strings.Count(logStr, sub)
+	defer func() {
+		d1.MustCleanShutdown(t)
+		d2.MustCleanShutdown(t)
+		d1.Kill()
+		d2.Kill()
+	}()
 
-		if subCount < 2 {
-			return fmt.Errorf("expected %d SOCK-TEST addresses, got %d addresses", 2, subCount)
-		}
+	// Try communicating with the two addresss.
+	l, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		if !env.LogCatcher.logsContains(mem.S(sub)) {
-			return fmt.Errorf("log catcher didn't see %#q; got %s", sub, env.LogCatcher.logsString())
-		}
-
-		firstIndex := env.LogCatcher.logsIndex(mem.S(sub))
-		secondIndex := env.LogCatcher.logsIndexLast(mem.S(sub))
-
-		if firstIndex == -1 {
-			return fmt.Errorf("cold not find tcp listener")
-		}
-
-		if secondIndex == -1 {
-			return fmt.Errorf("cold not find tcp listener for second node")
-		}
-
-		if firstIndex == secondIndex {
-			return fmt.Errorf("exected %d TCP listeners, got %d", 2, strings.Count(logStr, sub))
-		}
-
-		// Takes the index and tries to seek and obtain a proper netaddr with PORT.
-		retrieveAddressFromString := func(logString string, index int) (netaddr.IPPort, error) {
-			firstAddrSplit := strings.Fields(logString[index+len(sub) : index+len(sub)+20])
-
-			if len(firstAddrSplit) == 0 {
-				err := fmt.Errorf("could not parse the tcp listener address from %v", firstAddrSplit)
-				return netaddr.IPPort{}, err
-			}
-			// Build the proper address for parsing
-			addr := ""
-			for _, c := range firstAddrSplit[0] {
-				if unicode.IsDigit(c) || c == '.' || c == ':' {
-					addr += string(c)
-				}
-			}
-			t.Logf("Processed address : %v, before processing : %v", addr, firstAddrSplit)
-			return netaddr.ParseIPPort(addr)
-		}
-
-		n1Addr, err := retrieveAddressFromString(logStr, firstIndex)
-		if err != nil {
-			return fmt.Errorf("%v", err)
-		}
-
-		n2Addr, err := retrieveAddressFromString(logStr, secondIndex)
-		if err != nil {
-			return fmt.Errorf("%v", err)
-		}
-
-		t.Logf("Node 1 TCP Listener : %v, Node 2 TCP Listener : %v\n", n1Addr, n2Addr)
-
-		// Try communicating with the two addresss.
-		l, err := net.Listen("tcp", "localhost:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Dial this conn.addr
-		go func() {
-			conn, err := l.Accept()
-			if err != nil {
-				t.Error(err)
-			}
-			defer conn.Close()
-			_, err = conn.Write([]byte("TestString"))
-			if err != nil {
-				t.Error(err)
-			}
-			t.Logf("Wrote string from %v to %v\n", conn.LocalAddr(), conn.RemoteAddr())
-		}()
-
-		dialer, err := proxy.SOCKS5("tcp", n1Addr.String(), nil, nil)
+	// Dial this conn.addr
+	go func() {
+		conn, err := l.Accept()
 		if err != nil {
 			t.Error(err)
 		}
-
-		port := l.Addr().(*net.TCPAddr)
-		testIP := net.JoinHostPort(n2Addr.IP().String(), strconv.Itoa(port.Port))
-		t.Log("Dialing : ", testIP)
-		dialerConn, err := dialer.Dial("tcp", testIP)
-
+		defer conn.Close()
+		_, err = conn.Write([]byte("TestString"))
 		if err != nil {
 			t.Error(err)
 		}
-		defer dialerConn.Close()
+		t.Logf("Wrote string from %v to %v", conn.LocalAddr(), conn.RemoteAddr())
+	}()
 
-		t.Logf("Dialer Connection Established at %v", dialerConn.LocalAddr())
-		_, err = dialerConn.Write([]byte("TestTest"))
-		if err != nil {
-			t.Error(err)
-		}
-
-		// Read the bytes in
-		p := make([]byte, 1024)
-		n, err := dialerConn.Read(p)
-		if err != nil {
-			t.Error(err)
-		}
-
-		t.Log(n, string(p))
-		return nil
-	}); err != nil {
+	dialer, err := proxy.SOCKS5("tcp", n1Socks, nil, nil)
+	if err != nil {
 		t.Error(err)
 	}
+
+	port := l.Addr().(*net.TCPAddr)
+	t.Log(port)
+
+	testIP := strings.ReplaceAll(net.JoinHostPort(n2IP, strconv.Itoa(port.Port)), "\n", "")
+	t.Log("Dialing : ", testIP)
+
+	dialerConn, err := dialer.Dial("tcp", testIP)
+	if err != nil {
+		t.Error(err)
+	}
+	defer dialerConn.Close()
+
+	t.Logf("Dialer Connection Established at %v", dialerConn.LocalAddr())
+	_, err = dialerConn.Write([]byte("TestTest"))
+	if err != nil {
+		t.Error(err)
+	}
+
+	// Read the bytes in
+	p := make([]byte, 1024)
+	n, err := dialerConn.Read(p)
+	if err != nil {
+		t.Error(err)
+	}
+	t.Log(n, string(p))
 }
 
 // testEnv contains the test environment (set of servers) used by one
@@ -642,27 +573,13 @@ func (d *Daemon) MustCleanShutdown(t testing.TB) {
 
 // StartDaemon starts the node's tailscaled, failing if it fails to
 // start.
-// Additional flags to tailscaled can be passed through specialArgs
-func (n *testNode) StartDaemon(t testing.TB, specialArgs ...string) *Daemon {
-	var cmd *exec.Cmd
-	// Support additional flags in starting up tailscaled
-	if len(specialArgs) > 0 {
-		flags := []string{
-			"--tun=userspace-networking",
-			"--state=" + n.stateFile,
-			"--socket=" + n.sockFile,
-		}
-		flags = append(flags, specialArgs...)
-
-		cmd = exec.Command(n.env.Binaries.Daemon, flags...)
-	} else {
-		cmd = exec.Command(n.env.Binaries.Daemon,
-			"--tun=userspace-networking",
-			"--state="+n.stateFile,
-			"--socket="+n.sockFile,
-		)
-
-	}
+func (n *testNode) StartDaemon(t testing.TB) *Daemon {
+	cmd := exec.Command(n.env.Binaries.Daemon,
+		"--tun=userspace-networking",
+		"--state="+n.stateFile,
+		"--socket="+n.sockFile,
+		"--socks5-server=localhost:0",
+	)
 	cmd.Env = append(os.Environ(),
 		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
 		"HTTP_PROXY="+n.env.TrafficTrapServer.URL,
@@ -780,18 +697,6 @@ func (lc *logCatcher) logsContains(sub mem.RO) bool {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
 	return mem.Contains(mem.B(lc.buf.Bytes()), sub)
-}
-
-func (lc *logCatcher) logsIndex(sub mem.RO) int {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	return mem.Index(mem.B(lc.buf.Bytes()), sub)
-}
-
-func (lc *logCatcher) logsIndexLast(sub mem.RO) int {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	return mem.LastIndex(mem.B(lc.buf.Bytes()), sub)
 }
 
 func (lc *logCatcher) numRequests() int {

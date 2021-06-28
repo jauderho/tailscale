@@ -454,7 +454,7 @@ func (c *Conn) refill() error {
 	}
 
 	payloadLen := binary.BigEndian.Uint16(sz[:])
-	ciphertext := make([]byte, payloadLen)
+	ciphertext := make([]byte, payloadLen) // TODO: reuse bufs
 	if _, err := io.ReadFull(c.conn, ciphertext); err != nil {
 		return err
 	}

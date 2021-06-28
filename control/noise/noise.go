@@ -443,6 +443,11 @@ func (c *Conn) Peer() key.Public {
 
 // refill reads one Noise message and decrypts it into c.buf.
 func (c *Conn) refill() error {
+	if c.rxN == invalidNonce {
+		// Received 2^64-1 messages on this cipher state. Connection
+		// is no longer usable.
+		return net.ErrClosed
+	}
 	var sz [2]byte
 	if _, err := io.ReadFull(c.conn, sz[:]); err != nil {
 		return err

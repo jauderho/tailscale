@@ -41,11 +41,15 @@ type upnpClient interface {
 	AddPortMapping(
 		ctx context.Context,
 
-		// remoteHost is the remote device sending packets to this device, in the format of x.x.x.x,
-		// where any host, aka a wildcard, is the empty string: "".
+		// remoteHost is the remote device sending packets to this device, in the format of x.x.x.x.
+		// The empty string, "", means any host out on the internet can send packets in.
 		remoteHost string,
 
 		// externalPort is the exposed port of this port mapping. Visible during NAT operations.
+		// 0 will let the router select the port, but there is an additional call,
+		// `AddAnyPortMapping`, which is available on 1 of the 3 possible protocols,
+		// which should be used if available. See `addAnyPortMapping` below, which calls this if
+		// `AddAnyPortMapping` is not supported.
 		externalPort uint16,
 
 		// protocol is whether this is over TCP or UDP. Either "tcp" or "udp".
@@ -115,48 +119,33 @@ func addAnyPortMapping(
 // now.
 // Adapted from https://github.com/huin/goupnp/blob/master/GUIDE.md.
 func getUPnPClient(ctx context.Context) (upnpClient, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	tasks, ctx := errgroup.WithContext(ctx)
+	tasks, _ := errgroup.WithContext(ctx)
 	// Attempt to connect over the multiple available connection types concurrently,
 	// returning the fastest.
 	var ip1Clients []*internetgateway2.WANIPConnection1
 	var errs [3]error
 	tasks.Go(func() error {
 		var err error
-		ip1Clients, _, err = internetgateway2.NewWANIPConnection1Clients()
+		ip1Clients, _, err = internetgateway2.NewWANIPConnection1Clients(ctx)
 		errs[0] = err
 		return nil
 	})
 	var ip2Clients []*internetgateway2.WANIPConnection2
 	tasks.Go(func() error {
 		var err error
-		ip2Clients, _, err = internetgateway2.NewWANIPConnection2Clients()
+		ip2Clients, _, err = internetgateway2.NewWANIPConnection2Clients(ctx)
 		errs[1] = err
 		return nil
 	})
 	var ppp1Clients []*internetgateway2.WANPPPConnection1
 	tasks.Go(func() error {
 		var err error
-		ppp1Clients, _, err = internetgateway2.NewWANPPPConnection1Clients()
+		ppp1Clients, _, err = internetgateway2.NewWANPPPConnection1Clients(ctx)
 		errs[2] = err
 		return nil
 	})
-	deadline, ok := ctx.Deadline()
-	remaining := time.Until(deadline)
-	if !ok {
-		remaining = 5 * time.Second
-	}
 
-	var err error
-	select {
-	case <-ctx.Done():
-		if err = ctx.Err(); err != nil && err != context.DeadlineExceeded {
-			return nil, err
-		}
-	case <-time.After(remaining):
-		err = context.DeadlineExceeded
-	}
+	err := tasks.Wait()
 
 	switch {
 	case len(ip2Clients) > 0:

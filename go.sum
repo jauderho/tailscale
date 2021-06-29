@@ -579,8 +579,10 @@ github.com/tailscale/certstore v0.0.0-20210528134328-066c94b793d3 h1:fEubocuQkrl
 github.com/tailscale/certstore v0.0.0-20210528134328-066c94b793d3/go.mod h1:2P+hpOwd53e7JMX/L4f3VXkv1G+33ES6IWZSrkIeWNs=
 github.com/tailscale/depaware v0.0.0-20201214215404-77d1e9757027 h1:lK99QQdH3yBWY6aGilF+IRlQIdmhzLrsEmF6JgN+Ryw=
 github.com/tailscale/depaware v0.0.0-20201214215404-77d1e9757027/go.mod h1:p9lPsd+cx33L3H9nNoecRRxPssFKUwwI50I3pZ0yT+8=
-github.com/tailscale/goupnp v1.0.1-0.20210624221641-6698502bed79 h1:oKYtJJApDorcXqfmAExCKDixUpTU7axIXvDy6fAUS24=
-github.com/tailscale/goupnp v1.0.1-0.20210624221641-6698502bed79/go.mod h1:YwLsxdcMLE1xXbkXdHhyiK0S6GEwRPMEQssP7FZBACM=
+github.com/tailscale/goupnp v1.0.1-0.20210629174436-7df6c9efe30c h1:F+pROyGPs+9wdB7jBPHr9IZEF8SKj9YUCFFShnyLNZM=
+github.com/tailscale/goupnp v1.0.1-0.20210629174436-7df6c9efe30c/go.mod h1:PdCqy9JzfWMJf1H5UJW2ip33/d4YkoKN0r67yKH1mG8=
+github.com/tailscale/goupnp v1.0.1-0.20210629175715-39c5a55db683 h1:ZXmZQuVebYllEJL/dpttpIDGx723ezC5GJkHIu0YKrM=
+github.com/tailscale/goupnp v1.0.1-0.20210629175715-39c5a55db683/go.mod h1:PdCqy9JzfWMJf1H5UJW2ip33/d4YkoKN0r67yKH1mG8=
 github.com/tcnksm/go-httpstat v0.2.0 h1:rP7T5e5U2HfmOBmZzGgGZjBQ5/GluWUylujl0tJ04I0=
 github.com/tcnksm/go-httpstat v0.2.0/go.mod h1:s3JVJFtQxtBEBC9dwcdTTXS9xFnM3SXAZwPG41aurT8=
 github.com/tdakkota/asciicheck v0.0.0-20200416190851-d7f85be797a2/go.mod h1:yHp0ai0Z9gUljN3o0xMhYJnH/IcvkdTBOX2fmJ93JEM=

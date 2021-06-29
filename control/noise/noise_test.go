@@ -18,6 +18,19 @@ import (
 	"tailscale.com/types/key"
 )
 
+func TestMessageSize(t *testing.T) {
+	// This test is a regression guard against someone looking at
+	// maxCiphertextSize, going "huh, we could be more efficient if it
+	// were larger, and accidentally violating the Noise spec. Do not
+	// change this max value, it's a deliberate limitation of the
+	// cryptographic protocol we use (see Section 3 "Message Format"
+	// of the Noise spec).
+	const max = 65535
+	if maxCiphertextSize > max {
+		t.Fatalf("max ciphertext size is %d, which is larger than the maximum noise message size %d", maxCiphertextSize, max)
+	}
+}
+
 func TestConnect(t *testing.T) {
 	s1, s2 := tsnettest.NewConn("noise", 4096)
 	controlKey := key.NewPrivate()
@@ -73,8 +86,7 @@ func TestConnect(t *testing.T) {
 	}
 }
 
-func TestNoise(t *testing.T) {
-	t.Skip("bork, conn doesn't match the interface contract yet")
+func TestConn(t *testing.T) {
 	nettest.TestConn(t, func() (c1 net.Conn, c2 net.Conn, stop func(), err error) {
 		s1, s2 := tsnettest.NewConn("noise", 4096)
 		controlKey := key.NewPrivate()

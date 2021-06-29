@@ -31,8 +31,9 @@ import (
 const (
 	protocolName      = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
 	invalidNonce      = ^uint64(0)
-	maxCiphertextSize = 65535
-	maxPlaintextSize  = maxCiphertextSize - poly1305.TagSize
+	maxPlaintextSize  = 4096
+	maxCiphertextSize = maxPlaintextSize + poly1305.TagSize
+	maxPacketSize     = maxCiphertextSize + 2 // ciphertext + length header
 )
 
 // Client initiates a Noise client handshake, returning the resulting
@@ -370,17 +371,21 @@ type Conn struct {
 	peer          key.Public
 	handshakeHash [blake2s.Size]byte
 
-	readMu sync.Mutex
-	rx     cipher.AEAD
-	rxN    uint64
-	// TODO: reuse buffers to avoid allocations. Currently allocates
-	// fresh for every packet.
-	buf []byte // previously decrypted bytes
+	readMu      sync.Mutex
+	rx          cipher.AEAD
+	rxNonce     [chp.NonceSize]byte
+	rxBuf       [maxPacketSize]byte
+	rxN         int    // number of valid bytes in rxBuf
+	rxPlaintext []byte // slice into rxBuf of decrypted bytes
 
 	writeMu sync.Mutex
 	tx      cipher.AEAD
-	txN     uint64
+	txNonce [chp.NonceSize]byte
+	txBuf   [maxPacketSize]byte
+	txErr   error // records the first write error for all future calls
 }
+
+// 2b length, Nb payload
 
 // HandshakeHash returns the Noise handshake hash for the connection,
 // which can be used to bind other messages to this connection
@@ -395,32 +400,52 @@ func (c *Conn) Peer() key.Public {
 	return c.peer
 }
 
-// refill reads one Noise message and decrypts it into c.buf.
+func (c *Conn) readNLocked(total int) ([]byte, error) {
+	if total <= c.rxN {
+		return c.rxBuf[:c.rxN], nil
+	}
+
+	n, err := io.ReadFull(c.conn, c.rxBuf[c.rxN:total])
+	c.rxN += n
+	return c.rxBuf[:c.rxN], err
+}
+
+func validNonce(nonce []byte) bool {
+	return binary.BigEndian.Uint32(nonce[:4]) == 0 && binary.BigEndian.Uint64(nonce[4:]) != invalidNonce
+}
+
+func incrNonce(nonce []byte) {
+	if !validNonce(nonce) { // Last ditch attempt to prevent accidental nonce reuse.
+		panic("cannot increment invalidNonce")
+	}
+	binary.BigEndian.PutUint64(nonce[4:], 1+binary.BigEndian.Uint64(nonce[4:]))
+}
+
+// refill reads one Noise message and decrypts it into c.rxBuf.
 func (c *Conn) refillLocked() error {
-	if c.rxN == invalidNonce {
+	if !validNonce(c.rxNonce[:]) {
 		// Received 2^64-1 messages on this cipher state. Connection
 		// is no longer usable.
 		return net.ErrClosed
 	}
-	var sz [2]byte
-	if _, err := io.ReadFull(c.conn, sz[:]); err != nil {
-		return err
-	}
 
-	payloadLen := binary.BigEndian.Uint16(sz[:])
-	ciphertext := make([]byte, payloadLen) // TODO: reuse bufs
-	if _, err := io.ReadFull(c.conn, ciphertext); err != nil {
+	bs, err := c.readNLocked(2)
+	if err != nil {
 		return err
 	}
-	var nonce [chp.NonceSize]byte
-	binary.BigEndian.PutUint64(nonce[4:], c.rxN)
-	c.rxN++
-	plaintext, err := c.rx.Open(ciphertext[:0], nonce[:], ciphertext, nil)
+	payloadLen := int(binary.BigEndian.Uint16(bs[:2]))
+	bs, err = c.readNLocked(2 + payloadLen)
 	if err != nil {
 		return err
 	}
 
-	c.buf = plaintext
+	c.rxPlaintext, err = c.rx.Open(bs[2:2], c.rxNonce[:], bs[2:], nil)
+	if err != nil {
+		// Decryption error, must torch the crypto state. TODO
+		return err
+	}
+	incrNonce(c.rxNonce[:])
+	c.rxN = 0 // So the next refill starts reading the next frame.
 	return nil
 }
 
@@ -431,28 +456,30 @@ func (c *Conn) Read(bs []byte) (int, error) {
 	if c.rx == nil {
 		return 0, net.ErrClosed
 	}
-	if c.rxN == invalidNonce {
-		// Somehow sent 2^64-1 messages on this cipher
-		// state. Connection is no longer usable.
-		c.conn.Close()
-		c.rx = nil
-		return 0, net.ErrClosed
-	}
-	if len(c.buf) == 0 {
+	// Loop to handle receiving a zero-byte Noise message. Just skip
+	// over it and keep decrypting until we find some bytes.
+	for len(c.rxPlaintext) == 0 {
 		if err := c.refillLocked(); err != nil {
-			c.conn.Close()
-			c.rx = nil
 			return 0, err
 		}
 	}
-	n := copy(bs, c.buf)
-	c.buf = c.buf[n:]
+	n := copy(bs, c.rxPlaintext)
+	c.rxPlaintext = c.rxPlaintext[n:]
 	return n, nil
 }
 
-func (c *Conn) Write(bs []byte) (int, error) {
+func (c *Conn) Write(bs []byte) (n int, err error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+
+	if c.txErr != nil {
+		return 0, c.txErr
+	}
+	defer func() {
+		if err != nil {
+			c.txErr = err
+		}
+	}()
 
 	if c.tx == nil {
 		return 0, net.ErrClosed
@@ -460,10 +487,9 @@ func (c *Conn) Write(bs []byte) (int, error) {
 
 	var sent int
 	for len(bs) > 0 {
-		if c.rxN == invalidNonce {
+		if !validNonce(c.txNonce[:]) {
 			// Somehow sent 2^64-1 messages on this cipher
-			// state. Connection is no longer usable.
-			c.conn.Close()
+			// state. Can no longer write.
 			c.tx = nil
 			return 0, net.ErrClosed
 		}
@@ -474,15 +500,10 @@ func (c *Conn) Write(bs []byte) (int, error) {
 		}
 		bs = bs[len(toSend):]
 
-		// TODO: reuse buffers, be less wasteful.
-		ciphertext := make([]byte, len(toSend)+poly1305.TagSize+2)
-		binary.BigEndian.PutUint16(ciphertext[:2], uint16(len(ciphertext)-2))
-		var nonce [chp.NonceSize]byte
-		binary.BigEndian.PutUint64(nonce[4:], c.txN)
-		c.txN++
-		c.tx.Seal(ciphertext[:2], nonce[:], toSend, nil)
+		binary.BigEndian.PutUint16(c.txBuf[:2], uint16(len(toSend)+poly1305.TagSize))
+		ciphertext := c.tx.Seal(c.txBuf[:2], c.txNonce[:], toSend, nil)
+		incrNonce(c.txNonce[:])
 		if _, err := c.conn.Write(ciphertext); err != nil {
-			c.conn.Close()
 			c.tx = nil
 			return sent, err
 		}

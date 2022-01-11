@@ -18,7 +18,7 @@ require (
 	github.com/goreleaser/nfpm v1.10.3
 	github.com/jsimonetti/rtnetlink v0.0.0-20210525051524-4cc836578190
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51
-	github.com/klauspost/compress v1.12.2
+	github.com/klauspost/compress v1.13.6
 	github.com/kr/pty v1.1.8
 	github.com/mdlayher/netlink v1.4.1
 	github.com/mdlayher/sdnotify v0.0.0-20210228150836-ea3ec207d697

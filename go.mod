@@ -22,7 +22,7 @@ require (
 	github.com/kr/pty v1.1.8
 	github.com/mdlayher/netlink v1.4.1
 	github.com/mdlayher/sdnotify v0.0.0-20210228150836-ea3ec207d697
-	github.com/miekg/dns v1.1.42
+	github.com/miekg/dns v1.1.45
 	github.com/pborman/getopt v1.1.0
 	github.com/peterbourgon/ff/v2 v2.0.0
 	github.com/pkg/sftp v1.13.0
@@ -32,12 +32,12 @@ require (
 	github.com/toqueteos/webbrowser v1.2.0
 	go4.org/mem v0.0.0-20201119185036-c04c5a6ff174
 	golang.org/x/crypto v0.0.0-20210513164829-c07d793c2f9a
-	golang.org/x/net v0.0.0-20210525063256-abc453219eb5
+	golang.org/x/net v0.0.0-20210726213435-c6fcb2dbf985
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210616094352-59db8d763f22
+	golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c
 	golang.org/x/term v0.0.0-20210503060354-a79de5458b56
 	golang.org/x/time v0.0.0-20210611083556-38a9dc6acbc6
-	golang.org/x/tools v0.1.2
+	golang.org/x/tools v0.1.6-0.20210726203631-07bc1bf47fb2
 	golang.zx2c4.com/wireguard v0.0.0-20210525143454-64cb82f2b3f5
 	golang.zx2c4.com/wireguard/windows v0.3.15-0.20210525143335-94c0476d63e3
 	honnef.co/go/tools v0.1.4

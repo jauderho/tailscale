@@ -40,7 +40,7 @@ require (
 	golang.org/x/tools v0.1.2
 	golang.zx2c4.com/wireguard v0.0.0-20210525143454-64cb82f2b3f5
 	golang.zx2c4.com/wireguard/windows v0.3.15-0.20210525143335-94c0476d63e3
-	honnef.co/go/tools v0.1.4
+	honnef.co/go/tools v0.2.2
 	inet.af/netaddr v0.0.0-20210602152128-50f8686885e3
 	inet.af/netstack v0.0.0-20210622165351-29b14ebc044e
 	inet.af/peercred v0.0.0-20210318190834-4259e17bb763

@@ -5,108 +5,72 @@
 package netstack
 
 import (
-	"reflect"
+	"runtime"
 	"testing"
 
 	"inet.af/netaddr"
-	"tailscale.com/tailcfg"
-	"tailscale.com/types/netmap"
+	"tailscale.com/net/packet"
+	"tailscale.com/net/tsdial"
+	"tailscale.com/net/tstun"
+	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/filter"
 )
 
-func TestDNSMapFromNetworkMap(t *testing.T) {
-	pfx := netaddr.MustParseIPPrefix
-	ip := netaddr.MustParseIP
-	tests := []struct {
-		name string
-		nm   *netmap.NetworkMap
-		want DNSMap
-	}{
-		{
-			name: "self",
-			nm: &netmap.NetworkMap{
-				Name: "foo.tailnet",
-				Addresses: []netaddr.IPPrefix{
-					pfx("100.102.103.104/32"),
-					pfx("100::123/128"),
-				},
-			},
-			want: DNSMap{
-				"foo":         ip("100.102.103.104"),
-				"foo.tailnet": ip("100.102.103.104"),
-			},
-		},
-		{
-			name: "self_and_peers",
-			nm: &netmap.NetworkMap{
-				Name: "foo.tailnet",
-				Addresses: []netaddr.IPPrefix{
-					pfx("100.102.103.104/32"),
-					pfx("100::123/128"),
-				},
-				Peers: []*tailcfg.Node{
-					{
-						Name: "a.tailnet",
-						Addresses: []netaddr.IPPrefix{
-							pfx("100.0.0.201/32"),
-							pfx("100::201/128"),
-						},
-					},
-					{
-						Name: "b.tailnet",
-						Addresses: []netaddr.IPPrefix{
-							pfx("100::202/128"),
-						},
-					},
-				},
-			},
-			want: DNSMap{
-				"foo":         ip("100.102.103.104"),
-				"foo.tailnet": ip("100.102.103.104"),
-				"a":           ip("100.0.0.201"),
-				"a.tailnet":   ip("100.0.0.201"),
-				"b":           ip("100::202"),
-				"b.tailnet":   ip("100::202"),
-			},
-		},
-		{
-			name: "self_has_v6_only",
-			nm: &netmap.NetworkMap{
-				Name: "foo.tailnet",
-				Addresses: []netaddr.IPPrefix{
-					pfx("100::123/128"),
-				},
-				Peers: []*tailcfg.Node{
-					{
-						Name: "a.tailnet",
-						Addresses: []netaddr.IPPrefix{
-							pfx("100.0.0.201/32"),
-							pfx("100::201/128"),
-						},
-					},
-					{
-						Name: "b.tailnet",
-						Addresses: []netaddr.IPPrefix{
-							pfx("100::202/128"),
-						},
-					},
-				},
-			},
-			want: DNSMap{
-				"foo":         ip("100::123"),
-				"foo.tailnet": ip("100::123"),
-				"a":           ip("100::201"),
-				"a.tailnet":   ip("100::201"),
-				"b":           ip("100::202"),
-				"b.tailnet":   ip("100::202"),
-			},
-		},
+// TestInjectInboundLeak tests that injectInbound doesn't leak memory.
+// See https://github.com/tailscale/tailscale/issues/3762
+func TestInjectInboundLeak(t *testing.T) {
+	tunDev := tstun.NewFake()
+	dialer := new(tsdial.Dialer)
+	logf := func(format string, args ...interface{}) {
+		if !t.Failed() {
+			t.Logf(format, args...)
+		}
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := DNSMapFromNetworkMap(tt.nm)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("mismatch:\n got %v\nwant %v\n", got, tt.want)
-			}
-		})
+	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
+		Tun:    tunDev,
+		Dialer: dialer,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer eng.Close()
+	ig, ok := eng.(wgengine.InternalsGetter)
+	if !ok {
+		t.Fatal("not an InternalsGetter")
+	}
+	tunWrap, magicSock, ok := ig.GetInternals()
+	if !ok {
+		t.Fatal("failed to get internals")
+	}
+
+	ns, err := Create(logf, tunWrap, eng, magicSock, dialer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+	ns.ProcessLocalIPs = true
+	if err := ns.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ns.atomicIsLocalIPFunc.Store(func(netaddr.IP) bool { return true })
+
+	pkt := &packet.Parsed{}
+	const N = 10_000
+	ms0 := getMemStats()
+	for i := 0; i < N; i++ {
+		outcome := ns.injectInbound(pkt, tunWrap)
+		if outcome != filter.DropSilently {
+			t.Fatalf("got outcome %v; want DropSilently", outcome)
+		}
+	}
+	ms1 := getMemStats()
+	if grew := int64(ms1.HeapObjects) - int64(ms0.HeapObjects); grew >= N {
+		t.Fatalf("grew by %v (which is too much and >= the %v packets we sent)", grew, N)
+	}
+}
+
+func getMemStats() (ms runtime.MemStats) {
+	runtime.GC()
+	runtime.ReadMemStats(&ms)
+	return
 }

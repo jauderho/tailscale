@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"unicode"
+	"unsafe"
 )
 
 type filchTest struct {
@@ -53,6 +54,39 @@ func (f *filchTest) close(t *testing.T) {
 	t.Helper()
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDropOldLogs(t *testing.T) {
+	const line1 = "123456789" // 10 bytes (9+newline)
+	tests := []struct {
+		write, read int
+	}{
+		{10, 10},
+		{100, 100},
+		{200, 200},
+		{250, 150},
+		{500, 200},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("w%d-r%d", tc.write, tc.read), func(t *testing.T) {
+			filePrefix := t.TempDir()
+			f := newFilchTest(t, filePrefix, Options{ReplaceStderr: false, MaxFileSize: 1000})
+			defer f.close(t)
+			// Make filch rotate the logs 3 times
+			for i := 0; i < tc.write; i++ {
+				f.write(t, line1)
+			}
+			// We should only be able to read the last 150 lines
+			for i := 0; i < tc.read; i++ {
+				f.read(t, line1)
+				if t.Failed() {
+					t.Logf("could only read %d lines", i)
+					break
+				}
+			}
+			f.readEOF(t)
+		})
 	}
 }
 
@@ -167,5 +201,12 @@ func TestFilchStderr(t *testing.T) {
 	}
 	if len(b) > 0 {
 		t.Errorf("unexpected write to fake stderr: %s", b)
+	}
+}
+
+func TestSizeOf(t *testing.T) {
+	s := unsafe.Sizeof(Filch{})
+	if s > 4096 {
+		t.Fatalf("Filch{} has size %d on %v, decrease size of buf field", s, runtime.GOARCH)
 	}
 }

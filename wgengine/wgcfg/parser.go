@@ -6,16 +6,15 @@ package wgcfg
 
 import (
 	"bufio"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 
+	"go4.org/mem"
 	"inet.af/netaddr"
-	"tailscale.com/types/wgkey"
+	"tailscale.com/types/key"
 )
 
 type ParseError struct {
@@ -56,17 +55,14 @@ func parseEndpoint(s string) (host string, port uint16, err error) {
 	return host, uint16(uport), nil
 }
 
-func parseKeyHex(s string) (*wgkey.Key, error) {
-	k, err := hex.DecodeString(s)
-	if err != nil {
-		return nil, &ParseError{"Invalid key: " + err.Error(), s}
+// memROCut separates a mem.RO at the separator if it exists, otherwise
+// it returns two empty ROs and reports that it was not found.
+func memROCut(s mem.RO, sep byte) (before, after mem.RO, found bool) {
+	if i := mem.IndexByte(s, sep); i >= 0 {
+		return s.SliceTo(i), s.SliceFrom(i + 1), true
 	}
-	if len(k) != wgkey.Size {
-		return nil, &ParseError{"Keys must decode to exactly 32 bytes", s}
-	}
-	var key wgkey.Key
-	copy(key[:], k)
-	return &key, nil
+	found = false
+	return
 }
 
 // FromUAPI generates a Config from r.
@@ -79,25 +75,23 @@ func FromUAPI(r io.Reader) (*Config, error) {
 
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+		line := mem.B(scanner.Bytes())
+		if line.Len() == 0 {
 			continue
 		}
-		parts := strings.Split(line, "=")
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("failed to parse line %q, found %d =-separated parts, want 2", line, len(parts))
+		key, value, ok := memROCut(line, '=')
+		if !ok {
+			return nil, fmt.Errorf("failed to cut line %q on =", line.StringCopy())
 		}
-		key := parts[0]
-		value := parts[1]
-		valueBytes := scanner.Bytes()[len(key)+1:]
+		valueBytes := scanner.Bytes()[key.Len()+1:]
 
-		if key == "public_key" {
+		if key.EqualString("public_key") {
 			if deviceConfig {
 				deviceConfig = false
 			}
 			// Load/create the peer we are now configuring.
 			var err error
-			peer, err = cfg.handlePublicKeyLine(value)
+			peer, err = cfg.handlePublicKeyLine(valueBytes)
 			if err != nil {
 				return nil, err
 			}
@@ -106,7 +100,7 @@ func FromUAPI(r io.Reader) (*Config, error) {
 
 		var err error
 		if deviceConfig {
-			err = cfg.handleDeviceLine(key, value)
+			err = cfg.handleDeviceLine(key, value, valueBytes)
 		} else {
 			err = cfg.handlePeerLine(peer, key, value, valueBytes)
 		}
@@ -122,63 +116,72 @@ func FromUAPI(r io.Reader) (*Config, error) {
 	return cfg, nil
 }
 
-func (cfg *Config) handleDeviceLine(key, value string) error {
-	switch key {
-	case "private_key":
-		k, err := parseKeyHex(value)
+func (cfg *Config) handleDeviceLine(k, value mem.RO, valueBytes []byte) error {
+	switch {
+	case k.EqualString("private_key"):
+		// wireguard-go guarantees not to send zero value; private keys are already clamped.
+		var err error
+		cfg.PrivateKey, err = key.ParseNodePrivateUntyped(value)
 		if err != nil {
 			return err
 		}
-		// wireguard-go guarantees not to send zero value; private keys are already clamped.
-		cfg.PrivateKey = wgkey.Private(*k)
-	case "listen_port":
-		// ignore
-	case "fwmark":
-		// ignore
+	case k.EqualString("listen_port") || k.EqualString("fwmark"):
+	// ignore
 	default:
-		return fmt.Errorf("unexpected IpcGetOperation key: %v", key)
+		return fmt.Errorf("unexpected IpcGetOperation key: %q", k.StringCopy())
 	}
 	return nil
 }
 
-func (cfg *Config) handlePublicKeyLine(value string) (*Peer, error) {
-	k, err := parseKeyHex(value)
+func (cfg *Config) handlePublicKeyLine(valueBytes []byte) (*Peer, error) {
+	p := Peer{}
+	var err error
+	p.PublicKey, err = key.ParseNodePublicUntyped(mem.B(valueBytes))
 	if err != nil {
 		return nil, err
 	}
-	cfg.Peers = append(cfg.Peers, Peer{})
-	peer := &cfg.Peers[len(cfg.Peers)-1]
-	peer.PublicKey = *k
-	return peer, nil
+	cfg.Peers = append(cfg.Peers, p)
+	return &cfg.Peers[len(cfg.Peers)-1], nil
 }
 
-func (cfg *Config) handlePeerLine(peer *Peer, key, value string, valueBytes []byte) error {
-	switch key {
-	case "endpoint":
-		err := json.Unmarshal(valueBytes, &peer.Endpoints)
+func (cfg *Config) handlePeerLine(peer *Peer, k, value mem.RO, valueBytes []byte) error {
+	switch {
+	case k.EqualString("endpoint"):
+		nk, err := key.ParseNodePublicUntyped(value)
 		if err != nil {
-			return err
+			return fmt.Errorf("invalid endpoint %q for peer %q, expected a hex public key", value.StringCopy(), peer.PublicKey.ShortString())
 		}
-	case "persistent_keepalive_interval":
-		n, err := strconv.ParseUint(value, 10, 16)
+		// nk ought to equal peer.PublicKey.
+		// Under some rare circumstances, it might not. See corp issue #3016.
+		// Even if that happens, don't stop early, so that we can recover from it.
+		// Instead, note the value of nk so we can fix as needed.
+		peer.WGEndpoint = nk
+	case k.EqualString("persistent_keepalive_interval"):
+		n, err := mem.ParseUint(value, 10, 16)
 		if err != nil {
 			return err
 		}
 		peer.PersistentKeepalive = uint16(n)
-	case "allowed_ip":
-		ipp, err := netaddr.ParseIPPrefix(value)
+	case k.EqualString("allowed_ip"):
+		ipp := netaddr.IPPrefix{}
+		err := ipp.UnmarshalText(valueBytes)
 		if err != nil {
 			return err
 		}
 		peer.AllowedIPs = append(peer.AllowedIPs, ipp)
-	case "protocol_version":
-		if value != "1" {
-			return fmt.Errorf("invalid protocol version: %v", value)
+	case k.EqualString("protocol_version"):
+		if !value.EqualString("1") {
+			return fmt.Errorf("invalid protocol version: %q", value.StringCopy())
 		}
-	case "preshared_key", "last_handshake_time_sec", "last_handshake_time_nsec", "tx_bytes", "rx_bytes":
-		// ignore
+	case k.EqualString("replace_allowed_ips") ||
+		k.EqualString("preshared_key") ||
+		k.EqualString("last_handshake_time_sec") ||
+		k.EqualString("last_handshake_time_nsec") ||
+		k.EqualString("tx_bytes") ||
+		k.EqualString("rx_bytes"):
+	// ignore
 	default:
-		return fmt.Errorf("unexpected IpcGetOperation key: %v", key)
+		return fmt.Errorf("unexpected IpcGetOperation key: %q", k.StringCopy())
 	}
 	return nil
 }

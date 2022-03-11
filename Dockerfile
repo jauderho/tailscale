@@ -4,17 +4,11 @@
 
 ############################################################################
 #
-# WARNING: Tailscale is not yet officially supported in Docker,
-# Kubernetes, etc.
+# WARNING: Tailscale is not yet officially supported in container
+# environments, such as Docker and Kubernetes. Though it should work, we
+# don't regularly test it, and we know there are some feature limitations.
 #
-# It might work, but we don't regularly test it, and it's not as polished as
-# our currently supported platforms. This is provided for people who know
-# how Tailscale works and what they're doing.
-#
-# Our tracking bug for officially support container use cases is:
-#    https://github.com/tailscale/tailscale/issues/504
-#
-# Also, see the various bugs tagged "containers":
+# See current bugs tagged "containers":
 #    https://github.com/tailscale/tailscale/labels/containers
 #
 ############################################################################
@@ -23,11 +17,11 @@
 #
 # To build the Dockerfile:
 #
-#     $ docker build -t tailscale:tailscale .
+#     $ docker build -t tailscale/tailscale .
 #
 # To run the tailscaled agent:
 #
-#     $ docker run -d --name=tailscaled -v /var/lib:/var/lib -v /dev/net/tun:/dev/net/tun --network=host --privileged tailscale:tailscale tailscaled
+#     $ docker run -d --name=tailscaled -v /var/lib:/var/lib -v /dev/net/tun:/dev/net/tun --network=host --privileged tailscale/tailscale tailscaled
 #
 # To then log in:
 #
@@ -38,12 +32,11 @@
 #     $ docker exec tailscaled tailscale status
 
 
-FROM golang:1.16-alpine AS build-env
+FROM golang:1.17-alpine AS build-env
 
 WORKDIR /go/src/tailscale
 
-COPY go.mod .
-COPY go.sum .
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
@@ -55,13 +48,13 @@ ARG VERSION_SHORT=""
 ENV VERSION_SHORT=$VERSION_SHORT
 ARG VERSION_GIT_HASH=""
 ENV VERSION_GIT_HASH=$VERSION_GIT_HASH
+ARG TARGETARCH
 
-RUN go install -tags=xversion -ldflags="\
+RUN GOARCH=$TARGETARCH go install -ldflags="\
       -X tailscale.com/version.Long=$VERSION_LONG \
       -X tailscale.com/version.Short=$VERSION_SHORT \
       -X tailscale.com/version.GitCommit=$VERSION_GIT_HASH" \
-      -v ./cmd/...
+      -v ./cmd/tailscale ./cmd/tailscaled
 
-FROM alpine:3.11
-RUN apk add --no-cache ca-certificates iptables iproute2
+FROM ghcr.io/tailscale/alpine-base:3.14
 COPY --from=build-env /go/bin/* /usr/local/bin/

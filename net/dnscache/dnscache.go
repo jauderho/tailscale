@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// TODO(bradfitz): update this code to use netaddr more
+
 // Package dnscache contains a minimal DNS cache that makes a bunch of
 // assumptions that are only valid for us. Not recommended for general use.
 package dnscache
@@ -13,14 +15,13 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"runtime"
-	"strconv"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 )
 
 var single = &Resolver{
@@ -78,8 +79,9 @@ type Resolver struct {
 }
 
 type ipCacheEntry struct {
-	ip      net.IP // either v4 or v6
-	ip6     net.IP // nil if no v4 or no v6
+	ip      net.IP       // either v4 or v6
+	ip6     net.IP       // nil if no v4 or no v6
+	allIPs  []net.IPAddr // 1+ v4 and/or v6
 	expires time.Time
 }
 
@@ -97,7 +99,7 @@ func (r *Resolver) ttl() time.Duration {
 	return 10 * time.Minute
 }
 
-var debug, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_DNS_CACHE"))
+var debug = envknob.Bool("TS_DEBUG_DNS_CACHE")
 
 // LookupIP returns the host's primary IP address (either IPv4 or
 // IPv6, but preferring IPv4) and optionally its IPv6 address, if
@@ -105,81 +107,82 @@ var debug, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_DNS_CACHE"))
 //
 // If err is nil, ip will be non-nil. The v6 address may be nil even
 // with a nil error.
-func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 net.IP, err error) {
+func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 net.IP, allIPs []net.IPAddr, err error) {
 	if ip := net.ParseIP(host); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
-			return ip4, nil, nil
+			return ip4, nil, []net.IPAddr{{IP: ip4}}, nil
 		}
 		if debug {
 			log.Printf("dnscache: %q is an IP", host)
 		}
-		return ip, nil, nil
+		return ip, nil, []net.IPAddr{{IP: ip}}, nil
 	}
 
-	if ip, ip6, ok := r.lookupIPCache(host); ok {
+	if ip, ip6, allIPs, ok := r.lookupIPCache(host); ok {
 		if debug {
 			log.Printf("dnscache: %q = %v (cached)", host, ip)
 		}
-		return ip, ip6, nil
+		return ip, ip6, allIPs, nil
 	}
 
-	type ipPair struct {
+	type ipRes struct {
 		ip, ip6 net.IP
+		allIPs  []net.IPAddr
 	}
 	ch := r.sf.DoChan(host, func() (interface{}, error) {
-		ip, ip6, err := r.lookupIP(host)
+		ip, ip6, allIPs, err := r.lookupIP(host)
 		if err != nil {
 			return nil, err
 		}
-		return ipPair{ip, ip6}, nil
+		return ipRes{ip, ip6, allIPs}, nil
 	})
 	select {
 	case res := <-ch:
 		if res.Err != nil {
 			if r.UseLastGood {
-				if ip, ip6, ok := r.lookupIPCacheExpired(host); ok {
+				if ip, ip6, allIPs, ok := r.lookupIPCacheExpired(host); ok {
 					if debug {
 						log.Printf("dnscache: %q using %v after error", host, ip)
 					}
-					return ip, ip6, nil
+					return ip, ip6, allIPs, nil
 				}
 			}
 			if debug {
 				log.Printf("dnscache: error resolving %q: %v", host, res.Err)
 			}
-			return nil, nil, res.Err
+			return nil, nil, nil, res.Err
 		}
-		pair := res.Val.(ipPair)
-		return pair.ip, pair.ip6, nil
+		r := res.Val.(ipRes)
+		return r.ip, r.ip6, r.allIPs, nil
 	case <-ctx.Done():
 		if debug {
 			log.Printf("dnscache: context done while resolving %q: %v", host, ctx.Err())
 		}
-		return nil, nil, ctx.Err()
+		return nil, nil, nil, ctx.Err()
 	}
 }
 
-func (r *Resolver) lookupIPCache(host string) (ip, ip6 net.IP, ok bool) {
+func (r *Resolver) lookupIPCache(host string) (ip, ip6 net.IP, allIPs []net.IPAddr, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if ent, ok := r.ipCache[host]; ok && ent.expires.After(time.Now()) {
-		return ent.ip, ent.ip6, true
+		return ent.ip, ent.ip6, ent.allIPs, true
 	}
-	return nil, nil, false
+	return nil, nil, nil, false
 }
 
-func (r *Resolver) lookupIPCacheExpired(host string) (ip, ip6 net.IP, ok bool) {
+func (r *Resolver) lookupIPCacheExpired(host string) (ip, ip6 net.IP, allIPs []net.IPAddr, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if ent, ok := r.ipCache[host]; ok {
-		return ent.ip, ent.ip6, true
+		return ent.ip, ent.ip6, ent.allIPs, true
 	}
-	return nil, nil, false
+	return nil, nil, nil, false
 }
 
 func (r *Resolver) lookupTimeoutForHost(host string) time.Duration {
 	if r.UseLastGood {
-		if _, _, ok := r.lookupIPCacheExpired(host); ok {
+		if _, _, _, ok := r.lookupIPCacheExpired(host); ok {
 			// If we have some previous good value for this host,
 			// don't give this DNS lookup much time. If we're in a
 			// situation where the user's DNS server is unreachable
@@ -194,12 +197,12 @@ func (r *Resolver) lookupTimeoutForHost(host string) time.Duration {
 	return 10 * time.Second
 }
 
-func (r *Resolver) lookupIP(host string) (ip, ip6 net.IP, err error) {
-	if ip, ip6, ok := r.lookupIPCache(host); ok {
+func (r *Resolver) lookupIP(host string) (ip, ip6 net.IP, allIPs []net.IPAddr, err error) {
+	if ip, ip6, allIPs, ok := r.lookupIPCache(host); ok {
 		if debug {
 			log.Printf("dnscache: %q found in cache as %v", host, ip)
 		}
-		return ip, ip6, nil
+		return ip, ip6, allIPs, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), r.lookupTimeoutForHost(host))
@@ -218,10 +221,10 @@ func (r *Resolver) lookupIP(host string) (ip, ip6 net.IP, err error) {
 		}
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if len(ips) == 0 {
-		return nil, nil, fmt.Errorf("no IPs for %q found", host)
+		return nil, nil, nil, fmt.Errorf("no IPs for %q found", host)
 	}
 
 	have4 := false
@@ -240,12 +243,12 @@ func (r *Resolver) lookupIP(host string) (ip, ip6 net.IP, err error) {
 			}
 		}
 	}
-	r.addIPCache(host, ip, ip6, r.ttl())
-	return ip, ip6, nil
+	r.addIPCache(host, ip, ip6, ips, r.ttl())
+	return ip, ip6, ips, nil
 }
 
-func (r *Resolver) addIPCache(host string, ip, ip6 net.IP, d time.Duration) {
-	if isPrivateIP(ip) {
+func (r *Resolver) addIPCache(host string, ip, ip6 net.IP, allIPs []net.IPAddr, d time.Duration) {
+	if naIP, _ := netaddr.FromStdIP(ip); naIP.IsPrivate() {
 		// Don't cache obviously wrong entries from captive portals.
 		// TODO: use DoH or DoT for the forwarding resolver?
 		if debug {
@@ -263,81 +266,273 @@ func (r *Resolver) addIPCache(host string, ip, ip6 net.IP, d time.Duration) {
 	if r.ipCache == nil {
 		r.ipCache = make(map[string]ipCacheEntry)
 	}
-	r.ipCache[host] = ipCacheEntry{ip: ip, ip6: ip6, expires: time.Now().Add(d)}
-}
-
-func mustCIDR(s string) *net.IPNet {
-	_, ipNet, err := net.ParseCIDR(s)
-	if err != nil {
-		panic(err)
+	r.ipCache[host] = ipCacheEntry{
+		ip:      ip,
+		ip6:     ip6,
+		allIPs:  allIPs,
+		expires: time.Now().Add(d),
 	}
-	return ipNet
 }
-
-func isPrivateIP(ip net.IP) bool {
-	return private1.Contains(ip) || private2.Contains(ip) || private3.Contains(ip)
-}
-
-var (
-	private1 = mustCIDR("10.0.0.0/8")
-	private2 = mustCIDR("172.16.0.0/12")
-	private3 = mustCIDR("192.168.0.0/16")
-)
 
 type DialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 // Dialer returns a wrapped DialContext func that uses the provided dnsCache.
 func Dialer(fwd DialContextFunc, dnsCache *Resolver) DialContextFunc {
-	return func(ctx context.Context, network, address string) (retConn net.Conn, ret error) {
-		host, port, err := net.SplitHostPort(address)
-		if err != nil {
-			// Bogus. But just let the real dialer return an error rather than
-			// inventing a similar one.
-			return fwd(ctx, network, address)
+	d := &dialer{
+		fwd:         fwd,
+		dnsCache:    dnsCache,
+		pastConnect: map[netaddr.IP]time.Time{},
+	}
+	return d.DialContext
+}
+
+// dialer is the config and accumulated state for a dial func returned by Dialer.
+type dialer struct {
+	fwd      DialContextFunc
+	dnsCache *Resolver
+
+	mu          sync.Mutex
+	pastConnect map[netaddr.IP]time.Time
+}
+
+func (d *dialer) DialContext(ctx context.Context, network, address string) (retConn net.Conn, ret error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		// Bogus. But just let the real dialer return an error rather than
+		// inventing a similar one.
+		return d.fwd(ctx, network, address)
+	}
+	dc := &dialCall{
+		d:       d,
+		network: network,
+		address: address,
+		host:    host,
+		port:    port,
+	}
+	defer func() {
+		// On failure, consider that our DNS might be wrong and ask the DNS fallback mechanism for
+		// some other IPs to try.
+		if ret == nil || d.dnsCache.LookupIPFallback == nil || dc.dnsWasTrustworthy() {
+			return
 		}
-		defer func() {
-			// On any failure, assume our DNS is wrong and try our fallback, if any.
-			if ret == nil || dnsCache.LookupIPFallback == nil {
-				return
-			}
-			ips, err := dnsCache.LookupIPFallback(ctx, host)
-			if err != nil {
-				// Return with original error
-				return
-			}
-			for _, ip := range ips {
-				dst := net.JoinHostPort(ip.String(), port)
-				if c, err := fwd(ctx, network, dst); err == nil {
-					retConn = c
-					ret = nil
+		ips, err := d.dnsCache.LookupIPFallback(ctx, host)
+		if err != nil {
+			// Return with original error
+			return
+		}
+		if c, err := dc.raceDial(ctx, ips); err == nil {
+			retConn = c
+			ret = nil
+			return
+		}
+	}()
+
+	ip, ip6, allIPs, err := d.dnsCache.LookupIP(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve %q: %w", host, err)
+	}
+	i4s := v4addrs(allIPs)
+	if len(i4s) < 2 {
+		if debug {
+			log.Printf("dnscache: dialing %s, %s for %s", network, ip, address)
+		}
+		ipNA, ok := netaddr.FromStdIP(ip)
+		if !ok {
+			return nil, fmt.Errorf("invalid IP %q", ip)
+		}
+		c, err := dc.dialOne(ctx, ipNA)
+		if err == nil || ctx.Err() != nil {
+			return c, err
+		}
+		// Fall back to trying IPv6, if any.
+		ip6NA, ok := netaddr.FromStdIP(ip6)
+		if !ok {
+			return nil, err
+		}
+		return dc.dialOne(ctx, ip6NA)
+	}
+
+	// Multiple IPv4 candidates, and 0+ IPv6.
+	ipsToTry := append(i4s, v6addrs(allIPs)...)
+	return dc.raceDial(ctx, ipsToTry)
+}
+
+// dialCall is the state around a single call to dial.
+type dialCall struct {
+	d                            *dialer
+	network, address, host, port string
+
+	mu    sync.Mutex           // lock ordering: dialer.mu, then dialCall.mu
+	fails map[netaddr.IP]error // set of IPs that failed to dial thus far
+}
+
+// dnsWasTrustworthy reports whether we think the IP address(es) we
+// tried (and failed) to dial were probably the correct IPs. Currently
+// the heuristic is whether they ever worked previously.
+func (dc *dialCall) dnsWasTrustworthy() bool {
+	dc.d.mu.Lock()
+	defer dc.d.mu.Unlock()
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	if len(dc.fails) == 0 {
+		// No information.
+		return false
+	}
+
+	// If any of the IPs we failed to dial worked previously in
+	// this dialer, assume the DNS is fine.
+	for ip := range dc.fails {
+		if _, ok := dc.d.pastConnect[ip]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (dc *dialCall) dialOne(ctx context.Context, ip netaddr.IP) (net.Conn, error) {
+	c, err := dc.d.fwd(ctx, dc.network, net.JoinHostPort(ip.String(), dc.port))
+	dc.noteDialResult(ip, err)
+	return c, err
+}
+
+// noteDialResult records that a dial to ip either succeeded or
+// failed.
+func (dc *dialCall) noteDialResult(ip netaddr.IP, err error) {
+	if err == nil {
+		d := dc.d
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.pastConnect[ip] = time.Now()
+		return
+	}
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if dc.fails == nil {
+		dc.fails = map[netaddr.IP]error{}
+	}
+	dc.fails[ip] = err
+}
+
+// uniqueIPs returns a possibly-mutated subslice of ips, filtering out
+// dups and ones that have already failed previously.
+func (dc *dialCall) uniqueIPs(ips []netaddr.IP) (ret []netaddr.IP) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	seen := map[netaddr.IP]bool{}
+	ret = ips[:0]
+	for _, ip := range ips {
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if dc.fails[ip] != nil {
+			continue
+		}
+		ret = append(ret, ip)
+	}
+	return ret
+}
+
+// fallbackDelay is how long to wait between trying subsequent
+// addresses when multiple options are available.
+// 300ms is the same as Go's Happy Eyeballs fallbackDelay value.
+const fallbackDelay = 300 * time.Millisecond
+
+// raceDial tries to dial port on each ip in ips, starting a new race
+// dial every fallbackDelay apart, returning whichever completes first.
+func (dc *dialCall) raceDial(ctx context.Context, ips []netaddr.IP) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type res struct {
+		c   net.Conn
+		err error
+	}
+	resc := make(chan res)           // must be unbuffered
+	failBoost := make(chan struct{}) // best effort send on dial failure
+
+	// Remove IPs that we tried & failed to dial previously
+	// (such as when we're being called after a dnsfallback lookup and get
+	// the same results)
+	ips = dc.uniqueIPs(ips)
+	if len(ips) == 0 {
+		return nil, errors.New("no IPs")
+	}
+
+	go func() {
+		for i, ip := range ips {
+			if i != 0 {
+				timer := time.NewTimer(fallbackDelay)
+				select {
+				case <-timer.C:
+				case <-failBoost:
+					timer.Stop()
+				case <-ctx.Done():
+					timer.Stop()
 					return
 				}
 			}
-		}()
+			go func(ip netaddr.IP) {
+				c, err := dc.dialOne(ctx, ip)
+				if err != nil {
+					// Best effort wake-up a pending dial.
+					// e.g. IPv4 dials failing quickly on an IPv6-only system.
+					// In that case we don't want to wait 300ms per IPv4 before
+					// we get to the IPv6 addresses.
+					select {
+					case failBoost <- struct{}{}:
+					default:
+					}
+				}
+				select {
+				case resc <- res{c, err}:
+				case <-ctx.Done():
+					if c != nil {
+						c.Close()
+					}
+				}
+			}(ip)
+		}
+	}()
 
-		ip, ip6, err := dnsCache.LookupIP(ctx, host)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve %q: %w", host, err)
+	var firstErr error
+	var fails int
+	for {
+		select {
+		case r := <-resc:
+			if r.c != nil {
+				return r.c, nil
+			}
+			fails++
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if fails == len(ips) {
+				return nil, firstErr
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		dst := net.JoinHostPort(ip.String(), port)
-		if debug {
-			log.Printf("dnscache: dialing %s, %s for %s", network, dst, address)
-		}
-		c, err := fwd(ctx, network, dst)
-		if err == nil || ctx.Err() != nil || ip6 == nil {
-			return c, err
-		}
-		// Fall back to trying IPv6.
-		// TODO(bradfitz): this is a primarily for IPv6-only
-		// hosts; it's not supposed to be a real Happy
-		// Eyeballs implementation. We should use the net
-		// package's implementation of that by plumbing this
-		// dnscache impl into net.Dialer.Resolver.Dial and
-		// unmarshal/marshal DNS queries/responses to the net
-		// package. This works for v6-only hosts for now.
-		dst = net.JoinHostPort(ip6.String(), port)
-		return fwd(ctx, network, dst)
 	}
+}
+
+func v4addrs(aa []net.IPAddr) (ret []netaddr.IP) {
+	for _, a := range aa {
+		if ip, ok := netaddr.FromStdIP(a.IP); ok && ip.Is4() {
+			ret = append(ret, ip)
+		}
+	}
+	return ret
+}
+
+func v6addrs(aa []net.IPAddr) (ret []netaddr.IP) {
+	for _, a := range aa {
+		if ip, ok := netaddr.FromStdIP(a.IP); ok && ip.Is6() {
+			ret = append(ret, ip)
+		}
+	}
+	return ret
 }
 
 var errTLSHandshakeTimeout = errors.New("timeout doing TLS handshake")
@@ -363,24 +558,9 @@ func TLSDialer(fwd DialContextFunc, dnsCache *Resolver, tlsConfigBase *tls.Confi
 		}
 		tlsConn := tls.Client(tcpConn, cfg)
 
-		errc := make(chan error, 2)
 		handshakeCtx, handshakeTimeoutCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer handshakeTimeoutCancel()
-		done := make(chan bool)
-		defer close(done)
-		go func() {
-			select {
-			case <-done:
-			case <-handshakeCtx.Done():
-				errc <- errTLSHandshakeTimeout
-			}
-		}()
-		go func() {
-			err := tlsConn.Handshake()
-			handshakeTimeoutCancel()
-			errc <- err
-		}()
-		if err := <-errc; err != nil {
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 			tcpConn.Close()
 			// TODO: if err != errTLSHandshakeTimeout,
 			// assume it might be some captive portal or

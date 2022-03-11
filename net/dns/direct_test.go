@@ -5,31 +5,66 @@
 package dns
 
 import (
-	"io/ioutil"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
+	qt "github.com/frankban/quicktest"
 	"inet.af/netaddr"
 	"tailscale.com/util/dnsname"
 )
 
-func TestSetDNS(t *testing.T) {
-	const orig = "nameserver 9.9.9.9 # orig"
+func TestDirectManager(t *testing.T) {
 	tmp := t.TempDir()
-	resolvPath := filepath.Join(tmp, "etc", "resolv.conf")
-	backupPath := filepath.Join(tmp, "etc", "resolv.pre-tailscale-backup.conf")
-
-	if err := os.MkdirAll(filepath.Dir(resolvPath), 0777); err != nil {
+	if err := os.MkdirAll(filepath.Join(tmp, "etc"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := ioutil.WriteFile(resolvPath, []byte(orig), 0644); err != nil {
+	testDirect(t, directFS{prefix: tmp})
+}
+
+type boundResolvConfFS struct {
+	directFS
+}
+
+func (fs boundResolvConfFS) Rename(old, new string) error {
+	if old == "/etc/resolv.conf" || new == "/etc/resolv.conf" {
+		return errors.New("cannot move to/from /etc/resolv.conf")
+	}
+	return fs.directFS.Rename(old, new)
+}
+
+func (fs boundResolvConfFS) Remove(name string) error {
+	if name == "/etc/resolv.conf" {
+		return errors.New("cannot remove /etc/resolv.conf")
+	}
+	return fs.directFS.Remove(name)
+}
+
+func TestDirectBrokenRename(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "etc"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	testDirect(t, boundResolvConfFS{directFS{prefix: tmp}})
+}
+
+func testDirect(t *testing.T, fs wholeFileFS) {
+	const orig = "nameserver 9.9.9.9 # orig"
+	resolvPath := "/etc/resolv.conf"
+	backupPath := "/etc/resolv.pre-tailscale-backup.conf"
+
+	if err := fs.WriteFile(resolvPath, []byte(orig), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	readFile := func(t *testing.T, path string) string {
 		t.Helper()
-		b, err := ioutil.ReadFile(path)
+		b, err := fs.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -39,12 +74,12 @@ func TestSetDNS(t *testing.T) {
 		if got := readFile(t, resolvPath); got != orig {
 			t.Fatalf("resolv.conf:\n%s, want:\n%s", got, orig)
 		}
-		if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		if _, err := fs.Stat(backupPath); !os.IsNotExist(err) {
 			t.Fatalf("resolv.conf backup: want it to be gone but: %v", err)
 		}
 	}
 
-	m := directManager{fs: directFS{prefix: tmp}}
+	m := directManager{logf: t.Logf, fs: fs}
 	if err := m.SetDNS(OSConfig{
 		Nameservers:   []netaddr.IP{netaddr.MustParseIP("8.8.8.8"), netaddr.MustParseIP("8.8.4.4")},
 		SearchDomains: []dnsname.FQDN{"ts.net.", "ts-dns.test."},
@@ -80,4 +115,85 @@ search ts.net ts-dns.test
 		t.Fatal(err)
 	}
 	assertBaseState(t)
+}
+
+type brokenRemoveFS struct {
+	directFS
+}
+
+func (b brokenRemoveFS) Rename(old, new string) error {
+	return errors.New("nyaaah I'm a silly container!")
+}
+
+func (b brokenRemoveFS) Remove(name string) error {
+	if strings.Contains(name, "/etc/resolv.conf") {
+		return fmt.Errorf("Faking remove failure: %q", &fs.PathError{Err: syscall.EBUSY})
+	}
+	return b.directFS.Remove(name)
+}
+
+func TestDirectBrokenRemove(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmp, "etc"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	testDirect(t, brokenRemoveFS{directFS{prefix: tmp}})
+}
+
+func TestReadResolve(t *testing.T) {
+	c := qt.New(t)
+	tests := []struct {
+		in      string
+		want    OSConfig
+		wantErr bool
+	}{
+		{in: `nameserver 192.168.0.100`,
+			want: OSConfig{
+				Nameservers: []netaddr.IP{
+					netaddr.MustParseIP("192.168.0.100"),
+				},
+			},
+		},
+		{in: `nameserver 192.168.0.100 # comment`,
+			want: OSConfig{
+				Nameservers: []netaddr.IP{
+					netaddr.MustParseIP("192.168.0.100"),
+				},
+			},
+		},
+		{in: `nameserver 192.168.0.100#`,
+			want: OSConfig{
+				Nameservers: []netaddr.IP{
+					netaddr.MustParseIP("192.168.0.100"),
+				},
+			},
+		},
+		{in: `nameserver #192.168.0.100`, wantErr: true},
+		{in: `nameserver`, wantErr: true},
+		{in: `# nameserver 192.168.0.100`, want: OSConfig{}},
+		{in: `nameserver192.168.0.100`, wantErr: true},
+
+		{in: `search tailsacle.com`,
+			want: OSConfig{
+				SearchDomains: []dnsname.FQDN{"tailsacle.com."},
+			},
+		},
+		{in: `search tailsacle.com # typo`,
+			want: OSConfig{
+				SearchDomains: []dnsname.FQDN{"tailsacle.com."},
+			},
+		},
+		{in: `searchtailsacle.com`, wantErr: true},
+		{in: `search`, wantErr: true},
+	}
+
+	for _, test := range tests {
+		cfg, err := readResolv(strings.NewReader(test.in))
+		if test.wantErr {
+			c.Assert(err, qt.IsNotNil)
+		} else {
+			c.Assert(err, qt.IsNil)
+		}
+		c.Assert(cfg, qt.DeepEquals, test.want)
+	}
 }

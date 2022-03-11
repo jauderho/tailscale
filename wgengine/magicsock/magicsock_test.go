@@ -10,10 +10,10 @@ import (
 	crand "crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -26,7 +26,7 @@ import (
 	"time"
 	"unsafe"
 
-	"golang.org/x/crypto/nacl/box"
+	"go4.org/mem"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 	"inet.af/netaddr"
@@ -42,8 +42,8 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/util/cibuild"
+	"tailscale.com/util/racebuild"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/wgcfg"
 	"tailscale.com/wgengine/wgcfg/nmcfg"
@@ -52,6 +52,13 @@ import (
 
 func init() {
 	os.Setenv("IN_TS_TEST", "1")
+
+	// Some of these tests lose a disco pong before establishing a
+	// direct connection, so instead of waiting 5 seconds in the
+	// test, reduce the wait period.
+	// (In particular, TestActiveDiscovery.)
+	discoPingInterval = 100 * time.Millisecond
+	pingTimeoutDuration = 100 * time.Millisecond
 }
 
 // WaitReady waits until the magicsock is entirely initialized and connected
@@ -75,11 +82,7 @@ func (c *Conn) WaitReady(t testing.TB) {
 }
 
 func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, stunIP netaddr.IP) (derpMap *tailcfg.DERPMap, cleanup func()) {
-	var serverPrivateKey key.Private
-	if _, err := crand.Read(serverPrivateKey[:]); err != nil {
-		t.Fatal(err)
-	}
-	d := derp.NewServer(serverPrivateKey, logf)
+	d := derp.NewServer(key.NewNode(), logf)
 
 	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
@@ -95,14 +98,15 @@ func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, st
 				RegionCode: "test",
 				Nodes: []*tailcfg.DERPNode{
 					{
-						Name:         "t1",
-						RegionID:     1,
-						HostName:     "test-node.unused",
-						IPv4:         "127.0.0.1",
-						IPv6:         "none",
-						STUNPort:     stunAddr.Port,
-						DERPTestPort: httpsrv.Listener.Addr().(*net.TCPAddr).Port,
-						STUNTestIP:   stunIP.String(),
+						Name:             "t1",
+						RegionID:         1,
+						HostName:         "test-node.unused",
+						IPv4:             "127.0.0.1",
+						IPv6:             "none",
+						STUNPort:         stunAddr.Port,
+						DERPPort:         httpsrv.Listener.Addr().(*net.TCPAddr).Port,
+						InsecureForTests: true,
+						STUNTestIP:       stunIP.String(),
 					},
 				},
 			},
@@ -123,7 +127,7 @@ func runDERPAndStun(t *testing.T, logf logger.Logf, l nettype.PacketListener, st
 // necessary to send and receive packets to test e2e wireguard
 // happiness.
 type magicStack struct {
-	privateKey wgkey.Private
+	privateKey key.NodePrivate
 	epCh       chan []tailcfg.Endpoint // endpoint updates produced by this peer
 	conn       *Conn                   // the magicsock itself
 	tun        *tuntest.ChannelTUN     // TUN device to send/receive packets
@@ -135,28 +139,25 @@ type magicStack struct {
 // newMagicStack builds and initializes an idle magicsock and
 // friends. You need to call conn.SetNetworkMap and dev.Reconfig
 // before anything interesting happens.
-func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, disableLegacy bool) *magicStack {
-	t.Helper()
+func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap) *magicStack {
+	privateKey := key.NewNode()
+	return newMagicStackWithKey(t, logf, l, derpMap, privateKey)
+}
 
-	privateKey, err := wgkey.NewPrivate()
-	if err != nil {
-		t.Fatalf("generating private key: %v", err)
-	}
+func newMagicStackWithKey(t testing.TB, logf logger.Logf, l nettype.PacketListener, derpMap *tailcfg.DERPMap, privateKey key.NodePrivate) *magicStack {
+	t.Helper()
 
 	epCh := make(chan []tailcfg.Endpoint, 100) // arbitrary
 	conn, err := NewConn(Options{
-		Logf:           logf,
-		PacketListener: l,
+		Logf:                   logf,
+		TestOnlyPacketListener: l,
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			epCh <- eps
 		},
-		SimulatedNetwork:        l != nettype.Std{},
-		DisableLegacyNetworking: disableLegacy,
 	})
 	if err != nil {
 		t.Fatalf("constructing magicsock: %v", err)
 	}
-	conn.Start()
 	conn.SetDERPMap(derpMap)
 	if err := conn.SetPrivateKey(privateKey); err != nil {
 		t.Fatalf("setting private key in magicsock: %v", err)
@@ -167,7 +168,7 @@ func newMagicStack(t testing.TB, logf logger.Logf, l nettype.PacketListener, der
 	tsTun.SetFilter(filter.NewAllowAllForTest(logf))
 
 	wgLogger := wglog.NewLogger(logf)
-	dev := device.NewDevice(tsTun, conn.Bind(), wgLogger.DeviceLogger)
+	dev := wgcfg.NewDevice(tsTun, conn.Bind(), wgLogger.DeviceLogger)
 	dev.Up()
 
 	// Wait for magicsock to connect up to DERP.
@@ -205,8 +206,8 @@ func (s *magicStack) Close() {
 	s.conn.Close()
 }
 
-func (s *magicStack) Public() key.Public {
-	return key.Public(s.privateKey.Public())
+func (s *magicStack) Public() key.NodePublic {
+	return s.privateKey.Public()
 }
 
 func (s *magicStack) Status() *ipnstate.Status {
@@ -234,9 +235,7 @@ func (s *magicStack) IP() netaddr.IP {
 // and WireGuard configs into everyone to form a full mesh that has up
 // to date endpoint info. Think of it as an extremely stripped down
 // and purpose-built Tailscale control plane.
-//
-// meshStacks only supports disco connections, not legacy logic.
-func meshStacks(logf logger.Logf, ms []*magicStack) (cleanup func()) {
+func meshStacks(logf logger.Logf, mutateNetmap func(idx int, nm *netmap.NetworkMap), ms ...*magicStack) (cleanup func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Serialize all reconfigurations globally, just to keep things
@@ -250,7 +249,7 @@ func meshStacks(logf logger.Logf, ms []*magicStack) (cleanup func()) {
 		me := ms[myIdx]
 		nm := &netmap.NetworkMap{
 			PrivateKey: me.privateKey,
-			NodeKey:    tailcfg.NodeKey(me.privateKey.Public()),
+			NodeKey:    me.privateKey.Public(),
 			Addresses:  []netaddr.IPPrefix{netaddr.IPPrefixFrom(netaddr.IPv4(1, 0, 0, byte(myIdx+1)), 32)},
 		}
 		for i, peer := range ms {
@@ -261,7 +260,7 @@ func meshStacks(logf logger.Logf, ms []*magicStack) (cleanup func()) {
 			peer := &tailcfg.Node{
 				ID:         tailcfg.NodeID(i + 1),
 				Name:       fmt.Sprintf("node%d", i+1),
-				Key:        tailcfg.NodeKey(peer.privateKey.Public()),
+				Key:        peer.privateKey.Public(),
 				DiscoKey:   peer.conn.DiscoPublicKey(),
 				Addresses:  addrs,
 				AllowedIPs: addrs,
@@ -271,6 +270,9 @@ func meshStacks(logf logger.Logf, ms []*magicStack) (cleanup func()) {
 			nm.Peers = append(nm.Peers, peer)
 		}
 
+		if mutateNetmap != nil {
+			mutateNetmap(myIdx, nm)
+		}
 		return nm
 	}
 
@@ -283,9 +285,9 @@ func meshStacks(logf logger.Logf, ms []*magicStack) (cleanup func()) {
 		for i, m := range ms {
 			nm := buildNetmapLocked(i)
 			m.conn.SetNetworkMap(nm)
-			peerSet := make(map[key.Public]struct{}, len(nm.Peers))
+			peerSet := make(map[key.NodePublic]struct{}, len(nm.Peers))
 			for _, peer := range nm.Peers {
-				peerSet[key.Public(peer.Key)] = struct{}{}
+				peerSet[peer.Key] = struct{}{}
 			}
 			m.conn.UpdatePeers(peerSet)
 			wg, err := nmcfg.WGCfg(nm, logf, netmap.AllowSingleHosts, "")
@@ -295,6 +297,10 @@ func meshStacks(logf logger.Logf, ms []*magicStack) (cleanup func()) {
 				panic(fmt.Sprintf("failed to construct wgcfg from netmap: %v", err))
 			}
 			if err := m.Reconfig(wg); err != nil {
+				if ctx.Err() != nil || errors.Is(err, errConnClosed) {
+					// shutdown race, don't care.
+					return
+				}
 				panic(fmt.Sprintf("device reconfig failed: %v", err))
 			}
 		}
@@ -340,18 +346,16 @@ func TestNewConn(t *testing.T) {
 
 	port := pickPort(t)
 	conn, err := NewConn(Options{
-		Port:                    port,
-		EndpointsFunc:           epFunc,
-		Logf:                    t.Logf,
-		DisableLegacyNetworking: true,
+		Port:          port,
+		EndpointsFunc: epFunc,
+		Logf:          t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 	conn.SetDERPMap(stuntest.DERPMapOf(stunAddr.String()))
-	conn.SetPrivateKey(wgkey.Private(key.NewPrivate()))
-	conn.Start()
+	conn.SetPrivateKey(key.NewNode())
 
 	go func() {
 		var pkt [64 << 10]byte
@@ -397,14 +401,14 @@ func TestPickDERPFallback(t *testing.T) {
 	c := newConn()
 	dm := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
-			1: &tailcfg.DERPRegion{},
-			2: &tailcfg.DERPRegion{},
-			3: &tailcfg.DERPRegion{},
-			4: &tailcfg.DERPRegion{},
-			5: &tailcfg.DERPRegion{},
-			6: &tailcfg.DERPRegion{},
-			7: &tailcfg.DERPRegion{},
-			8: &tailcfg.DERPRegion{},
+			1: {},
+			2: {},
+			3: {},
+			4: {},
+			5: {},
+			6: {},
+			7: {},
+			8: {},
 		},
 	}
 	c.derpMap = dm
@@ -441,60 +445,9 @@ func TestPickDERPFallback(t *testing.T) {
 		t.Errorf("not sticky: got %v; want %v", got, someNode)
 	}
 
-	// But move if peers are elsewhere.
-	const otherNode = 789
-	c.addrsByKey = map[key.Public]*addrSet{
-		{1}: {ipPorts: []netaddr.IPPort{netaddr.IPPortFrom(derpMagicIPAddr, otherNode)}},
-	}
-	if got := c.pickDERPFallback(); got != otherNode {
-		t.Errorf("didn't join peers: got %v; want %v", got, someNode)
-	}
-}
-
-func makeConfigs(t *testing.T, addrs []netaddr.IPPort) []wgcfg.Config {
-	t.Helper()
-
-	var privKeys []wgkey.Private
-	var addresses [][]netaddr.IPPrefix
-
-	for i := range addrs {
-		privKey, err := wgkey.NewPrivate()
-		if err != nil {
-			t.Fatal(err)
-		}
-		privKeys = append(privKeys, wgkey.Private(privKey))
-
-		addresses = append(addresses, []netaddr.IPPrefix{
-			netaddr.MustParseIPPrefix(fmt.Sprintf("1.0.0.%d/32", i+1)),
-		})
-	}
-
-	var cfgs []wgcfg.Config
-	for i := range addrs {
-		cfg := wgcfg.Config{
-			Name:       fmt.Sprintf("peer%d", i+1),
-			PrivateKey: privKeys[i],
-			Addresses:  addresses[i],
-		}
-		for peerNum, addr := range addrs {
-			if peerNum == i {
-				continue
-			}
-			publicKey := privKeys[peerNum].Public()
-			peer := wgcfg.Peer{
-				PublicKey:  publicKey,
-				AllowedIPs: addresses[peerNum],
-				Endpoints: wgcfg.Endpoints{
-					PublicKey: publicKey,
-					IPPorts:   wgcfg.NewIPPortSet(addr),
-				},
-				PersistentKeepalive: 25,
-			}
-			cfg.Peers = append(cfg.Peers, peer)
-		}
-		cfgs = append(cfgs, cfg)
-	}
-	return cfgs
+	// TODO: test that disco-based clients changing to a new DERP
+	// region causes this fallback to also move, once disco clients
+	// have fixed DERP fallback logic.
 }
 
 // TestDeviceStartStop exercises the startup and shutdown logic of
@@ -508,19 +461,17 @@ func TestDeviceStartStop(t *testing.T) {
 	tstest.ResourceCheck(t)
 
 	conn, err := NewConn(Options{
-		EndpointsFunc:           func(eps []tailcfg.Endpoint) {},
-		Logf:                    t.Logf,
-		DisableLegacyNetworking: true,
+		EndpointsFunc: func(eps []tailcfg.Endpoint) {},
+		Logf:          t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn.Start()
 	defer conn.Close()
 
 	tun := tuntest.NewChannelTUN()
 	wgLogger := wglog.NewLogger(t.Logf)
-	dev := device.NewDevice(tun.TUN(), conn.Bind(), wgLogger.DeviceLogger)
+	dev := wgcfg.NewDevice(tun.TUN(), conn.Bind(), wgLogger.DeviceLogger)
 	dev.Up()
 	dev.Close()
 }
@@ -550,12 +501,12 @@ func TestConnClosed(t *testing.T) {
 	derpMap, cleanup := runDERPAndStun(t, logf, d.stun, d.stunIP)
 	defer cleanup()
 
-	ms1 := newMagicStack(t, logger.WithPrefix(logf, "conn1: "), d.m1, derpMap, true)
+	ms1 := newMagicStack(t, logger.WithPrefix(logf, "conn1: "), d.m1, derpMap)
 	defer ms1.Close()
-	ms2 := newMagicStack(t, logger.WithPrefix(logf, "conn2: "), d.m2, derpMap, true)
+	ms2 := newMagicStack(t, logger.WithPrefix(logf, "conn2: "), d.m2, derpMap)
 	defer ms2.Close()
 
-	cleanup = meshStacks(t.Logf, []*magicStack{ms1, ms2})
+	cleanup = meshStacks(t.Logf, nil, ms1, ms2)
 	defer cleanup()
 
 	pkt := tuntest.Ping(ms2.IP().IPAddr().IP, ms1.IP().IPAddr().IP)
@@ -602,8 +553,45 @@ func makeNestable(t *testing.T) (logf logger.Logf, setT func(t *testing.T)) {
 	return logf, setT
 }
 
+// localhostOnlyListener is a nettype.PacketListener that listens on
+// localhost (127.0.0.1 or ::1, depending on the requested network)
+// when asked to listen on the unspecified address.
+//
+// It's used in tests where we set up localhost-to-localhost
+// communication, because if you listen on the unspecified address on
+// macOS and Windows, you get an interactive firewall consent prompt
+// to allow the binding, which breaks our CIs.
+type localhostListener struct{}
+
+func (localhostListener) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	switch network {
+	case "udp4":
+		switch host {
+		case "", "0.0.0.0":
+			host = "127.0.0.1"
+		case "127.0.0.1":
+		default:
+			return nil, fmt.Errorf("localhostListener cannot be asked to listen on %q", address)
+		}
+	case "udp6":
+		switch host {
+		case "", "::":
+			host = "::1"
+		case "::1":
+		default:
+			return nil, fmt.Errorf("localhostListener cannot be asked to listen on %q", address)
+		}
+	}
+	var conf net.ListenConfig
+	return conf.ListenPacket(ctx, network, net.JoinHostPort(host, port))
+}
+
 func TestTwoDevicePing(t *testing.T) {
-	l, ip := nettype.Std{}, netaddr.IPv4(127, 0, 0, 1)
+	l, ip := localhostListener{}, netaddr.IPv4(127, 0, 0, 1)
 	n := &devices{
 		m1:     l,
 		m1IP:   ip,
@@ -613,6 +601,121 @@ func TestTwoDevicePing(t *testing.T) {
 		stunIP: ip,
 	}
 	testTwoDevicePing(t, n)
+}
+
+// Legacy clients appear to new code as peers that know about DERP and
+// WireGuard, but don't have a disco key. Check that we can still
+// communicate successfully with such peers.
+func TestNoDiscoKey(t *testing.T) {
+	tstest.PanicOnLog()
+	tstest.ResourceCheck(t)
+
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	m1 := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
+	defer m1.Close()
+	m2 := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
+	defer m2.Close()
+
+	removeDisco := func(idx int, nm *netmap.NetworkMap) {
+		for _, p := range nm.Peers {
+			p.DiscoKey = key.DiscoPublic{}
+		}
+	}
+
+	cleanupMesh := meshStacks(t.Logf, removeDisco, m1, m2)
+	defer cleanupMesh()
+
+	// Wait for both peers to know about each other before we try to
+	// ping.
+	for {
+		if s1 := m1.Status(); len(s1.Peer) != 1 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if s2 := m2.Status(); len(s2.Peer) != 1 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		break
+	}
+
+	pkt := tuntest.Ping(m2.IP().IPAddr().IP, m1.IP().IPAddr().IP)
+	m1.tun.Outbound <- pkt
+	select {
+	case <-m2.tun.Inbound:
+		t.Logf("ping m1>m2 ok")
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for ping to transit")
+	}
+}
+
+func TestDiscokeyChange(t *testing.T) {
+	tstest.PanicOnLog()
+	tstest.ResourceCheck(t)
+
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	m1Key := key.NewNode()
+	m1 := newMagicStackWithKey(t, t.Logf, localhostListener{}, derpMap, m1Key)
+	defer m1.Close()
+	m2 := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
+	defer m2.Close()
+
+	var (
+		mu sync.Mutex
+		// Start with some random discoKey that isn't actually m1's key,
+		// to simulate m2 coming up with knowledge of an old, expired
+		// discokey. We'll switch to the correct one later in the test.
+		m1DiscoKey = key.NewDisco().Public()
+	)
+	setm1Key := func(idx int, nm *netmap.NetworkMap) {
+		if idx != 1 {
+			// only mutate m2's netmap
+			return
+		}
+		if len(nm.Peers) != 1 {
+			// m1 not in netmap yet.
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		nm.Peers[0].DiscoKey = m1DiscoKey
+	}
+
+	cleanupMesh := meshStacks(t.Logf, setm1Key, m1, m2)
+	defer cleanupMesh()
+
+	// Wait for both peers to know about each other.
+	for {
+		if s1 := m1.Status(); len(s1.Peer) != 1 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if s2 := m2.Status(); len(s2.Peer) != 1 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		break
+	}
+
+	mu.Lock()
+	m1DiscoKey = m1.conn.DiscoPublicKey()
+	mu.Unlock()
+
+	// Manually trigger an endpoint update to meshStacks, so it hands
+	// m2 a new netmap.
+	m1.conn.mu.Lock()
+	m1.epCh <- m1.conn.lastEndpoints
+	m1.conn.mu.Unlock()
+
+	cleanup = newPinger(t, t.Logf, m1, m2)
+	defer cleanup()
+
+	mustDirect(t, t.Logf, m1, m2)
+	mustDirect(t, t.Logf, m2, m1)
 }
 
 func TestActiveDiscovery(t *testing.T) {
@@ -683,11 +786,11 @@ func TestActiveDiscovery(t *testing.T) {
 		inet := natlab.NewInternet()
 		lan1 := &natlab.Network{
 			Name:    "lan1",
-			Prefix4: mustPrefix("192.168.0.0/24"),
+			Prefix4: netaddr.MustParseIPPrefix("192.168.0.0/24"),
 		}
 		lan2 := &natlab.Network{
 			Name:    "lan2",
-			Prefix4: mustPrefix("192.168.1.0/24"),
+			Prefix4: netaddr.MustParseIPPrefix("192.168.1.0/24"),
 		}
 
 		sif := mstun.Attach("eth0", inet)
@@ -725,14 +828,6 @@ func TestActiveDiscovery(t *testing.T) {
 		}
 		testActiveDiscovery(t, n)
 	})
-}
-
-func mustPrefix(s string) netaddr.IPPrefix {
-	pfx, err := netaddr.ParseIPPrefix(s)
-	if err != nil {
-		panic(err)
-	}
-	return pfx
 }
 
 type devices struct {
@@ -836,12 +931,12 @@ func testActiveDiscovery(t *testing.T, d *devices) {
 	derpMap, cleanup := runDERPAndStun(t, logf, d.stun, d.stunIP)
 	defer cleanup()
 
-	m1 := newMagicStack(t, logger.WithPrefix(logf, "conn1: "), d.m1, derpMap, true)
+	m1 := newMagicStack(t, logger.WithPrefix(logf, "conn1: "), d.m1, derpMap)
 	defer m1.Close()
-	m2 := newMagicStack(t, logger.WithPrefix(logf, "conn2: "), d.m2, derpMap, true)
+	m2 := newMagicStack(t, logger.WithPrefix(logf, "conn2: "), d.m2, derpMap)
 	defer m2.Close()
 
-	cleanup = meshStacks(logf, []*magicStack{m1, m2})
+	cleanup = meshStacks(logf, nil, m1, m2)
 	defer cleanup()
 
 	m1IP := m1.IP()
@@ -854,28 +949,28 @@ func testActiveDiscovery(t *testing.T, d *devices) {
 	// Everything is now up and running, active discovery should find
 	// a direct path between our peers. Wait for it to switch away
 	// from DERP.
-
-	mustDirect := func(m1, m2 *magicStack) {
-		lastLog := time.Now().Add(-time.Minute)
-		// See https://github.com/tailscale/tailscale/issues/654 for a discussion of this deadline.
-		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-			pst := m1.Status().Peer[m2.Public()]
-			if pst.CurAddr != "" {
-				logf("direct link %s->%s found with addr %s", m1, m2, pst.CurAddr)
-				return
-			}
-			if now := time.Now(); now.Sub(lastLog) > time.Second {
-				logf("no direct path %s->%s yet, addrs %v", m1, m2, pst.Addrs)
-				lastLog = now
-			}
-		}
-		t.Errorf("magicsock did not find a direct path from %s to %s", m1, m2)
-	}
-
-	mustDirect(m1, m2)
-	mustDirect(m2, m1)
+	mustDirect(t, logf, m1, m2)
+	mustDirect(t, logf, m2, m1)
 
 	logf("starting cleanup")
+}
+
+func mustDirect(t *testing.T, logf logger.Logf, m1, m2 *magicStack) {
+	lastLog := time.Now().Add(-time.Minute)
+	// See https://github.com/tailscale/tailscale/issues/654
+	// and https://github.com/tailscale/tailscale/issues/3247 for discussions of this deadline.
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		pst := m1.Status().Peer[m2.Public()]
+		if pst.CurAddr != "" {
+			logf("direct link %s->%s found with addr %s", m1, m2, pst.CurAddr)
+			return
+		}
+		if now := time.Now(); now.Sub(lastLog) > time.Second {
+			logf("no direct path %s->%s yet, addrs %v", m1, m2, pst.Addrs)
+			lastLog = now
+		}
+	}
+	t.Errorf("magicsock did not find a direct path from %s to %s", m1, m2)
 }
 
 func testTwoDevicePing(t *testing.T, d *devices) {
@@ -892,21 +987,54 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	derpMap, cleanup := runDERPAndStun(t, logf, d.stun, d.stunIP)
 	defer cleanup()
 
-	m1 := newMagicStack(t, logf, d.m1, derpMap, false)
+	m1 := newMagicStack(t, logf, d.m1, derpMap)
 	defer m1.Close()
-	m2 := newMagicStack(t, logf, d.m2, derpMap, false)
+	m2 := newMagicStack(t, logf, d.m2, derpMap)
 	defer m2.Close()
 
-	addrs := []netaddr.IPPort{
-		netaddr.IPPortFrom(d.m1IP, m1.conn.LocalPort()),
-		netaddr.IPPortFrom(d.m2IP, m2.conn.LocalPort()),
-	}
-	cfgs := makeConfigs(t, addrs)
+	cleanupMesh := meshStacks(logf, nil, m1, m2)
+	defer cleanupMesh()
 
-	if err := m1.Reconfig(&cfgs[0]); err != nil {
+	// Wait for magicsock to be told about peers from meshStacks.
+	tstest.WaitFor(10*time.Second, func() error {
+		if p := m1.Status().Peer[m2.Public()]; p == nil || !p.InMagicSock {
+			return errors.New("m1 not ready")
+		}
+		if p := m2.Status().Peer[m1.Public()]; p == nil || !p.InMagicSock {
+			return errors.New("m2 not ready")
+		}
+		return nil
+	})
+
+	m1cfg := &wgcfg.Config{
+		Name:       "peer1",
+		PrivateKey: m1.privateKey,
+		Addresses:  []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.0.0.1/32")},
+		Peers: []wgcfg.Peer{
+			{
+				PublicKey:  m2.privateKey.Public(),
+				DiscoKey:   m2.conn.DiscoPublicKey(),
+				AllowedIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.0.0.2/32")},
+			},
+		},
+	}
+	m2cfg := &wgcfg.Config{
+		Name:       "peer2",
+		PrivateKey: m2.privateKey,
+		Addresses:  []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.0.0.2/32")},
+		Peers: []wgcfg.Peer{
+			{
+				PublicKey:  m1.privateKey.Public(),
+				DiscoKey:   m1.conn.DiscoPublicKey(),
+				AllowedIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.0.0.1/32")},
+			},
+		},
+	}
+
+	if err := m1.Reconfig(m1cfg); err != nil {
 		t.Fatal(err)
 	}
-	if err := m2.Reconfig(&cfgs[1]); err != nil {
+	if err := m2.Reconfig(m2cfg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -995,7 +1123,7 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	t.Run("no-op dev1 reconfig", func(t *testing.T) {
 		setT(t)
 		defer setT(outerT)
-		if err := m1.Reconfig(&cfgs[0]); err != nil {
+		if err := m1.Reconfig(m1cfg); err != nil {
 			t.Fatal(err)
 		}
 		ping1(t)
@@ -1003,215 +1131,43 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	})
 }
 
-// TestAddrSet tests addrSet appendDests and updateDst.
-func TestAddrSet(t *testing.T) {
-	tstest.PanicOnLog()
-	tstest.ResourceCheck(t)
-
-	mustIPPortPtr := func(s string) *netaddr.IPPort {
-		ipp := netaddr.MustParseIPPort(s)
-		return &ipp
-	}
-	ipps := func(ss ...string) (ret []netaddr.IPPort) {
-		t.Helper()
-		for _, s := range ss {
-			ret = append(ret, netaddr.MustParseIPPort(s))
-		}
-		return ret
-	}
-	joinUDPs := func(in []netaddr.IPPort) string {
-		var sb strings.Builder
-		for i, ua := range in {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(ua.String())
-		}
-		return sb.String()
-	}
-	var (
-		regPacket   = []byte("some regular packet")
-		sprayPacket = []byte("0000")
-	)
-	binary.LittleEndian.PutUint32(sprayPacket[:4], device.MessageInitiationType)
-	if !shouldSprayPacket(sprayPacket) {
-		t.Fatal("sprayPacket should be classified as a spray packet for testing")
-	}
-
-	// A step is either a b+want appendDests tests, or an
-	// UpdateDst call, depending on which fields are set.
-	type step struct {
-		// advance is the time to advance the fake clock
-		// before the step.
-		advance time.Duration
-
-		// updateDst, if set, does an UpdateDst call and
-		// b+want are ignored.
-		updateDst *netaddr.IPPort
-
-		b    []byte
-		want string // comma-separated
-	}
-	tests := []struct {
-		name     string
-		as       *addrSet
-		steps    []step
-		logCheck func(t *testing.T, logged []byte)
-	}{
-		{
-			name: "reg_packet_no_curaddr",
-			as: &addrSet{
-				ipPorts:  ipps("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
-				curAddr:  -1, // unknown
-				roamAddr: nil,
-			},
-			steps: []step{
-				{b: regPacket, want: "127.3.3.40:1"},
-			},
-		},
-		{
-			name: "reg_packet_have_curaddr",
-			as: &addrSet{
-				ipPorts:  ipps("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
-				curAddr:  1, // global IP
-				roamAddr: nil,
-			},
-			steps: []step{
-				{b: regPacket, want: "123.45.67.89:123"},
-			},
-		},
-		{
-			name: "reg_packet_have_roamaddr",
-			as: &addrSet{
-				ipPorts:  ipps("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
-				curAddr:  2, // should be ignored
-				roamAddr: mustIPPortPtr("5.6.7.8:123"),
-			},
-			steps: []step{
-				{b: regPacket, want: "5.6.7.8:123"},
-				{updateDst: mustIPPortPtr("10.0.0.1:123")}, // no more roaming
-				{b: regPacket, want: "10.0.0.1:123"},
-			},
-		},
-		{
-			name: "start_roaming",
-			as: &addrSet{
-				ipPorts: ipps("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
-				curAddr: 2,
-			},
-			steps: []step{
-				{b: regPacket, want: "10.0.0.1:123"},
-				{updateDst: mustIPPortPtr("4.5.6.7:123")},
-				{b: regPacket, want: "4.5.6.7:123"},
-				{updateDst: mustIPPortPtr("5.6.7.8:123")},
-				{b: regPacket, want: "5.6.7.8:123"},
-				{updateDst: mustIPPortPtr("123.45.67.89:123")}, // end roaming
-				{b: regPacket, want: "123.45.67.89:123"},
-			},
-		},
-		{
-			name: "spray_packet",
-			as: &addrSet{
-				ipPorts:  ipps("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
-				curAddr:  2, // should be ignored
-				roamAddr: mustIPPortPtr("5.6.7.8:123"),
-			},
-			steps: []step{
-				{b: sprayPacket, want: "127.3.3.40:1,123.45.67.89:123,10.0.0.1:123,5.6.7.8:123"},
-				{advance: 300 * time.Millisecond, b: regPacket, want: "127.3.3.40:1,123.45.67.89:123,10.0.0.1:123,5.6.7.8:123"},
-				{advance: 300 * time.Millisecond, b: regPacket, want: "127.3.3.40:1,123.45.67.89:123,10.0.0.1:123,5.6.7.8:123"},
-				{advance: 3, b: regPacket, want: "5.6.7.8:123"},
-				{advance: 2 * time.Millisecond, updateDst: mustIPPortPtr("10.0.0.1:123")},
-				{advance: 3, b: regPacket, want: "10.0.0.1:123"},
-			},
-		},
-		{
-			name: "low_pri",
-			as: &addrSet{
-				ipPorts: ipps("127.3.3.40:1", "123.45.67.89:123", "10.0.0.1:123"),
-				curAddr: 2,
-			},
-			steps: []step{
-				{updateDst: mustIPPortPtr("123.45.67.89:123")},
-				{updateDst: mustIPPortPtr("123.45.67.89:123")},
-			},
-			logCheck: func(t *testing.T, logged []byte) {
-				if n := bytes.Count(logged, []byte(", keeping current ")); n != 1 {
-					t.Errorf("low-prio keeping current logged %d times; want 1", n)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			faket := time.Unix(0, 0)
-			var logBuf bytes.Buffer
-			tt.as.Logf = func(format string, args ...interface{}) {
-				fmt.Fprintf(&logBuf, format, args...)
-				t.Logf(format, args...)
-			}
-			tt.as.clock = func() time.Time { return faket }
-			for i, st := range tt.steps {
-				faket = faket.Add(st.advance)
-
-				if st.updateDst != nil {
-					if err := tt.as.updateDst(*st.updateDst); err != nil {
-						t.Fatal(err)
-					}
-					continue
-				}
-				got, _ := tt.as.appendDests(nil, st.b)
-				if gotStr := joinUDPs(got); gotStr != st.want {
-					t.Errorf("step %d: got %v; want %v", i, gotStr, st.want)
-				}
-			}
-			if tt.logCheck != nil {
-				tt.logCheck(t, logBuf.Bytes())
-			}
-		})
-	}
-}
-
 func TestDiscoMessage(t *testing.T) {
 	c := newConn()
 	c.logf = t.Logf
-	c.privateKey = key.NewPrivate()
+	c.privateKey = key.NewNode()
 
 	peer1Pub := c.DiscoPublicKey()
 	peer1Priv := c.discoPrivate
-	c.endpointOfDisco = map[tailcfg.DiscoKey]*discoEndpoint{
-		tailcfg.DiscoKey(peer1Pub): {
-			// ... (enough for this test)
-		},
+	n := &tailcfg.Node{
+		Key:      key.NewNode().Public(),
+		DiscoKey: peer1Pub,
 	}
-	c.nodeOfDisco = map[tailcfg.DiscoKey]*tailcfg.Node{
-		tailcfg.DiscoKey(peer1Pub): {
-			// ... (enough for this test)
-		},
-	}
+	c.peerMap.upsertEndpoint(&endpoint{
+		publicKey: n.Key,
+		discoKey:  n.DiscoKey,
+	}, key.DiscoPublic{})
 
 	const payload = "why hello"
 
 	var nonce [24]byte
 	crand.Read(nonce[:])
 
-	pkt := append([]byte("TS💬"), peer1Pub[:]...)
-	pkt = append(pkt, nonce[:]...)
+	pkt := peer1Pub.AppendTo([]byte("TS💬"))
 
-	pkt = box.Seal(pkt, []byte(payload), &nonce, c.discoPrivate.Public().B32(), peer1Priv.B32())
-	got := c.handleDiscoMessage(pkt, netaddr.IPPort{})
+	box := peer1Priv.Shared(c.discoPrivate.Public()).Seal([]byte(payload))
+	pkt = append(pkt, box...)
+	got := c.handleDiscoMessage(pkt, netaddr.IPPort{}, key.NodePublic{})
 	if !got {
 		t.Error("failed to open it")
 	}
 }
 
-// tests that having a discoEndpoint.String prevents wireguard-go's
+// tests that having a endpoint.String prevents wireguard-go's
 // log.Printf("%v") of its conn.Endpoint values from using reflect to
 // walk into read mutex while they're being used and then causing data
 // races.
 func TestDiscoStringLogRace(t *testing.T) {
-	de := new(discoEndpoint)
+	de := new(endpoint)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -1226,31 +1182,40 @@ func TestDiscoStringLogRace(t *testing.T) {
 }
 
 func Test32bitAlignment(t *testing.T) {
-	var de discoEndpoint
-
-	if off := unsafe.Offsetof(de.lastRecvUnixAtomic); off%8 != 0 {
-		t.Fatalf("discoEndpoint.lastRecvUnixAtomic is not 8-byte aligned")
+	// Need an associated conn with non-nil noteRecvActivity to
+	// trigger interesting work on the atomics in endpoint.
+	called := 0
+	de := endpoint{
+		c: &Conn{
+			noteRecvActivity: func(key.NodePublic) { called++ },
+		},
 	}
 
-	if !de.isFirstRecvActivityInAwhile() { // verify this doesn't panic on 32-bit
-		t.Error("expected true")
+	if off := unsafe.Offsetof(de.lastRecv); off%8 != 0 {
+		t.Fatalf("endpoint.lastRecv is not 8-byte aligned")
 	}
-	if de.isFirstRecvActivityInAwhile() {
-		t.Error("expected false on second call")
+
+	de.noteRecvActivity() // verify this doesn't panic on 32-bit
+	if called != 1 {
+		t.Fatal("expected call to noteRecvActivity")
+	}
+	de.noteRecvActivity()
+	if called != 1 {
+		t.Error("expected no second call to noteRecvActivity")
 	}
 }
 
-// newNonLegacyTestConn returns a new Conn with DisableLegacyNetworking set true.
-func newNonLegacyTestConn(t testing.TB) *Conn {
+// newTestConn returns a new Conn.
+func newTestConn(t testing.TB) *Conn {
 	t.Helper()
 	port := pickPort(t)
 	conn, err := NewConn(Options{
-		Logf: t.Logf,
-		Port: port,
+		Logf:                   t.Logf,
+		Port:                   port,
+		TestOnlyPacketListener: localhostListener{},
 		EndpointsFunc: func(eps []tailcfg.Endpoint) {
 			t.Logf("endpoints: %q", eps)
 		},
-		DisableLegacyNetworking: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1258,28 +1223,15 @@ func newNonLegacyTestConn(t testing.TB) *Conn {
 	return conn
 }
 
-func makeEndpoint(tb testing.TB, public tailcfg.NodeKey, disco tailcfg.DiscoKey) string {
-	tb.Helper()
-	ep := wgcfg.Endpoints{
-		PublicKey: wgkey.Key(public),
-		DiscoKey:  disco,
-	}
-	buf, err := json.Marshal(ep)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	return string(buf)
-}
-
 // addTestEndpoint sets conn's network map to a single peer expected
 // to receive packets from sendConn (or DERP), and returns that peer's
 // nodekey and discokey.
-func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (tailcfg.NodeKey, tailcfg.DiscoKey) {
+func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (key.NodePublic, key.DiscoPublic) {
 	// Give conn just enough state that it'll recognize sendConn as a
 	// valid peer and not fall through to the legacy magicsock
 	// codepath.
-	discoKey := tailcfg.DiscoKey{31: 1}
-	nodeKey := tailcfg.NodeKey{0: 'N', 1: 'K'}
+	discoKey := key.DiscoPublicFromRaw32(mem.B([]byte{31: 1}))
+	nodeKey := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 31: 0}))
 	conn.SetNetworkMap(&netmap.NetworkMap{
 		Peers: []*tailcfg.Node{
 			{
@@ -1289,17 +1241,21 @@ func addTestEndpoint(tb testing.TB, conn *Conn, sendConn net.PacketConn) (tailcf
 			},
 		},
 	})
-	conn.SetPrivateKey(wgkey.Private{0: 1})
-	_, err := conn.ParseEndpoint(makeEndpoint(tb, nodeKey, discoKey))
+	conn.SetPrivateKey(key.NodePrivateFromRaw32(mem.B([]byte{0: 1, 31: 0})))
+	_, err := conn.ParseEndpoint(nodeKey.UntypedHexString())
 	if err != nil {
 		tb.Fatal(err)
 	}
-	conn.addValidDiscoPathForTest(discoKey, netaddr.MustParseIPPort(sendConn.LocalAddr().String()))
+	conn.addValidDiscoPathForTest(nodeKey, netaddr.MustParseIPPort(sendConn.LocalAddr().String()))
 	return nodeKey, discoKey
 }
 
 func setUpReceiveFrom(tb testing.TB) (roundTrip func()) {
-	conn := newNonLegacyTestConn(tb)
+	if b, ok := tb.(*testing.B); ok {
+		b.ReportAllocs()
+	}
+
+	conn := newTestConn(tb)
 	tb.Cleanup(func() { conn.Close() })
 	conn.logf = logger.Discard
 
@@ -1377,18 +1333,25 @@ func TestGoMajorVersion(t *testing.T) {
 }
 
 func TestReceiveFromAllocs(t *testing.T) {
+	if racebuild.On {
+		t.Skip("alloc tests are unreliable with -race")
+	}
 	// Go 1.16 and before: allow 3 allocs.
-	// Go Tailscale fork, Go 1.17+: only allow 2 allocs.
+	// Go 1.17: allow 2 allocs.
+	// Go Tailscale fork, Go 1.18+: allow 1 alloc.
 	major, ts := goMajorVersion(runtime.Version())
 	maxAllocs := 3
-	if major >= 17 || ts {
+	switch {
+	case major == 17:
 		maxAllocs = 2
+	case major >= 18, ts:
+		maxAllocs = 1
 	}
 	t.Logf("allowing %d allocs for Go version %q", maxAllocs, runtime.Version())
 	roundTrip := setUpReceiveFrom(t)
-	avg := int(testing.AllocsPerRun(100, roundTrip))
-	if avg > maxAllocs {
-		t.Fatalf("expected %d allocs in ReceiveFrom, got %v", maxAllocs, avg)
+	err := tstest.MinAllocsPerRun(t, uint64(maxAllocs), roundTrip)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1400,6 +1363,7 @@ func BenchmarkReceiveFrom(b *testing.B) {
 }
 
 func BenchmarkReceiveFrom_Native(b *testing.B) {
+	b.ReportAllocs()
 	recvConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		b.Fatal(err)
@@ -1430,30 +1394,21 @@ func BenchmarkReceiveFrom_Native(b *testing.B) {
 	}
 }
 
-func logBufWriter(buf *bytes.Buffer) logger.Logf {
-	return func(format string, a ...interface{}) {
-		fmt.Fprintf(buf, format, a...)
-		if !bytes.HasSuffix(buf.Bytes(), []byte("\n")) {
-			buf.WriteByte('\n')
-		}
-	}
-}
-
 // Test that a netmap update where node changes its node key but
 // doesn't change its disco key doesn't result in a broken state.
 //
 // https://github.com/tailscale/tailscale/issues/1391
 func TestSetNetworkMapChangingNodeKey(t *testing.T) {
-	conn := newNonLegacyTestConn(t)
+	conn := newTestConn(t)
 	t.Cleanup(func() { conn.Close() })
-	var logBuf bytes.Buffer
-	conn.logf = logBufWriter(&logBuf)
+	var buf tstest.MemLogger
+	conn.logf = buf.Logf
 
-	conn.SetPrivateKey(wgkey.Private{0: 1})
+	conn.SetPrivateKey(key.NodePrivateFromRaw32(mem.B([]byte{0: 1, 31: 0})))
 
-	discoKey := tailcfg.DiscoKey{31: 1}
-	nodeKey1 := tailcfg.NodeKey{0: 'N', 1: 'K', 2: '1'}
-	nodeKey2 := tailcfg.NodeKey{0: 'N', 1: 'K', 2: '2'}
+	discoKey := key.DiscoPublicFromRaw32(mem.B([]byte{31: 1}))
+	nodeKey1 := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 2: '1', 31: 0}))
+	nodeKey2 := key.NodePublicFromRaw32(mem.B([]byte{0: 'N', 1: 'K', 2: '2', 31: 0}))
 
 	conn.SetNetworkMap(&netmap.NetworkMap{
 		Peers: []*tailcfg.Node{
@@ -1464,7 +1419,7 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 			},
 		},
 	})
-	_, err := conn.ParseEndpoint(makeEndpoint(t, nodeKey1, discoKey))
+	_, err := conn.ParseEndpoint(nodeKey1.UntypedHexString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1481,15 +1436,20 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 		})
 	}
 
-	de := conn.endpointOfDisco[discoKey]
-	if de != nil && de.publicKey != nodeKey2 {
-		t.Fatalf("discoEndpoint public key = %q; want %q", de.publicKey[:], nodeKey2[:])
+	de, ok := conn.peerMap.endpointForNodeKey(nodeKey2)
+	if ok && de.publicKey != nodeKey2 {
+		t.Fatalf("discoEndpoint public key = %q; want %q", de.publicKey, nodeKey2)
+	}
+	if de.discoKey != discoKey {
+		t.Errorf("discoKey = %v; want %v", de.discoKey, discoKey)
+	}
+	if _, ok := conn.peerMap.endpointForNodeKey(nodeKey1); ok {
+		t.Errorf("didn't expect to find node for key1")
 	}
 
-	log := logBuf.String()
+	log := buf.String()
 	wantSub := map[string]int{
-		"magicsock: got updated network map; 1 peers (1 with discokey)":                                                                           2,
-		"magicsock: disco key discokey:0000000000000000000000000000000000000000000000000000000000000001 changed from node key [TksxA] to [TksyA]": 1,
+		"magicsock: got updated network map; 1 peers": 2,
 	}
 	for sub, want := range wantSub {
 		got := strings.Count(log, sub)
@@ -1503,10 +1463,10 @@ func TestSetNetworkMapChangingNodeKey(t *testing.T) {
 }
 
 func TestRebindStress(t *testing.T) {
-	conn := newNonLegacyTestConn(t)
+	conn := newTestConn(t)
 
-	var logBuf bytes.Buffer
-	conn.logf = logBufWriter(&logBuf)
+	var buf tstest.MemLogger
+	conn.logf = buf.Logf
 
 	closed := false
 	t.Cleanup(func() {
@@ -1558,7 +1518,7 @@ func TestRebindStress(t *testing.T) {
 
 	err := <-errc
 	if err != nil {
-		t.Fatalf("Got ReceiveIPv4 error: %v (is closed = %v). Log:\n%s", err, errors.Is(err, net.ErrClosed), logBuf.Bytes())
+		t.Fatalf("Got ReceiveIPv4 error: %v (is closed = %v). Log:\n%s", err, errors.Is(err, net.ErrClosed), buf.String())
 	}
 }
 
@@ -1680,4 +1640,150 @@ func epStrings(eps []tailcfg.Endpoint) (ret []string) {
 		ret = append(ret, ep.Addr.String())
 	}
 	return
+}
+
+func TestStressSetNetworkMap(t *testing.T) {
+	t.Parallel()
+
+	conn := newTestConn(t)
+	t.Cleanup(func() { conn.Close() })
+	var buf tstest.MemLogger
+	conn.logf = buf.Logf
+
+	conn.SetPrivateKey(key.NewNode())
+
+	const npeers = 5
+	present := make([]bool, npeers)
+	allPeers := make([]*tailcfg.Node, npeers)
+	for i := range allPeers {
+		present[i] = true
+		allPeers[i] = &tailcfg.Node{
+			DiscoKey:  randDiscoKey(),
+			Key:       randNodeKey(),
+			Endpoints: []string{fmt.Sprintf("192.168.1.2:%d", i)},
+		}
+	}
+
+	// Get a PRNG seed. If not provided, generate a new one to get extra coverage.
+	seed, err := strconv.ParseUint(os.Getenv("TS_STRESS_SET_NETWORK_MAP_SEED"), 10, 64)
+	if err != nil {
+		var buf [8]byte
+		crand.Read(buf[:])
+		seed = binary.LittleEndian.Uint64(buf[:])
+	}
+	t.Logf("TS_STRESS_SET_NETWORK_MAP_SEED=%d", seed)
+	prng := rand.New(rand.NewSource(int64(seed)))
+
+	const iters = 1000 // approx 0.5s on an m1 mac
+	for i := 0; i < iters; i++ {
+		for j := 0; j < npeers; j++ {
+			// Randomize which peers are present.
+			if prng.Int()&1 == 0 {
+				present[j] = !present[j]
+			}
+			// Randomize some peer disco keys and node keys.
+			if prng.Int()&1 == 0 {
+				allPeers[j].DiscoKey = randDiscoKey()
+			}
+			if prng.Int()&1 == 0 {
+				allPeers[j].Key = randNodeKey()
+			}
+		}
+		// Clone existing peers into a new netmap.
+		peers := make([]*tailcfg.Node, 0, len(allPeers))
+		for peerIdx, p := range allPeers {
+			if present[peerIdx] {
+				peers = append(peers, p.Clone())
+			}
+		}
+		// Set the netmap.
+		conn.SetNetworkMap(&netmap.NetworkMap{
+			Peers: peers,
+		})
+		// Check invariants.
+		if err := conn.peerMap.validate(); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func randDiscoKey() (k key.DiscoPublic) { return key.NewDisco().Public() }
+func randNodeKey() (k key.NodePublic)   { return key.NewNode().Public() }
+
+// validate checks m for internal consistency and reports the first error encountered.
+// It is used in tests only, so it doesn't need to be efficient.
+func (m *peerMap) validate() error {
+	seenEps := make(map[*endpoint]bool)
+	for pub, pi := range m.byNodeKey {
+		if got := pi.ep.publicKey; got != pub {
+			return fmt.Errorf("byNodeKey[%v].publicKey = %v", pub, got)
+		}
+		if got, want := pi.ep.wgEndpoint, pub.UntypedHexString(); got != want {
+			return fmt.Errorf("byNodeKey[%v].wgEndpoint = %q, want %q", pub, got, want)
+		}
+		if _, ok := seenEps[pi.ep]; ok {
+			return fmt.Errorf("duplicate endpoint present: %v", pi.ep.publicKey)
+		}
+		seenEps[pi.ep] = true
+		for ipp, v := range pi.ipPorts {
+			if !v {
+				return fmt.Errorf("m.byIPPort[%v] is false, expected map to be set-like", ipp)
+			}
+			if got := m.byIPPort[ipp]; got != pi {
+				return fmt.Errorf("m.byIPPort[%v] = %v, want %v", ipp, got, pi)
+			}
+		}
+	}
+
+	for ipp, pi := range m.byIPPort {
+		if !pi.ipPorts[ipp] {
+			return fmt.Errorf("ipPorts[%v] for %v is false", ipp, pi.ep.publicKey)
+		}
+		pi2 := m.byNodeKey[pi.ep.publicKey]
+		if pi != pi2 {
+			return fmt.Errorf("byNodeKey[%v]=%p doesn't match byIPPort[%v]=%p", pi, pi, pi.ep.publicKey, pi2)
+		}
+	}
+
+	publicToDisco := make(map[key.NodePublic]key.DiscoPublic)
+	for disco, nodes := range m.nodesOfDisco {
+		for pub, v := range nodes {
+			if !v {
+				return fmt.Errorf("m.nodeOfDisco[%v][%v] is false, expected map to be set-like", disco, pub)
+			}
+			if _, ok := m.byNodeKey[pub]; !ok {
+				return fmt.Errorf("nodesOfDisco refers to public key %v, which is not present in byNodeKey", pub)
+			}
+			if _, ok := publicToDisco[pub]; ok {
+				return fmt.Errorf("publicKey %v refers to multiple disco keys", pub)
+			}
+			publicToDisco[pub] = disco
+		}
+	}
+
+	return nil
+}
+
+func TestBlockForeverConnUnblocks(t *testing.T) {
+	c := newBlockForeverConn()
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		_, _, err := c.ReadFrom(make([]byte, 1))
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // give ReadFrom time to get blocked
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != net.ErrClosed {
+			t.Errorf("got %v; want net.ErrClosed", err)
+		}
+	case <-timer.C:
+		t.Fatal("timeout")
+	}
 }

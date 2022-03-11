@@ -26,13 +26,16 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
-	"golang.org/x/crypto/nacl/box"
+	"go4.org/mem"
 	"inet.af/netaddr"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/wgkey"
 )
+
+const msgLimit = 1 << 20 // encrypted message length limit
 
 // Server is a control plane server. Its zero value is ready for use.
 // Everything is stored in-memory in one tailnet.
@@ -41,6 +44,7 @@ type Server struct {
 	DERPMap     *tailcfg.DERPMap // nil means to use prod DERP map
 	RequireAuth bool
 	Verbose     bool
+	DNSConfig   *tailcfg.DNSConfig // nil means no DNS config
 
 	// ExplicitBaseURL or HTTPTestServer must be set.
 	ExplicitBaseURL string           // e.g. "http://127.0.0.1:1234" with no trailing URL
@@ -49,17 +53,23 @@ type Server struct {
 	initMuxOnce sync.Once
 	mux         *http.ServeMux
 
-	mu            sync.Mutex
-	cond          *sync.Cond // lazily initialized by condLocked
-	pubKey        wgkey.Key
-	privKey       wgkey.Private
-	nodes         map[tailcfg.NodeKey]*tailcfg.Node
-	users         map[tailcfg.NodeKey]*tailcfg.User
-	logins        map[tailcfg.NodeKey]*tailcfg.Login
+	mu         sync.Mutex
+	inServeMap int
+	cond       *sync.Cond // lazily initialized by condLocked
+	pubKey     key.MachinePublic
+	privKey    key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
+
+	noisePubKey  key.MachinePublic
+	noisePrivKey key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
+
+	nodes         map[key.NodePublic]*tailcfg.Node
+	users         map[key.NodePublic]*tailcfg.User
+	logins        map[key.NodePublic]*tailcfg.Login
 	updates       map[tailcfg.NodeID]chan updateType
 	authPath      map[string]*AuthPath
-	nodeKeyAuthed map[tailcfg.NodeKey]bool // key => true once authenticated
-	pingReqsToAdd map[tailcfg.NodeKey]*tailcfg.PingRequest
+	nodeKeyAuthed map[key.NodePublic]bool // key => true once authenticated
+	pingReqsToAdd map[key.NodePublic]*tailcfg.PingRequest
+	allExpired    bool // All nodes will be told their node key is expired.
 }
 
 // BaseURL returns the server's base URL, without trailing slash.
@@ -98,7 +108,7 @@ func (s *Server) condLocked() *sync.Cond {
 
 // AwaitNodeInMapRequest waits for node k to be stuck in a map poll.
 // It returns an error if and only if the context is done first.
-func (s *Server) AwaitNodeInMapRequest(ctx context.Context, k tailcfg.NodeKey) error {
+func (s *Server) AwaitNodeInMapRequest(ctx context.Context, k key.NodePublic) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cond := s.condLocked()
@@ -130,11 +140,11 @@ func (s *Server) AwaitNodeInMapRequest(ctx context.Context, k tailcfg.NodeKey) e
 
 // AddPingRequest sends the ping pr to nodeKeyDst. It reports whether it did so. That is,
 // it reports whether nodeKeyDst was connected.
-func (s *Server) AddPingRequest(nodeKeyDst tailcfg.NodeKey, pr *tailcfg.PingRequest) bool {
+func (s *Server) AddPingRequest(nodeKeyDst key.NodePublic, pr *tailcfg.PingRequest) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pingReqsToAdd == nil {
-		s.pingReqsToAdd = map[tailcfg.NodeKey]*tailcfg.PingRequest{}
+		s.pingReqsToAdd = map[key.NodePublic]*tailcfg.PingRequest{}
 	}
 	// Now send the update to the channel
 	node := s.nodeLocked(nodeKeyDst)
@@ -148,8 +158,20 @@ func (s *Server) AddPingRequest(nodeKeyDst tailcfg.NodeKey, pr *tailcfg.PingRequ
 	return sendUpdate(oldUpdatesCh, updateDebugInjection)
 }
 
+// Mark the Node key of every node as expired
+func (s *Server) SetExpireAllNodes(expired bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.allExpired = expired
+
+	for _, node := range s.nodes {
+		sendUpdate(s.updates[node.ID], updateSelfChanged)
+	}
+}
+
 type AuthPath struct {
-	nodeKey tailcfg.NodeKey
+	nodeKey key.NodePublic
 
 	closeOnce sync.Once
 	ch        chan struct{}
@@ -193,34 +215,43 @@ func (s *Server) serveUnhandled(w http.ResponseWriter, r *http.Request) {
 	go panic(fmt.Sprintf("testcontrol.Server received unhandled request: %s", got.Bytes()))
 }
 
-func (s *Server) publicKey() wgkey.Key {
-	pub, _ := s.keyPair()
-	return pub
-}
-
-func (s *Server) privateKey() wgkey.Private {
-	_, priv := s.keyPair()
-	return priv
-}
-
-func (s *Server) keyPair() (pub wgkey.Key, priv wgkey.Private) {
+func (s *Server) publicKeys() (noiseKey, pubKey key.MachinePublic) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.pubKey.IsZero() {
-		var err error
-		s.privKey, err = wgkey.NewPrivate()
-		if err != nil {
-			go panic(err) // bring down test, even if in http.Handler
-		}
-		s.pubKey = s.privKey.Public()
+	s.ensureKeyPairLocked()
+	return s.noisePubKey, s.pubKey
+}
+
+func (s *Server) privateKey() key.ControlPrivate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureKeyPairLocked()
+	return s.privKey
+}
+
+func (s *Server) ensureKeyPairLocked() {
+	if !s.pubKey.IsZero() {
+		return
 	}
-	return s.pubKey, s.privKey
+	s.noisePrivKey = key.NewControl()
+	s.noisePubKey = s.noisePrivKey.Public()
+	s.privKey = key.NewControl()
+	s.pubKey = s.privKey.Public()
 }
 
 func (s *Server) serveKey(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(200)
-	io.WriteString(w, s.publicKey().HexString())
+	_, legacyKey := s.publicKeys()
+	if r.FormValue("v") == "" {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, legacyKey.UntypedHexString())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	// TODO(maisem/bradfitz): support noise protocol here.
+	json.NewEncoder(w).Encode(&tailcfg.OverTLSPublicKeyResponse{
+		LegacyPublicKey: legacyKey,
+		// PublicKey:       noiseKey,
+	})
 }
 
 func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
@@ -231,12 +262,12 @@ func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
 		mkeyStr = mkeyStr[:i]
 	}
 
-	key, err := wgkey.ParseHex(mkeyStr)
+	// TODO(maisem/bradfitz): support noise protocol here.
+	mkey, err := key.ParseMachinePublicUntyped(mem.S(mkeyStr))
 	if err != nil {
 		http.Error(w, "bad machine key hex", 400)
 		return
 	}
-	mkey := tailcfg.MachineKey(key)
 
 	if r.Method != "POST" {
 		http.Error(w, "POST required", 400)
@@ -254,7 +285,7 @@ func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
 }
 
 // Node returns the node for nodeKey. It's always nil or cloned memory.
-func (s *Server) Node(nodeKey tailcfg.NodeKey) *tailcfg.Node {
+func (s *Server) Node(nodeKey key.NodePublic) *tailcfg.Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.nodeLocked(nodeKey)
@@ -263,8 +294,36 @@ func (s *Server) Node(nodeKey tailcfg.NodeKey) *tailcfg.Node {
 // nodeLocked returns the node for nodeKey. It's always nil or cloned memory.
 //
 // s.mu must be held.
-func (s *Server) nodeLocked(nodeKey tailcfg.NodeKey) *tailcfg.Node {
+func (s *Server) nodeLocked(nodeKey key.NodePublic) *tailcfg.Node {
 	return s.nodes[nodeKey].Clone()
+}
+
+// AddFakeNode injects a fake node into the server.
+func (s *Server) AddFakeNode() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nodes == nil {
+		s.nodes = make(map[key.NodePublic]*tailcfg.Node)
+	}
+	nk := key.NewNode().Public()
+	mk := key.NewMachine().Public()
+	dk := key.NewDisco().Public()
+	r := nk.Raw32()
+	id := int64(binary.LittleEndian.Uint64(r[:]))
+	ip := netaddr.IPv4(r[0], r[1], r[2], r[3])
+	addr := netaddr.IPPrefixFrom(ip, 32)
+	s.nodes[nk] = &tailcfg.Node{
+		ID:                tailcfg.NodeID(id),
+		StableID:          tailcfg.StableNodeID(fmt.Sprintf("TESTCTRL%08x", id)),
+		User:              tailcfg.UserID(id),
+		Machine:           mk,
+		Key:               nk,
+		MachineAuthorized: true,
+		DiscoKey:          dk,
+		Addresses:         []netaddr.IPPrefix{addr},
+		AllowedIPs:        []netaddr.IPPrefix{addr},
+	}
+	// TODO: send updates to other (non-fake?) nodes
 }
 
 func (s *Server) AllNodes() (nodes []*tailcfg.Node) {
@@ -279,14 +338,14 @@ func (s *Server) AllNodes() (nodes []*tailcfg.Node) {
 	return nodes
 }
 
-func (s *Server) getUser(nodeKey tailcfg.NodeKey) (*tailcfg.User, *tailcfg.Login) {
+func (s *Server) getUser(nodeKey key.NodePublic) (*tailcfg.User, *tailcfg.Login) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.users == nil {
-		s.users = map[tailcfg.NodeKey]*tailcfg.User{}
+		s.users = map[key.NodePublic]*tailcfg.User{}
 	}
 	if s.logins == nil {
-		s.logins = map[tailcfg.NodeKey]*tailcfg.Login{}
+		s.logins = map[key.NodePublic]*tailcfg.Login{}
 	}
 	if u, ok := s.users[nodeKey]; ok {
 		return u, s.logins[nodeKey]
@@ -326,7 +385,7 @@ func (s *Server) authPathDone(authPath string) <-chan struct{} {
 	return nil
 }
 
-func (s *Server) addAuthPath(authPath string, nodeKey tailcfg.NodeKey) {
+func (s *Server) addAuthPath(authPath string, nodeKey key.NodePublic) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.authPath == nil {
@@ -358,23 +417,30 @@ func (s *Server) CompleteAuth(authPathOrURL string) bool {
 		panic("zero AuthPath.NodeKey")
 	}
 	if s.nodeKeyAuthed == nil {
-		s.nodeKeyAuthed = map[tailcfg.NodeKey]bool{}
+		s.nodeKeyAuthed = map[key.NodePublic]bool{}
 	}
 	s.nodeKeyAuthed[ap.nodeKey] = true
 	ap.CompleteSuccessfully()
 	return true
 }
 
-func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey tailcfg.MachineKey) {
-	var req tailcfg.RegisterRequest
-	if err := s.decode(mkey, r.Body, &req); err != nil {
-		panic(fmt.Sprintf("serveRegister: decode: %v", err))
+func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.MachinePublic) {
+	msg, err := ioutil.ReadAll(io.LimitReader(r.Body, msgLimit))
+	r.Body.Close()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("bad map request read: %v", err), 400)
+		return
 	}
-	if req.Version != 1 {
-		panic(fmt.Sprintf("serveRegister: unsupported version: %d", req.Version))
+
+	var req tailcfg.RegisterRequest
+	if err := s.decode(mkey, msg, &req); err != nil {
+		go panic(fmt.Sprintf("serveRegister: decode: %v", err))
+	}
+	if req.Version == 0 {
+		panic("serveRegister: zero Version")
 	}
 	if req.NodeKey.IsZero() {
-		panic("serveRegister: request has zero node key")
+		go panic("serveRegister: request has zero node key")
 	}
 	if s.Verbose {
 		j, _ := json.MarshalIndent(req, "", "\t")
@@ -398,19 +464,25 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey tail
 		// some follow-ups? For now all are successes.
 	}
 
-	user, login := s.getUser(req.NodeKey)
+	nk := req.NodeKey
+
+	user, login := s.getUser(nk)
 	s.mu.Lock()
 	if s.nodes == nil {
-		s.nodes = map[tailcfg.NodeKey]*tailcfg.Node{}
+		s.nodes = map[key.NodePublic]*tailcfg.Node{}
 	}
 
 	machineAuthorized := true // TODO: add Server.RequireMachineAuth
 
+	v4Prefix := netaddr.IPPrefixFrom(netaddr.IPv4(100, 64, uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID))), 32)
+	v6Prefix := netaddr.IPPrefixFrom(tsaddr.Tailscale4To6(v4Prefix.IP()), 128)
+
 	allowedIPs := []netaddr.IPPrefix{
-		netaddr.MustParseIPPrefix(fmt.Sprintf("100.64.%d.%d/32", uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID)))),
+		v4Prefix,
+		v6Prefix,
 	}
 
-	s.nodes[req.NodeKey] = &tailcfg.Node{
+	s.nodes[nk] = &tailcfg.Node{
 		ID:                tailcfg.NodeID(user.ID),
 		StableID:          tailcfg.StableNodeID(fmt.Sprintf("TESTCTRL%08x", int(user.ID))),
 		User:              user.ID,
@@ -419,11 +491,13 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey tail
 		MachineAuthorized: machineAuthorized,
 		Addresses:         allowedIPs,
 		AllowedIPs:        allowedIPs,
+		Hostinfo:          req.Hostinfo.View(),
 	}
 	requireAuth := s.RequireAuth
-	if requireAuth && s.nodeKeyAuthed[req.NodeKey] {
+	if requireAuth && s.nodeKeyAuthed[nk] {
 		requireAuth = false
 	}
+	allExpired := s.allExpired
 	s.mu.Unlock()
 
 	authURL := ""
@@ -431,14 +505,14 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey tail
 		randHex := make([]byte, 10)
 		crand.Read(randHex)
 		authPath := fmt.Sprintf("/auth/%x", randHex)
-		s.addAuthPath(authPath, req.NodeKey)
+		s.addAuthPath(authPath, nk)
 		authURL = s.BaseURL() + authPath
 	}
 
 	res, err := s.encode(mkey, false, tailcfg.RegisterResponse{
 		User:              *user,
 		Login:             *login,
-		NodeKeyExpired:    false,
+		NodeKeyExpired:    allExpired,
 		MachineAuthorized: machineAuthorized,
 		AuthURL:           authURL,
 	})
@@ -504,11 +578,34 @@ func (s *Server) UpdateNode(n *tailcfg.Node) (peersToUpdate []tailcfg.NodeID) {
 	return peersToUpdate
 }
 
-func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey tailcfg.MachineKey) {
+func (s *Server) incrInServeMap(delta int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inServeMap += delta
+}
+
+// InServeMap returns the number of clients currently in a MapRequest HTTP handler.
+func (s *Server) InServeMap() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inServeMap
+}
+
+func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.MachinePublic) {
+	s.incrInServeMap(1)
+	defer s.incrInServeMap(-1)
 	ctx := r.Context()
 
+	msg, err := ioutil.ReadAll(io.LimitReader(r.Body, msgLimit))
+	if err != nil {
+		r.Body.Close()
+		http.Error(w, fmt.Sprintf("bad map request read: %v", err), 400)
+		return
+	}
+	r.Body.Close()
+
 	req := new(tailcfg.MapRequest)
-	if err := s.decode(mkey, r.Body, req); err != nil {
+	if err := s.decode(mkey, msg, req); err != nil {
 		go panic(fmt.Sprintf("bad map request: %v", err))
 	}
 
@@ -530,6 +627,14 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey tailcfg.M
 		endpoints := filterInvalidIPv6Endpoints(req.Endpoints)
 		node.Endpoints = endpoints
 		node.DiscoKey = req.DiscoKey
+		if req.Hostinfo != nil {
+			node.Hostinfo = req.Hostinfo.View()
+			if ni := node.Hostinfo.NetInfo(); ni.Valid() {
+				if ni.PreferredDERP() != 0 {
+					node.DERP = fmt.Sprintf("127.3.3.40:%d", ni.PreferredDERP())
+				}
+			}
+		}
 		peersToUpdate = s.UpdateNode(node)
 	}
 
@@ -567,6 +672,13 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey tailcfg.M
 		}
 		if res == nil {
 			return // done
+		}
+
+		s.mu.Lock()
+		allExpired := s.allExpired
+		s.mu.Unlock()
+		if allExpired {
+			res.Node.KeyExpiry = time.Now().Add(-1 * time.Minute)
 		}
 		// TODO: add minner if/when needed
 		resBytes, err := json.Marshal(res)
@@ -619,41 +731,55 @@ var keepAliveMsg = &struct {
 //
 // No updates to s are done here.
 func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse, err error) {
-	node := s.Node(req.NodeKey)
+	nk := req.NodeKey
+	node := s.Node(nk)
 	if node == nil {
 		// node key rotated away (once test server supports that)
 		return nil, nil
 	}
-	user, _ := s.getUser(req.NodeKey)
+	user, _ := s.getUser(nk)
+	t := time.Date(2020, 8, 3, 0, 0, 0, 1, time.UTC)
 	res = &tailcfg.MapResponse{
 		Node:            node,
 		DERPMap:         s.DERPMap,
 		Domain:          string(user.Domain),
 		CollectServices: "true",
 		PacketFilter:    tailcfg.FilterAllowAll,
+		Debug: &tailcfg.Debug{
+			DisableUPnP: "true",
+		},
+		DNSConfig:   s.DNSConfig,
+		ControlTime: &t,
 	}
 	for _, p := range s.AllNodes() {
 		if p.StableID != node.StableID {
 			res.Peers = append(res.Peers, p)
 		}
 	}
+	sort.Slice(res.Peers, func(i, j int) bool {
+		return res.Peers[i].ID < res.Peers[j].ID
+	})
+
+	v4Prefix := netaddr.IPPrefixFrom(netaddr.IPv4(100, 64, uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID))), 32)
+	v6Prefix := netaddr.IPPrefixFrom(tsaddr.Tailscale4To6(v4Prefix.IP()), 128)
 
 	res.Node.Addresses = []netaddr.IPPrefix{
-		netaddr.MustParseIPPrefix(fmt.Sprintf("100.64.%d.%d/32", uint8(node.ID>>8), uint8(node.ID))),
+		v4Prefix,
+		v6Prefix,
 	}
 	res.Node.AllowedIPs = res.Node.Addresses
 
 	// Consume the PingRequest while protected by mutex if it exists
 	s.mu.Lock()
-	if pr, ok := s.pingReqsToAdd[node.Key]; ok {
+	if pr, ok := s.pingReqsToAdd[nk]; ok {
 		res.PingRequest = pr
-		delete(s.pingReqsToAdd, node.Key)
+		delete(s.pingReqsToAdd, nk)
 	}
 	s.mu.Unlock()
 	return res, nil
 }
 
-func (s *Server) sendMapMsg(w http.ResponseWriter, mkey tailcfg.MachineKey, compress bool, msg interface{}) error {
+func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compress bool, msg interface{}) error {
 	resBytes, err := s.encode(mkey, compress, msg)
 	if err != nil {
 		return err
@@ -677,29 +803,12 @@ func (s *Server) sendMapMsg(w http.ResponseWriter, mkey tailcfg.MachineKey, comp
 	return nil
 }
 
-func (s *Server) decode(mkey tailcfg.MachineKey, r io.Reader, v interface{}) error {
-	if c, _ := r.(io.Closer); c != nil {
-		defer c.Close()
-	}
-	const msgLimit = 1 << 20
-	msg, err := ioutil.ReadAll(io.LimitReader(r, msgLimit))
-	if err != nil {
-		return err
-	}
+func (s *Server) decode(mkey key.MachinePublic, msg []byte, v interface{}) error {
 	if len(msg) == msgLimit {
 		return errors.New("encrypted message too long")
 	}
 
-	var nonce [24]byte
-	if len(msg) < len(nonce)+1 {
-		return errors.New("missing nonce")
-	}
-	copy(nonce[:], msg)
-	msg = msg[len(nonce):]
-
-	priv := s.privateKey()
-	pub, pri := (*[32]byte)(&mkey), (*[32]byte)(&priv)
-	decrypted, ok := box.Open(nil, msg, &nonce, pub, pri)
+	decrypted, ok := s.privateKey().OpenFrom(mkey, msg)
 	if !ok {
 		return errors.New("can't decrypt request")
 	}
@@ -716,7 +825,7 @@ var zstdEncoderPool = &sync.Pool{
 	},
 }
 
-func (s *Server) encode(mkey tailcfg.MachineKey, compress bool, v interface{}) (b []byte, err error) {
+func (s *Server) encode(mkey key.MachinePublic, compress bool, v interface{}) (b []byte, err error) {
 	var isBytes bool
 	if b, isBytes = v.([]byte); !isBytes {
 		b, err = json.Marshal(v)
@@ -730,14 +839,7 @@ func (s *Server) encode(mkey tailcfg.MachineKey, compress bool, v interface{}) (
 		encoder.Close()
 		zstdEncoderPool.Put(encoder)
 	}
-	var nonce [24]byte
-	if _, err := io.ReadFull(crand.Reader, nonce[:]); err != nil {
-		panic(err)
-	}
-	priv := s.privateKey()
-	pub, pri := (*[32]byte)(&mkey), (*[32]byte)(&priv)
-	msgData := box.Seal(nonce[:], b, &nonce, pub, pri)
-	return msgData, nil
+	return s.privateKey().SealTo(mkey, b), nil
 }
 
 // filterInvalidIPv6Endpoints removes invalid IPv6 endpoints from eps,

@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows
+// +build windows
+
 package dns
 
 import (
@@ -23,8 +26,8 @@ func TestParseIni(t *testing.T) {
 [network] # trailing comment
 generateResolvConf = false  # trailing comment`,
 			want: map[string]map[string]string{
-				"automount": map[string]string{"enabled": "true", "root": "/mnt/"},
-				"network":   map[string]string{"generateResolvConf": "false"},
+				"automount": {"enabled": "true", "root": "/mnt/"},
+				"network":   {"generateResolvConf": "false"},
 			},
 		},
 	}

@@ -9,13 +9,16 @@ package health
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-multierror/multierror"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/multierr"
 )
 
 var (
@@ -26,18 +29,22 @@ var (
 	watchers = map[*watchHandle]func(Subsystem, error){} // opt func to run if error state changes
 	timer    *time.Timer
 
+	debugHandler = map[string]http.Handler{}
+
 	inMapPoll               bool
 	inMapPollSince          time.Time
 	lastMapPollEndedAt      time.Time
 	lastStreamedMapResponse time.Time
 	derpHomeRegion          int
 	derpRegionConnected     = map[int]bool{}
+	derpRegionHealthProblem = map[int]string{}
 	derpRegionLastFrame     = map[int]time.Time{}
 	lastMapRequestHeard     time.Time // time we got a 200 from control for a MapRequest
 	ipnState                string
 	ipnWantRunning          bool
 	anyInterfaceUp          = true // until told otherwise
 	udp4Unbound             bool
+	controlHealth           []string
 )
 
 // Subsystem is the name of a subsystem whose health can be monitored.
@@ -53,6 +60,12 @@ const (
 
 	// SysDNS is the name of the net/dns subsystem.
 	SysDNS = Subsystem("dns")
+
+	// SysDNSOS is the name of the net/dns OSConfigurator subsystem.
+	SysDNSOS = Subsystem("dns-os")
+
+	// SysDNSManager is the name of the net/dns manager subsystem.
+	SysDNSManager = Subsystem("dns-manager")
 
 	// SysNetworkCategory is the name of the subsystem that sets
 	// the Windows network adapter's "category" (public, private, domain).
@@ -97,11 +110,33 @@ func SetDNSHealth(err error) { set(SysDNS, err) }
 // DNSHealth returns the net/dns.Manager error state.
 func DNSHealth() error { return get(SysDNS) }
 
+// SetDNSOSHealth sets the state of the net/dns.OSConfigurator
+func SetDNSOSHealth(err error) { set(SysDNSOS, err) }
+
+// SetDNSManagerHealth sets the state of the Linux net/dns manager's
+// discovery of the /etc/resolv.conf situation.
+func SetDNSManagerHealth(err error) { set(SysDNSManager, err) }
+
+// DNSOSHealth returns the net/dns.OSConfigurator error state.
+func DNSOSHealth() error { return get(SysDNSOS) }
+
 // SetNetworkCategoryHealth sets the state of setting the network adaptor's category.
 // This only applies on Windows.
 func SetNetworkCategoryHealth(err error) { set(SysNetworkCategory, err) }
 
 func NetworkCategoryHealth() error { return get(SysNetworkCategory) }
+
+func RegisterDebugHandler(typ string, h http.Handler) {
+	mu.Lock()
+	defer mu.Unlock()
+	debugHandler[typ] = h
+}
+
+func DebugHandler(typ string) http.Handler {
+	mu.Lock()
+	defer mu.Unlock()
+	return debugHandler[typ]
+}
 
 func get(key Subsystem) error {
 	mu.Lock()
@@ -139,6 +174,13 @@ func setLocked(key Subsystem, err error) {
 	}
 }
 
+func SetControlHealth(problems []string) {
+	mu.Lock()
+	defer mu.Unlock()
+	controlHealth = problems
+	selfCheckLocked()
+}
+
 // GotStreamedMapResponse notes that we got a tailcfg.MapResponse
 // message in streaming mode, even if it's just a keep-alive message.
 func GotStreamedMapResponse() {
@@ -148,7 +190,8 @@ func GotStreamedMapResponse() {
 	selfCheckLocked()
 }
 
-// SetInPollNetMap records that we're in
+// SetInPollNetMap records whether the client has an open
+// HTTP long poll open to the control plane.
 func SetInPollNetMap(v bool) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -161,6 +204,14 @@ func SetInPollNetMap(v bool) {
 	} else {
 		lastMapPollEndedAt = time.Now()
 	}
+}
+
+// GetInPollNetMap reports whether the client has an open
+// HTTP long poll open to the control plane.
+func GetInPollNetMap() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return inMapPoll
 }
 
 // SetMagicSockDERPHome notes what magicsock's view of its home DERP is.
@@ -188,6 +239,19 @@ func SetDERPRegionConnectedState(region int, connected bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	derpRegionConnected[region] = connected
+	selfCheckLocked()
+}
+
+// SetDERPRegionHealth sets or clears any problem associated with the
+// provided DERP region.
+func SetDERPRegionHealth(region int, problem string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if problem == "" {
+		delete(derpRegionHealthProblem, region)
+	} else {
+		derpRegionHealthProblem[region] = problem
+	}
 	selfCheckLocked()
 }
 
@@ -241,6 +305,18 @@ func selfCheckLocked() {
 	setLocked(SysOverall, overallErrorLocked())
 }
 
+// OverallError returns a summary of the health state.
+//
+// If there are multiple problems, the error will be of type
+// multierr.Error.
+func OverallError() error {
+	mu.Lock()
+	defer mu.Unlock()
+	return overallErrorLocked()
+}
+
+var fakeErrForTesting = envknob.String("TS_DEBUG_FAKE_HEALTH_ERROR")
+
 func overallErrorLocked() error {
 	if !anyInterfaceUp {
 		return errors.New("network down")
@@ -288,11 +364,20 @@ func overallErrorLocked() error {
 		}
 		errs = append(errs, fmt.Errorf("%v: %w", sys, err))
 	}
+	for regionID, problem := range derpRegionHealthProblem {
+		errs = append(errs, fmt.Errorf("derp%d: %v", regionID, problem))
+	}
+	for _, s := range controlHealth {
+		errs = append(errs, errors.New(s))
+	}
+	if e := fakeErrForTesting; len(errs) == 0 && e != "" {
+		return errors.New(e)
+	}
 	sort.Slice(errs, func(i, j int) bool {
 		// Not super efficient (stringifying these in a sort), but probably max 2 or 3 items.
 		return errs[i].Error() < errs[j].Error()
 	})
-	return multierror.New(errs)
+	return multierr.New(errs...)
 }
 
 var (
@@ -302,6 +387,12 @@ var (
 
 	receiveFuncs = []*ReceiveFuncStats{&ReceiveIPv4, &ReceiveIPv6, &ReceiveDERP}
 )
+
+func init() {
+	if runtime.GOOS == "js" {
+		receiveFuncs = receiveFuncs[2:] // ignore IPv4 and IPv6
+	}
+}
 
 // ReceiveFuncStats tracks the calls made to a wireguard-go receive func.
 type ReceiveFuncStats struct {

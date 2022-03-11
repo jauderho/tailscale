@@ -2,16 +2,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !windows
+//go:build !windows && !js
+// +build !windows,!js
 
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 
 	"golang.org/x/sys/unix"
+	"tailscale.com/version/distro"
 )
 
 func init() {
@@ -32,6 +35,9 @@ func statePath() string {
 }
 
 func stateFileUnix() string {
+	if distro.Get() == distro.Gokrazy {
+		return "/perm/tailscaled/tailscaled.state"
+	}
 	path := statePath()
 	if path == "" {
 		return ""
@@ -59,4 +65,28 @@ func xdgDataHome() string {
 		return e
 	}
 	return filepath.Join(os.Getenv("HOME"), ".local/share")
+}
+
+func ensureStateDirPerms(dir string) error {
+	if filepath.Base(dir) != "tailscale" {
+		return nil
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("expected %q to be a directory; is %v", dir, fi.Mode())
+	}
+	const perm = 0700
+	if fi.Mode().Perm() == perm {
+		// Already correct.
+		return nil
+	}
+	return os.Chmod(dir, perm)
+}
+
+// LegacyStateFilePath is not applicable to UNIX; it is just stubbed out.
+func LegacyStateFilePath() string {
+	return ""
 }

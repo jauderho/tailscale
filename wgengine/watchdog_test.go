@@ -5,12 +5,13 @@
 package wgengine
 
 import (
-	"bytes"
 	"fmt"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"tailscale.com/tstest"
 )
 
 func TestWatchdog(t *testing.T) {
@@ -47,16 +48,15 @@ func TestWatchdog(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(e.Close)
 		usEngine := e.(*userspaceEngine)
 		e = NewWatchdog(e)
 		wdEngine := e.(*watchdogEngine)
 		wdEngine.maxWait = maxWaitMultiple * 100 * time.Millisecond
 
-		logBuf := new(bytes.Buffer)
+		logBuf := new(tstest.MemLogger)
 		fatalCalled := make(chan struct{})
-		wdEngine.logf = func(format string, args ...interface{}) {
-			fmt.Fprintf(logBuf, format+"\n", args...)
-		}
+		wdEngine.logf = logBuf.Logf
 		wdEngine.fatalf = func(format string, args ...interface{}) {
 			t.Logf("FATAL: %s", fmt.Sprintf(format, args...))
 			fatalCalled <- struct{}{}

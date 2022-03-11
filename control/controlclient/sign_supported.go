@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build windows && cgo
 // +build windows,cgo
 
 // darwin,cgo is also supported by certstore but machineCertificateSubject will
@@ -17,10 +18,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/tailscale/certstore"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/wgkey"
+	"tailscale.com/types/key"
 	"tailscale.com/util/winutil"
 )
 
@@ -72,10 +74,19 @@ func isSubjectInChain(subject string, chain []*x509.Certificate) bool {
 	return false
 }
 
-func selectIdentityFromSlice(subject string, ids []certstore.Identity) (certstore.Identity, []*x509.Certificate) {
+func selectIdentityFromSlice(subject string, ids []certstore.Identity, now time.Time) (certstore.Identity, []*x509.Certificate) {
+	var bestCandidate struct {
+		id    certstore.Identity
+		chain []*x509.Certificate
+	}
+
 	for _, id := range ids {
 		chain, err := id.CertificateChain()
 		if err != nil {
+			continue
+		}
+
+		if len(chain) < 1 {
 			continue
 		}
 
@@ -83,12 +94,26 @@ func selectIdentityFromSlice(subject string, ids []certstore.Identity) (certstor
 			continue
 		}
 
-		if isSubjectInChain(subject, chain) {
-			return id, chain
+		if now.Before(chain[0].NotBefore) || now.After(chain[0].NotAfter) {
+			// Certificate is not valid at this time
+			continue
 		}
+
+		if !isSubjectInChain(subject, chain) {
+			continue
+		}
+
+		// Select the most recently issued certificate. If there is a tie, pick
+		// one arbitrarily.
+		if len(bestCandidate.chain) > 0 && bestCandidate.chain[0].NotBefore.After(chain[0].NotBefore) {
+			continue
+		}
+
+		bestCandidate.id = id
+		bestCandidate.chain = chain
 	}
 
-	return nil, nil
+	return bestCandidate.id, bestCandidate.chain
 }
 
 // findIdentity locates an identity from the Windows or Darwin certificate
@@ -104,7 +129,7 @@ func findIdentity(subject string, st certstore.Store) (certstore.Identity, []*x5
 		return nil, nil, err
 	}
 
-	selected, chain := selectIdentityFromSlice(subject, ids)
+	selected, chain := selectIdentityFromSlice(subject, ids, time.Now())
 
 	for _, id := range ids {
 		if id != selected {
@@ -124,7 +149,7 @@ func findIdentity(subject string, st certstore.Store) (certstore.Identity, []*x5
 // using that identity's public key. In addition to the signature, the full
 // certificate chain is included so that the control server can validate the
 // certificate from a copy of the root CA's certificate.
-func signRegisterRequest(req *tailcfg.RegisterRequest, serverURL string, serverPubKey, machinePubKey wgkey.Key) (err error) {
+func signRegisterRequest(req *tailcfg.RegisterRequest, serverURL string, serverPubKey, machinePubKey key.MachinePublic) (err error) {
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("signRegisterRequest: %w", err)
@@ -166,7 +191,11 @@ func signRegisterRequest(req *tailcfg.RegisterRequest, serverURL string, serverP
 		req.DeviceCert = append(req.DeviceCert, c.Raw...)
 	}
 
-	h := HashRegisterRequest(req.Timestamp.UTC(), serverURL, req.DeviceCert, serverPubKey, machinePubKey)
+	req.SignatureType = tailcfg.SignatureV2
+	h, err := HashRegisterRequest(req.SignatureType, req.Timestamp.UTC(), serverURL, req.DeviceCert, serverPubKey, machinePubKey)
+	if err != nil {
+		return fmt.Errorf("hash: %w", err)
+	}
 
 	req.Signature, err = signer.Sign(nil, h, &rsa.PSSOptions{
 		SaltLength: rsa.PSSSaltLengthEqualsHash,
@@ -175,7 +204,6 @@ func signRegisterRequest(req *tailcfg.RegisterRequest, serverURL string, serverP
 	if err != nil {
 		return fmt.Errorf("sign: %w", err)
 	}
-	req.SignatureType = tailcfg.SignatureV1
 
 	return nil
 }

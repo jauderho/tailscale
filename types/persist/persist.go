@@ -8,8 +8,8 @@ package persist
 import (
 	"fmt"
 
+	"tailscale.com/types/key"
 	"tailscale.com/types/structs"
-	"tailscale.com/types/wgkey"
 )
 
 //go:generate go run tailscale.com/cmd/cloner -type=Persist -output=persist_clone.go
@@ -28,10 +28,10 @@ type Persist struct {
 	// needed. This field should be considered read-only from GUI
 	// frontends. The real value should not be written back in
 	// this field, lest the frontend persist it to disk.
-	LegacyFrontendPrivateMachineKey wgkey.Private `json:"PrivateMachineKey"`
+	LegacyFrontendPrivateMachineKey key.MachinePrivate `json:"PrivateMachineKey"`
 
-	PrivateNodeKey    wgkey.Private
-	OldPrivateNodeKey wgkey.Private // needed to request key rotation
+	PrivateNodeKey    key.NodePrivate
+	OldPrivateNodeKey key.NodePrivate // needed to request key rotation
 	Provider          string
 	LoginName         string
 }
@@ -52,7 +52,10 @@ func (p *Persist) Equals(p2 *Persist) bool {
 }
 
 func (p *Persist) Pretty() string {
-	var mk, ok, nk wgkey.Key
+	var (
+		mk     key.MachinePublic
+		ok, nk key.NodePublic
+	)
 	if !p.LegacyFrontendPrivateMachineKey.IsZero() {
 		mk = p.LegacyFrontendPrivateMachineKey.Public()
 	}
@@ -62,12 +65,6 @@ func (p *Persist) Pretty() string {
 	if !p.PrivateNodeKey.IsZero() {
 		nk = p.PrivateNodeKey.Public()
 	}
-	ss := func(k wgkey.Key) string {
-		if k.IsZero() {
-			return ""
-		}
-		return k.ShortString()
-	}
 	return fmt.Sprintf("Persist{lm=%v, o=%v, n=%v u=%#v}",
-		ss(mk), ss(ok), ss(nk), p.LoginName)
+		mk.ShortString(), ok.ShortString(), nk.ShortString(), p.LoginName)
 }

@@ -4,19 +4,69 @@
 
 // Package hostinfo answers questions about the host environment that Tailscale is
 // running on.
-//
-// TODO(bradfitz): move more of control/controlclient/hostinfo_* into this package.
 package hostinfo
 
 import (
+	"bufio"
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"go4.org/mem"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/dnsname"
 	"tailscale.com/util/lineread"
+	"tailscale.com/version"
 )
+
+// New returns a partially populated Hostinfo for the current host.
+func New() *tailcfg.Hostinfo {
+	hostname, _ := os.Hostname()
+	hostname = dnsname.FirstLabel(hostname)
+	return &tailcfg.Hostinfo{
+		IPNVersion:  version.Long,
+		Hostname:    hostname,
+		OS:          version.OS(),
+		OSVersion:   GetOSVersion(),
+		Package:     packageTypeCached(),
+		GoArch:      runtime.GOARCH,
+		DeviceModel: deviceModel(),
+	}
+}
+
+// non-nil on some platforms
+var (
+	osVersion   func() string
+	packageType func() string
+)
+
+// GetOSVersion returns the OSVersion of current host if available.
+func GetOSVersion() string {
+	if s, _ := osVersionAtomic.Load().(string); s != "" {
+		return s
+	}
+	if osVersion != nil {
+		return osVersion()
+	}
+	return ""
+}
+
+func packageTypeCached() string {
+	if v, _ := packagingType.Load().(string); v != "" {
+		return v
+	}
+	if packageType == nil {
+		return ""
+	}
+	v := packageType()
+	if v != "" {
+		SetPackage(v)
+	}
+	return v
+}
 
 // EnvType represents a known environment type.
 // The empty string, the default, means unknown.
@@ -27,6 +77,10 @@ const (
 	AWSLambda       = EnvType("lm")
 	Heroku          = EnvType("hr")
 	AzureAppService = EnvType("az")
+	AWSFargate      = EnvType("fg")
+	FlyDotIo        = EnvType("fly")
+	Kubernetes      = EnvType("k8s")
+	DockerDesktop   = EnvType("dde")
 )
 
 var envType atomic.Value // of EnvType
@@ -38,6 +92,28 @@ func GetEnvType() EnvType {
 	e := getEnvType()
 	envType.Store(e)
 	return e
+}
+
+var (
+	deviceModelAtomic atomic.Value // of string
+	osVersionAtomic   atomic.Value // of string
+	packagingType     atomic.Value // of string
+)
+
+// SetDeviceModel sets the device model for use in Hostinfo updates.
+func SetDeviceModel(model string) { deviceModelAtomic.Store(model) }
+
+// SetOSVersion sets the OS version.
+func SetOSVersion(v string) { osVersionAtomic.Store(v) }
+
+// SetPackage sets the packaging type for the app.
+// This is currently (2021-10-05) only used by Android,
+// set to "nogoogle" for the F-Droid build.
+func SetPackage(v string) { packagingType.Store(v) }
+
+func deviceModel() string {
+	s, _ := deviceModelAtomic.Load().(string)
+	return s
 }
 
 func getEnvType() EnvType {
@@ -53,11 +129,23 @@ func getEnvType() EnvType {
 	if inAzureAppService() {
 		return AzureAppService
 	}
+	if inAWSFargate() {
+		return AWSFargate
+	}
+	if inFlyDotIo() {
+		return FlyDotIo
+	}
+	if inKubernetes() {
+		return Kubernetes
+	}
+	if inDockerDesktop() {
+		return DockerDesktop
+	}
 	return ""
 }
 
-// InContainer reports whether we're running in a container.
-func InContainer() bool {
+// inContainer reports whether we're running in a container.
+func inContainer() bool {
 	if runtime.GOOS != "linux" {
 		return false
 	}
@@ -114,4 +202,84 @@ func inAzureAppService() bool {
 		return true
 	}
 	return false
+}
+
+func inAWSFargate() bool {
+	if os.Getenv("AWS_EXECUTION_ENV") == "AWS_ECS_FARGATE" {
+		return true
+	}
+	return false
+}
+
+func inFlyDotIo() bool {
+	if os.Getenv("FLY_APP_NAME") != "" && os.Getenv("FLY_REGION") != "" {
+		return true
+	}
+	return false
+}
+
+func inKubernetes() bool {
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" && os.Getenv("KUBERNETES_SERVICE_PORT") != "" {
+		return true
+	}
+	return false
+}
+
+func inDockerDesktop() bool {
+	if os.Getenv("TS_HOST_ENV") == "dde" {
+		return true
+	}
+	return false
+}
+
+type etcAptSrcResult struct {
+	mod      time.Time
+	disabled bool
+}
+
+var etcAptSrcCache atomic.Value // of etcAptSrcResult
+
+// DisabledEtcAptSource reports whether Ubuntu (or similar) has disabled
+// the /etc/apt/sources.list.d/tailscale.list file contents upon upgrade
+// to a new release of the distro.
+//
+// See https://github.com/tailscale/tailscale/issues/3177
+func DisabledEtcAptSource() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	const path = "/etc/apt/sources.list.d/tailscale.list"
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	mod := fi.ModTime()
+	if c, ok := etcAptSrcCache.Load().(etcAptSrcResult); ok && c.mod == mod {
+		return c.disabled
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	v := etcAptSourceFileIsDisabled(f)
+	etcAptSrcCache.Store(etcAptSrcResult{mod: mod, disabled: v})
+	return v
+}
+
+func etcAptSourceFileIsDisabled(r io.Reader) bool {
+	bs := bufio.NewScanner(r)
+	disabled := false // did we find the "disabled on upgrade" comment?
+	for bs.Scan() {
+		line := strings.TrimSpace(bs.Text())
+		if strings.Contains(line, "# disabled on upgrade") {
+			disabled = true
+		}
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		// Well, it has some contents in it at least.
+		return false
+	}
+	return disabled
 }

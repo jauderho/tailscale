@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -20,7 +19,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"inet.af/netaddr"
@@ -30,6 +28,8 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
+	"tailscale.com/version"
 )
 
 func randHex(n int) string {
@@ -52,7 +52,14 @@ type Handler struct {
 	PermitRead bool
 
 	// PermitWrite is whether mutating HTTP handlers are allowed.
+	// If PermitWrite is true, everything is allowed.
+	// It effectively means that the user is root or the admin
+	// (operator user).
 	PermitWrite bool
+
+	// PermitCert is whether the client is additionally granted
+	// cert fetching access.
+	PermitCert bool
 
 	b            *ipnlocal.LocalBackend
 	logf         logger.Logf
@@ -64,6 +71,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server has no local backend", http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Tailscale-Version", version.Long)
 	if h.RequiredPassword != "" {
 		_, pass, ok := r.BasicAuth()
 		if !ok {
@@ -83,11 +91,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveFilePut(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/localapi/v0/cert/") {
+		h.serveCert(w, r)
+		return
+	}
 	switch r.URL.Path {
 	case "/localapi/v0/whois":
 		h.serveWhoIs(w, r)
 	case "/localapi/v0/goroutines":
 		h.serveGoroutines(w, r)
+	case "/localapi/v0/profile":
+		h.serveProfile(w, r)
 	case "/localapi/v0/status":
 		h.serveStatus(w, r)
 	case "/localapi/v0/logout":
@@ -104,6 +118,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveSetDNS(w, r)
 	case "/localapi/v0/derpmap":
 		h.serveDERPMap(w, r)
+	case "/localapi/v0/metrics":
+		h.serveMetrics(w, r)
+	case "/localapi/v0/debug":
+		h.serveDebug(w, r)
+	case "/localapi/v0/set-expiry-sooner":
+		h.serveSetExpirySooner(w, r)
 	case "/":
 		io.WriteString(w, "tailscaled\n")
 	default:
@@ -173,6 +193,64 @@ func (h *Handler) serveGoroutines(w http.ResponseWriter, r *http.Request) {
 	buf = buf[:runtime.Stack(buf, true)]
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write(buf)
+}
+
+func (h *Handler) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	// Require write access out of paranoia that the metrics
+	// might contain something sensitive.
+	if !h.PermitWrite {
+		http.Error(w, "metric access denied", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	clientmetric.WritePrometheusExpositionFormat(w)
+}
+
+func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "debug access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	action := r.FormValue("action")
+	var err error
+	switch action {
+	case "rebind":
+		err = h.b.DebugRebind()
+	case "restun":
+		err = h.b.DebugReSTUN()
+	case "":
+		err = fmt.Errorf("missing parameter 'action'")
+	default:
+		err = fmt.Errorf("unknown action %q", action)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	io.WriteString(w, "done\n")
+}
+
+// serveProfileFunc is the implementation of Handler.serveProfile, after auth,
+// for platforms where we want to link it in.
+var serveProfileFunc func(http.ResponseWriter, *http.Request)
+
+func (h *Handler) serveProfile(w http.ResponseWriter, r *http.Request) {
+	// Require write access out of paranoia that the profile dump
+	// might contain something sensitive.
+	if !h.PermitWrite {
+		http.Error(w, "profile access denied", http.StatusForbidden)
+		return
+	}
+	if serveProfileFunc == nil {
+		http.Error(w, "not implemented on this platform", http.StatusServiceUnavailable)
+		return
+	}
+	serveProfileFunc(w, r)
 }
 
 func (h *Handler) serveCheckIPForwarding(w http.ResponseWriter, r *http.Request) {
@@ -266,7 +344,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "file access denied", http.StatusForbidden)
 		return
 	}
-	suffix := strings.TrimPrefix(r.URL.Path, "/localapi/v0/files/")
+	suffix := strings.TrimPrefix(r.URL.EscapedPath(), "/localapi/v0/files/")
 	if suffix == "" {
 		if r.Method != "GET" {
 			http.Error(w, "want GET to list files", 400)
@@ -335,6 +413,25 @@ func (h *Handler) serveFileTargets(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(fts)
 }
 
+// serveFilePut sends a file to another node.
+//
+// It's sometimes possible for clients to do this themselves, without
+// tailscaled, except in the case of tailscaled running in
+// userspace-networking ("netstack") mode, in which case tailscaled
+// needs to a do a netstack dial out.
+//
+// Instead, the CLI also goes through tailscaled so it doesn't need to be
+// aware of the network mode in use.
+//
+// macOS/iOS have always used this localapi method to simplify the GUI
+// clients.
+//
+// The Windows client currently (2021-11-30) uses the peerapi (/v0/put/)
+// directly, as the Windows GUI always runs in tun mode anyway.
+//
+// URL format:
+//
+//    * PUT /localapi/v0/file-put/:stableID/:escaped-filename
 func (h *Handler) serveFilePut(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "file access denied", http.StatusForbidden)
@@ -382,7 +479,7 @@ func (h *Handler) serveFilePut(w http.ResponseWriter, r *http.Request) {
 	outReq.ContentLength = r.ContentLength
 
 	rp := httputil.NewSingleHostReverseProxy(dstURL)
-	rp.Transport = getDialPeerTransport(h.b)
+	rp.Transport = h.b.Dialer().PeerAPITransport()
 	rp.ServeHTTP(w, outReq)
 }
 
@@ -416,24 +513,33 @@ func (h *Handler) serveDERPMap(w http.ResponseWriter, r *http.Request) {
 	e.Encode(h.b.DERPMap())
 }
 
-var dialPeerTransportOnce struct {
-	sync.Once
-	v *http.Transport
-}
+// serveSetExpirySooner sets the expiry date on the current machine, specified
+// by an `expiry` unix timestamp as POST or query param.
+func (h *Handler) serveSetExpirySooner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
 
-func getDialPeerTransport(b *ipnlocal.LocalBackend) *http.Transport {
-	dialPeerTransportOnce.Do(func() {
-		t := http.DefaultTransport.(*http.Transport).Clone()
-		t.Dial = nil
-		dialer := net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Control:   b.PeerDialControlFunc(),
+	var expiryTime time.Time
+	if v := r.FormValue("expiry"); v != "" {
+		expiryInt, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			http.Error(w, "can't parse expiry time, expects a unix timestamp", http.StatusBadRequest)
+			return
 		}
-		t.DialContext = dialer.DialContext
-		dialPeerTransportOnce.v = t
-	})
-	return dialPeerTransportOnce.v
+		expiryTime = time.Unix(expiryInt, 0)
+	} else {
+		http.Error(w, "missing 'expiry' parameter, a unix timestamp", http.StatusBadRequest)
+		return
+	}
+	err := h.b.SetExpirySooner(r.Context(), expiryTime)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	io.WriteString(w, "done\n")
 }
 
 func defBool(a string, def bool) bool {

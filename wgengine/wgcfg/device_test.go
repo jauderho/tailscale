@@ -10,39 +10,36 @@ import (
 	"io"
 	"net"
 	"os"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 
+	"go4.org/mem"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"inet.af/netaddr"
-	"tailscale.com/types/wgkey"
+	"tailscale.com/types/key"
 )
 
 func TestDeviceConfig(t *testing.T) {
-	newPrivateKey := func() (wgkey.Key, wgkey.Private) {
+	newK := func() (key.NodePublic, key.NodePrivate) {
 		t.Helper()
-		pk, err := wgkey.NewPrivate()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return wgkey.Key(pk.Public()), wgkey.Private(pk)
+		k := key.NewNode()
+		return k.Public(), k
 	}
-	k1, pk1 := newPrivateKey()
+	k1, pk1 := newK()
 	ip1 := netaddr.MustParseIPPrefix("10.0.0.1/32")
 
-	k2, pk2 := newPrivateKey()
+	k2, pk2 := newK()
 	ip2 := netaddr.MustParseIPPrefix("10.0.0.2/32")
 
-	k3, _ := newPrivateKey()
+	k3, _ := newK()
 	ip3 := netaddr.MustParseIPPrefix("10.0.0.3/32")
 
 	cfg1 := &Config{
-		PrivateKey: wgkey.Private(pk1),
+		PrivateKey: pk1,
 		Peers: []Peer{{
 			PublicKey:  k2,
 			AllowedIPs: []netaddr.IPPrefix{ip2},
@@ -50,7 +47,7 @@ func TestDeviceConfig(t *testing.T) {
 	}
 
 	cfg2 := &Config{
-		PrivateKey: wgkey.Private(pk2),
+		PrivateKey: pk2,
 		Peers: []Peer{{
 			PublicKey:           k1,
 			AllowedIPs:          []netaddr.IPPrefix{ip1},
@@ -58,8 +55,8 @@ func TestDeviceConfig(t *testing.T) {
 		}},
 	}
 
-	device1 := device.NewDevice(newNilTun(), new(noopBind), device.NewLogger(device.LogLevelError, "device1"))
-	device2 := device.NewDevice(newNilTun(), new(noopBind), device.NewLogger(device.LogLevelError, "device2"))
+	device1 := NewDevice(newNilTun(), new(noopBind), device.NewLogger(device.LogLevelError, "device1"))
+	device2 := NewDevice(newNilTun(), new(noopBind), device.NewLogger(device.LogLevelError, "device2"))
 	defer device1.Close()
 	defer device2.Close()
 
@@ -71,14 +68,14 @@ func TestDeviceConfig(t *testing.T) {
 		}
 		prev := new(Config)
 		gotbuf := new(strings.Builder)
-		err = got.ToUAPI(gotbuf, prev)
+		err = got.ToUAPI(t.Logf, gotbuf, prev)
 		gotStr := gotbuf.String()
 		if err != nil {
 			t.Errorf("got.ToUAPI(): error: %v", err)
 			return
 		}
 		wantbuf := new(strings.Builder)
-		err = want.ToUAPI(wantbuf, prev)
+		err = want.ToUAPI(t.Logf, wantbuf, prev)
 		wantStr := wantbuf.String()
 		if err != nil {
 			t.Errorf("want.ToUAPI(): error: %v", err)
@@ -128,7 +125,7 @@ func TestDeviceConfig(t *testing.T) {
 	})
 
 	t.Run("device1 modify peer", func(t *testing.T) {
-		cfg1.Peers[0].Endpoints.IPPorts = NewIPPortSet(netaddr.MustParseIPPort("1.2.3.4:12345"))
+		cfg1.Peers[0].DiscoKey = key.DiscoPublicFromRaw32(mem.B([]byte{0: 1, 31: 0}))
 		if err := ReconfigDevice(device1, cfg1, t.Logf); err != nil {
 			t.Fatal(err)
 		}
@@ -136,7 +133,7 @@ func TestDeviceConfig(t *testing.T) {
 	})
 
 	t.Run("device1 replace endpoint", func(t *testing.T) {
-		cfg1.Peers[0].Endpoints.IPPorts = NewIPPortSet(netaddr.MustParseIPPort("1.1.1.1:123"))
+		cfg1.Peers[0].DiscoKey = key.DiscoPublicFromRaw32(mem.B([]byte{0: 2, 31: 0}))
 		if err := ReconfigDevice(device1, cfg1, t.Logf); err != nil {
 			t.Fatal(err)
 		}
@@ -149,7 +146,7 @@ func TestDeviceConfig(t *testing.T) {
 			AllowedIPs: []netaddr.IPPrefix{ip3},
 		})
 		sort.Slice(cfg1.Peers, func(i, j int) bool {
-			return cfg1.Peers[i].PublicKey.LessThan(&cfg1.Peers[j].PublicKey)
+			return cfg1.Peers[i].PublicKey.Less(cfg1.Peers[j].PublicKey)
 		})
 
 		origCfg, err := DeviceConfig(device1)
@@ -176,8 +173,7 @@ func TestDeviceConfig(t *testing.T) {
 			return p
 		}
 		peersEqual := func(p, q Peer) bool {
-			return p.PublicKey == q.PublicKey && p.PersistentKeepalive == q.PersistentKeepalive &&
-				reflect.DeepEqual(p.Endpoints, q.Endpoints) && cidrsEqual(p.AllowedIPs, q.AllowedIPs)
+			return p.PublicKey == q.PublicKey && p.DiscoKey == q.DiscoKey && p.PersistentKeepalive == q.PersistentKeepalive && cidrsEqual(p.AllowedIPs, q.AllowedIPs)
 		}
 		if !peersEqual(peer0(origCfg), peer0(newCfg)) {
 			t.Error("reconfig modified old peer")

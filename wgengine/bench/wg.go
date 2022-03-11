@@ -17,9 +17,9 @@ import (
 
 	"tailscale.com/net/dns"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/router"
@@ -28,10 +28,8 @@ import (
 
 func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netaddr.IPPrefix) {
 	l1 := logger.WithPrefix(logf, "e1: ")
-	k1, err := wgkey.NewPrivate()
-	if err != nil {
-		log.Fatalf("e1 NewPrivateKey: %v", err)
-	}
+	k1 := key.NewNode()
+
 	c1 := wgcfg.Config{
 		Name:       "e1",
 		PrivateKey: k1,
@@ -55,10 +53,7 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netadd
 	}
 
 	l2 := logger.WithPrefix(logf, "e2: ")
-	k2, err := wgkey.NewPrivate()
-	if err != nil {
-		log.Fatalf("e2 NewPrivateKey: %v", err)
-	}
+	k2 := key.NewNode()
 	c2 := wgcfg.Config{
 		Name:       "e2",
 		PrivateKey: k2,
@@ -98,14 +93,8 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netadd
 		logf("e1 status: %v", *st)
 
 		var eps []string
-		var ipps []netaddr.IPPort
 		for _, ep := range st.LocalAddrs {
 			eps = append(eps, ep.Addr.String())
-			ipps = append(ipps, ep.Addr)
-		}
-		endpoint := wgcfg.Endpoints{
-			PublicKey: c1.PrivateKey.Public(),
-			IPPorts:   wgcfg.NewIPPortSet(ipps...),
 		}
 
 		n := tailcfg.Node{
@@ -116,15 +105,14 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netadd
 			Endpoints:  eps,
 		}
 		e2.SetNetworkMap(&netmap.NetworkMap{
-			NodeKey:    tailcfg.NodeKey(k2),
-			PrivateKey: wgkey.Private(k2),
+			NodeKey:    k2.Public(),
+			PrivateKey: k2,
 			Peers:      []*tailcfg.Node{&n},
 		})
 
 		p := wgcfg.Peer{
 			PublicKey:  c1.PrivateKey.Public(),
 			AllowedIPs: []netaddr.IPPrefix{a1},
-			Endpoints:  endpoint,
 		}
 		c2.Peers = []wgcfg.Peer{p}
 		e2.Reconfig(&c2, &router.Config{}, new(dns.Config), nil)
@@ -142,14 +130,8 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netadd
 		logf("e2 status: %v", *st)
 
 		var eps []string
-		var ipps []netaddr.IPPort
 		for _, ep := range st.LocalAddrs {
 			eps = append(eps, ep.Addr.String())
-			ipps = append(ipps, ep.Addr)
-		}
-		endpoint := wgcfg.Endpoints{
-			PublicKey: c2.PrivateKey.Public(),
-			IPPorts:   wgcfg.NewIPPortSet(ipps...),
 		}
 
 		n := tailcfg.Node{
@@ -160,15 +142,14 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netadd
 			Endpoints:  eps,
 		}
 		e1.SetNetworkMap(&netmap.NetworkMap{
-			NodeKey:    tailcfg.NodeKey(k1),
-			PrivateKey: wgkey.Private(k1),
+			NodeKey:    k1.Public(),
+			PrivateKey: k1,
 			Peers:      []*tailcfg.Node{&n},
 		})
 
 		p := wgcfg.Peer{
 			PublicKey:  c2.PrivateKey.Public(),
 			AllowedIPs: []netaddr.IPPrefix{a2},
-			Endpoints:  endpoint,
 		}
 		c1.Peers = []wgcfg.Peer{p}
 		e1.Reconfig(&c1, &router.Config{}, new(dns.Config), nil)

@@ -24,16 +24,18 @@ import (
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
 	"tailscale.com/types/logger"
+	"tailscale.com/wgengine/monitor"
 )
 
 type winRouter struct {
 	logf                func(fmt string, args ...interface{})
+	linkMon             *monitor.Mon // may be nil
 	nativeTun           *tun.NativeTun
 	routeChangeCallback *winipcfg.RouteChangeCallback
 	firewall            *firewallTweaker
 }
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
 	nativeTun := tundev.(*tun.NativeTun)
 	luid := winipcfg.LUID(nativeTun.LUID())
 	guid, err := luid.GUID()
@@ -43,6 +45,7 @@ func newUserspaceRouter(logf logger.Logf, tundev tun.Device) (Router, error) {
 
 	return &winRouter{
 		logf:      logf,
+		linkMon:   linkMon,
 		nativeTun: nativeTun,
 		firewall: &firewallTweaker{
 			logf:    logger.WithPrefix(logf, "firewall: "),
@@ -180,7 +183,10 @@ func (ft *firewallTweaker) runFirewall(args ...string) (time.Duration, error) {
 	args = append([]string{"advfirewall", "firewall"}, args...)
 	cmd := exec.Command("netsh", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	err := cmd.Run()
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		err = fmt.Errorf("%w: %v", err, string(b))
+	}
 	return time.Since(t0).Round(time.Millisecond), err
 }
 

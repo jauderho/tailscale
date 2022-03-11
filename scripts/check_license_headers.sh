@@ -10,7 +10,7 @@
 check_file() {
     got=$1
 
-    for year in `seq 2019 2021`; do
+    for year in `seq 2019 2022`; do
         want=$(cat <<EOF
 // Copyright (c) $year Tailscale Inc & AUTHORS All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -37,7 +37,13 @@ for file in $(find $1 -name '*.go' -not -path '*/.git/*'); do
         ;;
         $1/wgengine/router/ifconfig_windows.go)
             # WireGuard copyright.
-            ;;
+        ;;
+		*_string.go)
+			# Generated file from go:generate stringer
+		;;
+		$1/control/controlbase/noiseexplorer_test.go)
+			# Noiseexplorer.com copyright.
+		;;
         *)
             header="$(head -3 $file)"
             if ! check_file "$header"; then

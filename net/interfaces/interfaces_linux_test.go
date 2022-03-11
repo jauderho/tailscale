@@ -5,7 +5,9 @@
 package interfaces
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -51,7 +53,7 @@ func TestExtremelyLongProcNetRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for n := 0; n <= 1000; n++ {
+	for n := 0; n <= 900; n++ {
 		line := fmt.Sprintf("eth%d\t8008FEA9\t00000000\t0001\t0\t0\t0\t01FFFFFF\t0\t0\t0\n", n)
 		_, err := f.Write([]byte(line))
 		if err != nil {
@@ -73,6 +75,32 @@ func TestExtremelyLongProcNetRoute(t *testing.T) {
 	}
 }
 
+// test the specific /proc/net/route path as found on AWS App Runner instances
+func TestAwsAppRunnerDefaultRouteInterface(t *testing.T) {
+	dir := t.TempDir()
+	savedProcNetRoutePath := procNetRoutePath
+	defer func() { procNetRoutePath = savedProcNetRoutePath }()
+	procNetRoutePath = filepath.Join(dir, "CloudRun")
+	buf := []byte("Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n" +
+		"eth0\t00000000\tF9AFFEA9\t0003\t0\t0\t0\t00000000\t0\t0\t0\n" +
+		"*\tFEA9FEA9\t00000000\t0005\t0\t0\t0\tFFFFFFFF\t0\t0\t0\n" +
+		"ecs-eth0\t02AAFEA9\t01ACFEA9\t0007\t0\t0\t0\tFFFFFFFF\t0\t0\t0\n" +
+		"ecs-eth0\t00ACFEA9\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n" +
+		"eth0\t00AFFEA9\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n")
+	err := ioutil.WriteFile(procNetRoutePath, buf, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DefaultRouteInterface()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got != "eth0" {
+		t.Fatalf("got %s, want eth0", got)
+	}
+}
+
 func BenchmarkDefaultRouteInterface(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -80,4 +108,15 @@ func BenchmarkDefaultRouteInterface(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func TestRouteLinuxNetlink(t *testing.T) {
+	d, err := defaultRouteFromNetlink()
+	if errors.Is(err, fs.ErrPermission) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Got: %+v", d)
 }

@@ -15,7 +15,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/go-multierror/multierror"
 	ole "github.com/go-ole/go-ole"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
@@ -24,6 +23,7 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/util/multierr"
 	"tailscale.com/wgengine/winnet"
 )
 
@@ -257,7 +257,7 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 		return fmt.Errorf("getting interface: %w", err)
 	}
 
-	// Send non-nil return errors to retErrc, to interupt our background
+	// Send non-nil return errors to retErrc, to interrupt our background
 	// setPrivateNetwork goroutine.
 	retErrc := make(chan error, 1)
 	defer func() {
@@ -809,5 +809,5 @@ func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*winipcfg.RouteData, do
 		}
 	}
 
-	return multierror.New(errs)
+	return multierr.New(errs...)
 }

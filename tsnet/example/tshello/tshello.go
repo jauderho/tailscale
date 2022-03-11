@@ -6,25 +6,38 @@
 package main
 
 import (
+	"crypto/tls"
+	"flag"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
 	"strings"
 
+	"tailscale.com/client/tailscale"
 	"tailscale.com/tsnet"
 )
 
+var (
+	addr = flag.String("addr", ":80", "address to listen on")
+)
+
 func main() {
+	flag.Parse()
 	s := new(tsnet.Server)
-	ln, err := s.Listen("tcp", ":80")
+	ln, err := s.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
+	if *addr == ":443" {
+		ln = tls.NewListener(ln, &tls.Config{
+			GetCertificate: tailscale.GetCertificate,
+		})
+	}
 	log.Fatal(http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		who, ok := s.WhoIs(r.RemoteAddr)
-		if !ok {
-			http.Error(w, "WhoIs failed", 500)
+		who, err := tailscale.WhoIs(r.Context(), r.RemoteAddr)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
 			return
 		}
 		fmt.Fprintf(w, "<html><body><h1>Hello, world!</h1>\n")

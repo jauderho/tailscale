@@ -6,6 +6,8 @@ package ipnlocal
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -27,32 +29,50 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"golang.org/x/net/dns/dnsmessage"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/health"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/logtail/backoff"
+	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netutil"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/filter"
 )
 
 var initListenConfig func(*net.ListenConfig, netaddr.IP, *interfaces.State, string) error
 
+// addH2C is non-nil on platforms where we want to add H2C
+// ("cleartext" HTTP/2) support to the peerAPI.
+var addH2C func(*http.Server)
+
 type peerAPIServer struct {
 	b          *LocalBackend
-	rootDir    string
-	tunName    string
+	rootDir    string // empty means file receiving unavailable
 	selfNode   *tailcfg.Node
 	knownEmpty syncs.AtomicBool
+	resolver   *resolver.Resolver
 
 	// directFileMode is whether we're writing files directly to a
 	// download directory (as *.partial files), rather than making
 	// the frontend retrieve it over localapi HTTP and write it
-	// somewhere itself. This is used on GUI macOS version.
+	// somewhere itself. This is used on the GUI macOS versions
+	// and on Synology.
 	// In directFileMode, the peerapi doesn't do the final rename
-	// from "foo.jpg.partial" to "foo.jpg".
+	// from "foo.jpg.partial" to "foo.jpg" unless
+	// directFileDoFinalRename is set.
 	directFileMode bool
+
+	// directFileDoFinalRename is whether in directFileMode we
+	// additionally move the *.direct file to its final name after
+	// it's received.
+	directFileDoFinalRename bool
 }
 
 const (
@@ -68,6 +88,10 @@ const (
 	// partial files.
 	deletedSuffix = ".deleted"
 )
+
+func (s *peerAPIServer) canReceiveFiles() bool {
+	return s != nil && s.rootDir != ""
+}
 
 func validFilenameRune(r rune) bool {
 	switch r {
@@ -115,7 +139,7 @@ func (s *peerAPIServer) diskPath(baseName string) (fullPath string, ok bool) {
 // hasFilesWaiting reports whether any files are buffered in the
 // tailscaled daemon storage.
 func (s *peerAPIServer) hasFilesWaiting() bool {
-	if s.rootDir == "" || s.directFileMode {
+	if s == nil || s.rootDir == "" || s.directFileMode {
 		return false
 	}
 	if s.knownEmpty.Get() {
@@ -175,8 +199,11 @@ func (s *peerAPIServer) hasFilesWaiting() bool {
 // As a side effect, it also does any lazy deletion of files as
 // required by Windows.
 func (s *peerAPIServer) WaitingFiles() (ret []apitype.WaitingFile, err error) {
+	if s == nil {
+		return nil, errNilPeerAPIServer
+	}
 	if s.rootDir == "" {
-		return nil, errors.New("peerapi disabled; no storage configured")
+		return nil, errNoTaildrop
 	}
 	if s.directFileMode {
 		return nil, nil
@@ -240,6 +267,11 @@ func (s *peerAPIServer) WaitingFiles() (ret []apitype.WaitingFile, err error) {
 	return ret, nil
 }
 
+var (
+	errNilPeerAPIServer = errors.New("peerapi unavailable; not listening")
+	errNoTaildrop       = errors.New("Taildrop disabled; no storage directory")
+)
+
 // tryDeleteAgain tries to delete path (and path+deletedSuffix) after
 // it failed earlier.  This happens on Windows when various anti-virus
 // tools hook into filesystem operations and have the file open still
@@ -255,8 +287,11 @@ func tryDeleteAgain(fullPath string) {
 }
 
 func (s *peerAPIServer) DeleteFile(baseName string) error {
+	if s == nil {
+		return errNilPeerAPIServer
+	}
 	if s.rootDir == "" {
-		return errors.New("peerapi disabled; no storage configured")
+		return errNoTaildrop
 	}
 	if s.directFileMode {
 		return errors.New("deletes not allowed in direct mode")
@@ -321,8 +356,11 @@ func touchFile(path string) error {
 }
 
 func (s *peerAPIServer) OpenFile(baseName string) (rc io.ReadCloser, size int64, err error) {
+	if s == nil {
+		return nil, 0, errNilPeerAPIServer
+	}
 	if s.rootDir == "" {
-		return nil, 0, errors.New("peerapi disabled; no storage configured")
+		return nil, 0, errNoTaildrop
 	}
 	if s.directFileMode {
 		return nil, 0, errors.New("opens not allowed in direct mode")
@@ -355,7 +393,7 @@ func (s *peerAPIServer) listen(ip netaddr.IP, ifState *interfaces.State) (ln net
 		// On iOS/macOS, this sets the lc.Control hook to
 		// setsockopt the interface index to bind to, to get
 		// out of the network sandbox.
-		if err := initListenConfig(&lc, ip, ifState, s.tunName); err != nil {
+		if err := initListenConfig(&lc, ip, ifState, s.b.dialer.TUNName()); err != nil {
 			return nil, err
 		}
 		if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
@@ -373,7 +411,7 @@ func (s *peerAPIServer) listen(ip netaddr.IP, ifState *interfaces.State) (ln net
 	}
 
 	// Make a best effort to pick a deterministic port number for
-	// the ip The lower three bytes are the same for IPv4 and IPv6
+	// the ip. The lower three bytes are the same for IPv4 and IPv6
 	// Tailscale addresses (at least currently), so we'll usually
 	// get the same port number on both address families for
 	// dev/debugging purposes, which is nice. But it's not so
@@ -444,43 +482,33 @@ func (pln *peerAPIListener) serve() {
 			c.Close()
 			continue
 		}
-		peerNode, peerUser, ok := pln.lb.WhoIs(ipp)
-		if !ok {
-			logf("peerapi: unknown peer %v", ipp)
-			c.Close()
-			continue
-		}
-		h := &peerAPIHandler{
-			ps:         pln.ps,
-			isSelf:     pln.ps.selfNode.User == peerNode.User,
-			remoteAddr: ipp,
-			peerNode:   peerNode,
-			peerUser:   peerUser,
-		}
-		httpServer := &http.Server{
-			Handler: h,
-		}
-		go httpServer.Serve(&oneConnListener{Listener: pln.ln, conn: c})
+		pln.ServeConn(ipp, c)
 	}
 }
 
-type oneConnListener struct {
-	net.Listener
-	conn net.Conn
-}
-
-func (l *oneConnListener) Accept() (c net.Conn, err error) {
-	c = l.conn
-	if c == nil {
-		err = io.EOF
+func (pln *peerAPIListener) ServeConn(src netaddr.IPPort, c net.Conn) {
+	logf := pln.lb.logf
+	peerNode, peerUser, ok := pln.lb.WhoIs(src)
+	if !ok {
+		logf("peerapi: unknown peer %v", src)
+		c.Close()
 		return
 	}
-	err = nil
-	l.conn = nil
-	return
+	h := &peerAPIHandler{
+		ps:         pln.ps,
+		isSelf:     pln.ps.selfNode.User == peerNode.User,
+		remoteAddr: src,
+		peerNode:   peerNode,
+		peerUser:   peerUser,
+	}
+	httpServer := &http.Server{
+		Handler: h,
+	}
+	if addH2C != nil {
+		addH2C(httpServer)
+	}
+	go httpServer.Serve(netutil.NewOneConnListener(c, pln.ln.Addr()))
 }
-
-func (l *oneConnListener) Close() error { return nil }
 
 // peerAPIHandler serves the Peer API for a source specific client.
 type peerAPIHandler struct {
@@ -500,8 +528,25 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handlePeerPut(w, r)
 		return
 	}
-	if r.URL.Path == "/v0/goroutines" {
+	if strings.HasPrefix(r.URL.Path, "/dns-query") {
+		h.handleDNSQuery(w, r)
+		return
+	}
+	switch r.URL.Path {
+	case "/v0/goroutines":
 		h.handleServeGoroutines(w, r)
+		return
+	case "/v0/env":
+		h.handleServeEnv(w, r)
+		return
+	case "/v0/metrics":
+		h.handleServeMetrics(w, r)
+		return
+	case "/v0/magicsock":
+		h.handleServeMagicsock(w, r)
+		return
+	case "/v0/dnsfwd":
+		h.handleServeDNSFwd(w, r)
 		return
 	}
 	who := h.peerUser.DisplayName
@@ -589,7 +634,7 @@ func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.ps.rootDir == "" {
-		http.Error(w, "no rootdir", http.StatusInternalServerError)
+		http.Error(w, errNoTaildrop.Error(), http.StatusInternalServerError)
 		return
 	}
 	rawPath := r.URL.EscapedPath()
@@ -661,7 +706,7 @@ func (h *peerAPIHandler) handlePeerPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if h.ps.directFileMode {
+	if h.ps.directFileMode && !h.ps.directFileDoFinalRename {
 		if inFile != nil { // non-zero length; TODO: notify even for zero length
 			inFile.markAndNotifyDone()
 		}
@@ -709,4 +754,276 @@ func (h *peerAPIHandler) handleServeGoroutines(w http.ResponseWriter, r *http.Re
 		}
 	}
 	w.Write(buf)
+}
+
+func (h *peerAPIHandler) handleServeEnv(w http.ResponseWriter, r *http.Request) {
+	if !h.isSelf {
+		http.Error(w, "not owner", http.StatusForbidden)
+		return
+	}
+	var data struct {
+		Hostinfo *tailcfg.Hostinfo
+		Uid      int
+		Args     []string
+		Env      []string
+	}
+	data.Hostinfo = hostinfo.New()
+	data.Uid = os.Getuid()
+	data.Args = os.Args
+	data.Env = os.Environ()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func (h *peerAPIHandler) handleServeMagicsock(w http.ResponseWriter, r *http.Request) {
+	if !h.isSelf {
+		http.Error(w, "not owner", http.StatusForbidden)
+		return
+	}
+	eng := h.ps.b.e
+	if ig, ok := eng.(wgengine.InternalsGetter); ok {
+		if _, mc, ok := ig.GetInternals(); ok {
+			mc.ServeHTTPDebug(w, r)
+			return
+		}
+	}
+	http.Error(w, "miswired", 500)
+}
+
+func (h *peerAPIHandler) handleServeMetrics(w http.ResponseWriter, r *http.Request) {
+	if !h.isSelf {
+		http.Error(w, "not owner", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	clientmetric.WritePrometheusExpositionFormat(w)
+}
+
+func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Request) {
+	if !h.isSelf {
+		http.Error(w, "not owner", http.StatusForbidden)
+		return
+	}
+	dh := health.DebugHandler("dnsfwd")
+	if dh == nil {
+		http.Error(w, "not wired up", 500)
+		return
+	}
+	dh.ServeHTTP(w, r)
+}
+
+func (h *peerAPIHandler) replyToDNSQueries() bool {
+	if h.isSelf {
+		// If the peer is owned by the same user, just allow it
+		// without further checks.
+		return true
+	}
+	b := h.ps.b
+	if !b.OfferingExitNode() {
+		// If we're not an exit node, there's no point to
+		// being a DNS server for somebody.
+		return false
+	}
+	if !h.remoteAddr.IsValid() {
+		// This should never be the case if the peerAPIHandler
+		// was wired up correctly, but just in case.
+		return false
+	}
+	// Otherwise, we're an exit node but the peer is not us, so
+	// we need to check if they're allowed access to the internet.
+	// As peerapi bypasses wgengine/filter checks, we need to check
+	// ourselves. As a proxy for autogroup:internet access, we see
+	// if we would've accepted a packet to 0.0.0.0:53. We treat
+	// the IP 0.0.0.0 as being "the internet".
+	f, ok := b.filterAtomic.Load().(*filter.Filter)
+	if !ok {
+		return false
+	}
+	// Note: we check TCP here because the Filter type already had
+	// a CheckTCP method (for unit tests), but it's pretty
+	// arbitrary. DNS runs over TCP and UDP, so sure... we check
+	// TCP.
+	dstIP := netaddr.IPv4(0, 0, 0, 0)
+	remoteIP := h.remoteAddr.IP()
+	if remoteIP.Is6() {
+		// autogroup:internet for IPv6 is defined to start with 2000::/3,
+		// so use 2000::0 as the probe "the internet" address.
+		dstIP = netaddr.MustParseIP("2000::")
+	}
+	verdict := f.CheckTCP(remoteIP, dstIP, 53)
+	return verdict == filter.Accept
+}
+
+// handleDNSQuery implements a DoH server (RFC 8484) over the peerapi.
+// It's not over HTTPS as the spec dictates, but rather HTTP-over-WireGuard.
+func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
+	if h.ps.resolver == nil {
+		http.Error(w, "DNS not wired up", http.StatusNotImplemented)
+		return
+	}
+	if !h.replyToDNSQueries() {
+		http.Error(w, "DNS access denied", http.StatusForbidden)
+		return
+	}
+	pretty := false // non-DoH debug mode for humans
+	q, publicError := dohQuery(r)
+	if publicError != "" && r.Method == "GET" {
+		if name := r.FormValue("q"); name != "" {
+			pretty = true
+			publicError = ""
+			q = dnsQueryForName(name, r.FormValue("t"))
+		}
+	}
+	if publicError != "" {
+		http.Error(w, publicError, http.StatusBadRequest)
+		return
+	}
+
+	// Some timeout that's short enough to be noticed by humans
+	// but long enough that it's longer than real DNS timeouts.
+	const arbitraryTimeout = 5 * time.Second
+
+	ctx, cancel := context.WithTimeout(r.Context(), arbitraryTimeout)
+	defer cancel()
+	res, err := h.ps.resolver.HandleExitNodeDNSQuery(ctx, q, h.remoteAddr, h.ps.b.allowExitNodeDNSProxyToServeName)
+	if err != nil {
+		h.logf("handleDNS fwd error: %v", err)
+		if err := ctx.Err(); err != nil {
+			http.Error(w, err.Error(), 500)
+		} else {
+			http.Error(w, "DNS forwarding error", 500)
+		}
+		return
+	}
+	if pretty {
+		// Non-standard response for interactive debugging.
+		w.Header().Set("Content-Type", "application/json")
+		writePrettyDNSReply(w, res)
+		return
+	}
+	w.Header().Set("Content-Type", "application/dns-message")
+	w.Header().Set("Content-Length", strconv.Itoa(len(res)))
+	w.Write(res)
+}
+
+func dohQuery(r *http.Request) (dnsQuery []byte, publicErr string) {
+	const maxQueryLen = 256 << 10
+	switch r.Method {
+	default:
+		return nil, "bad HTTP method"
+	case "GET":
+		q64 := r.FormValue("dns")
+		if q64 == "" {
+			return nil, "missing 'dns' parameter"
+		}
+		if base64.RawURLEncoding.DecodedLen(len(q64)) > maxQueryLen {
+			return nil, "query too large"
+		}
+		q, err := base64.RawURLEncoding.DecodeString(q64)
+		if err != nil {
+			return nil, "invalid 'dns' base64 encoding"
+		}
+		return q, ""
+	case "POST":
+		if r.Header.Get("Content-Type") != "application/dns-message" {
+			return nil, "unexpected Content-Type"
+		}
+		q, err := io.ReadAll(io.LimitReader(r.Body, maxQueryLen+1))
+		if err != nil {
+			return nil, "error reading post body with DNS query"
+		}
+		if len(q) > maxQueryLen {
+			return nil, "query too large"
+		}
+		return q, ""
+	}
+}
+
+func dnsQueryForName(name, typStr string) []byte {
+	typ := dnsmessage.TypeA
+	switch strings.ToLower(typStr) {
+	case "aaaa":
+		typ = dnsmessage.TypeAAAA
+	case "txt":
+		typ = dnsmessage.TypeTXT
+	}
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		OpCode:           0, // query
+		RecursionDesired: true,
+		ID:               0,
+	})
+	if !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	b.StartQuestions()
+	b.Question(dnsmessage.Question{
+		Name:  dnsmessage.MustNewName(name),
+		Type:  typ,
+		Class: dnsmessage.ClassINET,
+	})
+	msg, _ := b.Finish()
+	return msg
+}
+
+func writePrettyDNSReply(w io.Writer, res []byte) (err error) {
+	defer func() {
+		if err != nil {
+			j, _ := json.Marshal(struct {
+				Error string
+			}{err.Error()})
+			j = append(j, '\n')
+			w.Write(j)
+			return
+		}
+	}()
+	var p dnsmessage.Parser
+	hdr, err := p.Start(res)
+	if err != nil {
+		return err
+	}
+	if hdr.RCode != dnsmessage.RCodeSuccess {
+		return fmt.Errorf("DNS RCode = %v", hdr.RCode)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		return err
+	}
+
+	var gotIPs []string
+	for {
+		h, err := p.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if h.Class != dnsmessage.ClassINET {
+			continue
+		}
+		switch h.Type {
+		case dnsmessage.TypeA:
+			r, err := p.AResource()
+			if err != nil {
+				return err
+			}
+			gotIPs = append(gotIPs, net.IP(r.A[:]).String())
+		case dnsmessage.TypeAAAA:
+			r, err := p.AAAAResource()
+			if err != nil {
+				return err
+			}
+			gotIPs = append(gotIPs, net.IP(r.AAAA[:]).String())
+		case dnsmessage.TypeTXT:
+			r, err := p.TXTResource()
+			if err != nil {
+				return err
+			}
+			gotIPs = append(gotIPs, r.TXT...)
+		}
+	}
+	j, _ := json.Marshal(gotIPs)
+	j = append(j, '\n')
+	w.Write(j)
+	return nil
 }

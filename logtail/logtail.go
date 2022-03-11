@@ -28,6 +28,12 @@ import (
 // Config.BaseURL isn't provided.
 const DefaultHost = "log.tailscale.io"
 
+const (
+	// CollectionNode is the name of a logtail Config.Collection
+	// for tailscaled (or equivalent: IPNExtension, Android app).
+	CollectionNode = "tailnode.log.tailscale.io"
+)
+
 type Encoder interface {
 	EncodeAll(src, dst []byte) []byte
 	Close() error
@@ -45,6 +51,12 @@ type Config struct {
 	StderrLevel    int              // max verbosity level to write to stderr; 0 means the non-verbose messages only
 	Buffer         Buffer           // temp storage, if nil a MemoryBuffer
 	NewZstdEncoder func() Encoder   // if set, used to compress logs for transmission
+
+	// MetricsDelta, if non-nil, is a func that returns an encoding
+	// delta in clientmetrics to upload alongside existing logs.
+	// It can return either an empty string (for nothing) or a string
+	// that's safe to embed in a JSON string literal without further escaping.
+	MetricsDelta func() string
 
 	// DrainLogs, if non-nil, disables automatic uploading of new logs,
 	// so that logs are only uploaded when a token is sent to DrainLogs.
@@ -84,6 +96,7 @@ func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
 		drainLogs:      cfg.DrainLogs,
 		timeNow:        cfg.TimeNow,
 		bo:             backoff.NewBackoff("logtail", logf, 30*time.Second),
+		metricsDelta:   cfg.MetricsDelta,
 
 		shutdownStart: make(chan struct{}),
 		shutdownDone:  make(chan struct{}),
@@ -118,9 +131,11 @@ type Logger struct {
 	bo             *backoff.Backoff
 	zstdEncoder    Encoder
 	uploadCancel   func()
+	explainedRaw   bool
+	metricsDelta   func() string // or nil
 
 	shutdownStart chan struct{} // closed when shutdown begins
-	shutdownDone  chan struct{} // closd when shutdown complete
+	shutdownDone  chan struct{} // closed when shutdown complete
 }
 
 // SetVerbosityLevel controls the verbosity level that should be
@@ -199,9 +214,11 @@ func (l *Logger) drainBlock() (shuttingDown bool) {
 }
 
 // drainPending drains and encodes a batch of logs from the buffer for upload.
+// It uses scratch as its initial buffer.
 // If no logs are available, drainPending blocks until logs are available.
-func (l *Logger) drainPending() (res []byte) {
-	buf := new(bytes.Buffer)
+func (l *Logger) drainPending(scratch []byte) (res []byte) {
+	buf := bytes.NewBuffer(scratch[:0])
+	buf.WriteByte('[')
 	entries := 0
 
 	var batchDone bool
@@ -230,31 +247,26 @@ func (l *Logger) drainPending() (res []byte) {
 			// outside of the logtail logger. Encode it.
 			// Do not add a client time, as it could have been
 			// been written a long time ago.
-			b = l.encodeText(b, true)
+			if !l.explainedRaw {
+				fmt.Fprintf(l.stderr, "RAW-STDERR: ***\n")
+				fmt.Fprintf(l.stderr, "RAW-STDERR: *** Lines prefixed with RAW-STDERR below bypassed logtail and probably come from a previous run of the program\n")
+				fmt.Fprintf(l.stderr, "RAW-STDERR: ***\n")
+				fmt.Fprintf(l.stderr, "RAW-STDERR:\n")
+				l.explainedRaw = true
+			}
+			fmt.Fprintf(l.stderr, "RAW-STDERR: %s", b)
+			b = l.encodeText(b, true, 0)
 		}
 
-		switch {
-		case entries == 0:
-			buf.Write(b)
-		case entries == 1:
-			buf2 := new(bytes.Buffer)
-			buf2.WriteByte('[')
-			buf2.Write(buf.Bytes())
-			buf2.WriteByte(',')
-			buf2.Write(b)
-			buf.Reset()
-			buf.Write(buf2.Bytes())
-		default:
+		if entries > 0 {
 			buf.WriteByte(',')
-			buf.Write(b)
 		}
+		buf.Write(b)
 		entries++
 	}
 
-	if entries > 1 {
-		buf.WriteByte(']')
-	}
-	if buf.Len() == 0 {
+	buf.WriteByte(']')
+	if buf.Len() <= len("[]") {
 		return nil
 	}
 	return buf.Bytes()
@@ -264,8 +276,9 @@ func (l *Logger) drainPending() (res []byte) {
 func (l *Logger) uploading(ctx context.Context) {
 	defer close(l.shutdownDone)
 
+	scratch := make([]byte, 4096) // reusable buffer to write into
 	for {
-		body := l.drainPending()
+		body := l.drainPending(scratch)
 		origlen := -1 // sentinel value: uncompressed
 		// Don't attempt to compress tiny bodies; not worth the CPU cycles.
 		if l.zstdEncoder != nil && len(body) > 256 {
@@ -405,7 +418,7 @@ func (l *Logger) send(jsonBlob []byte) (int, error) {
 
 // TODO: instead of allocating, this should probably just append
 // directly into the output log buffer.
-func (l *Logger) encodeText(buf []byte, skipClientTime bool) []byte {
+func (l *Logger) encodeText(buf []byte, skipClientTime bool, level int) []byte {
 	now := l.timeNow()
 
 	// Factor in JSON encoding overhead to try to only do one alloc
@@ -418,6 +431,21 @@ func (l *Logger) encodeText(buf []byte, skipClientTime bool) []byte {
 	// For now just factor in a dozen.
 	overhead += 12
 
+	// Put a sanity cap on buf's size.
+	max := 16 << 10
+	if l.lowMem {
+		max = 255
+	}
+	var nTruncated int
+	if len(buf) > max {
+		nTruncated = len(buf) - max
+		// TODO: this can break a UTF-8 character
+		// mid-encoding.  We don't tend to log
+		// non-ASCII stuff ourselves, but e.g. client
+		// names might be.
+		buf = buf[:max]
+	}
+
 	b := make([]byte, 0, len(buf)+overhead)
 	b = append(b, '{')
 
@@ -427,8 +455,24 @@ func (l *Logger) encodeText(buf []byte, skipClientTime bool) []byte {
 		b = append(b, "\"}, "...)
 	}
 
+	if l.metricsDelta != nil {
+		if d := l.metricsDelta(); d != "" {
+			b = append(b, `"metrics": "`...)
+			b = append(b, d...)
+			b = append(b, `",`...)
+		}
+	}
+
+	// Add the log level, if non-zero. Note that we only use log
+	// levels 1 and 2 currently. It's unlikely we'll ever make it
+	// past 9.
+	if level > 0 && level < 10 {
+		b = append(b, `"v":`...)
+		b = append(b, '0'+byte(level))
+		b = append(b, ',')
+	}
 	b = append(b, "\"text\": \""...)
-	for i, c := range buf {
+	for _, c := range buf {
 		switch c {
 		case '\b':
 			b = append(b, '\\', 'b')
@@ -448,22 +492,18 @@ func (l *Logger) encodeText(buf []byte, skipClientTime bool) []byte {
 			// TODO: what about binary gibberish or non UTF-8?
 			b = append(b, c)
 		}
-		if l.lowMem && i > 254 {
-			// TODO: this can break a UTF-8 character
-			// mid-encoding.  We don't tend to log
-			// non-ASCII stuff ourselves, but e.g. client
-			// names might be.
-			b = append(b, "…"...)
-			break
-		}
+	}
+	if nTruncated > 0 {
+		b = append(b, "…+"...)
+		b = strconv.AppendInt(b, int64(nTruncated), 10)
 	}
 	b = append(b, "\"}\n"...)
 	return b
 }
 
-func (l *Logger) encode(buf []byte) []byte {
+func (l *Logger) encode(buf []byte, level int) []byte {
 	if buf[0] != '{' {
-		return l.encodeText(buf, l.skipClientTime) // text fast-path
+		return l.encodeText(buf, l.skipClientTime, level) // text fast-path
 	}
 
 	now := l.timeNow()
@@ -490,6 +530,9 @@ func (l *Logger) encode(buf []byte) []byte {
 			"client_time": now.Format(time.RFC3339Nano),
 		}
 	}
+	if level > 0 {
+		obj["v"] = level
+	}
 
 	b, err := json.Marshal(obj)
 	if err != nil {
@@ -500,6 +543,11 @@ func (l *Logger) encode(buf []byte) []byte {
 	}
 	b = append(b, '\n')
 	return b
+}
+
+// Logf logs to l using the provided fmt-style format and optional arguments.
+func (l *Logger) Logf(format string, args ...interface{}) {
+	fmt.Fprintf(l, format, args...)
 }
 
 // Write logs an encoded JSON blob.
@@ -523,7 +571,7 @@ func (l *Logger) Write(buf []byte) (int, error) {
 			l.stderr.Write(withNL)
 		}
 	}
-	b := l.encode(buf)
+	b := l.encode(buf, level)
 	_, err := l.send(b)
 	return len(buf), err
 }
@@ -532,6 +580,7 @@ var (
 	openBracketV = []byte("[v")
 	v1           = []byte("[v1] ")
 	v2           = []byte("[v2] ")
+	vJSON        = []byte("[v\x00JSON]") // precedes log level '0'-'9' byte, then JSON value
 )
 
 // level 0 is normal (or unknown) level; 1+ are increasingly verbose
@@ -544,6 +593,15 @@ func parseAndRemoveLogLevel(buf []byte) (level int, cleanBuf []byte) {
 	}
 	if bytes.Contains(buf, v2) {
 		return 2, bytes.ReplaceAll(buf, v2, nil)
+	}
+	if i := bytes.Index(buf, vJSON); i != -1 {
+		rest := buf[i+len(vJSON):]
+		if len(rest) >= 2 {
+			v := rest[0]
+			if v >= '0' && v <= '9' {
+				return int(v - '0'), rest[1:]
+			}
+		}
 	}
 	return 0, buf
 }

@@ -10,7 +10,7 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
@@ -18,12 +18,13 @@ import (
 
 var ipCmd = &ffcli.Command{
 	Name:       "ip",
-	ShortUsage: "ip [-4] [-6] [peername]",
-	ShortHelp:  "Show current Tailscale IP address(es)",
-	LongHelp:   "Shows the Tailscale IP address of the current machine without an argument. With an argument, it shows the IP of a named peer.",
+	ShortUsage: "ip [-1] [-4] [-6] [peer hostname or ip address]",
+	ShortHelp:  "Show Tailscale IP addresses",
+	LongHelp:   "Show Tailscale IP addresses for peer. Peer defaults to the current machine.",
 	Exec:       runIP,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("ip", flag.ExitOnError)
+		fs := newFlagSet("ip")
+		fs.BoolVar(&ipArgs.want1, "1", false, "only print one IP address")
 		fs.BoolVar(&ipArgs.want4, "4", false, "only print IPv4 address")
 		fs.BoolVar(&ipArgs.want6, "6", false, "only print IPv6 address")
 		return fs
@@ -31,13 +32,14 @@ var ipCmd = &ffcli.Command{
 }
 
 var ipArgs struct {
+	want1 bool
 	want4 bool
 	want6 bool
 }
 
 func runIP(ctx context.Context, args []string) error {
 	if len(args) > 1 {
-		return errors.New("unknown arguments")
+		return errors.New("too many arguments, expected at most one peer")
 	}
 	var of string
 	if len(args) == 1 {
@@ -45,8 +47,14 @@ func runIP(ctx context.Context, args []string) error {
 	}
 
 	v4, v6 := ipArgs.want4, ipArgs.want6
-	if v4 && v6 {
-		return errors.New("tailscale up -4 and -6 are mutually exclusive")
+	nflags := 0
+	for _, b := range []bool{ipArgs.want1, v4, v6} {
+		if b {
+			nflags++
+		}
+	}
+	if nflags > 1 {
+		return errors.New("tailscale ip -1, -4, and -6 are mutually exclusive")
 	}
 	if !v4 && !v6 {
 		v4, v6 = true, true
@@ -57,7 +65,7 @@ func runIP(ctx context.Context, args []string) error {
 	}
 	ips := st.TailscaleIPs
 	if of != "" {
-		ip, err := tailscaleIPFromArg(ctx, of)
+		ip, _, err := tailscaleIPFromArg(ctx, of)
 		if err != nil {
 			return err
 		}
@@ -71,11 +79,14 @@ func runIP(ctx context.Context, args []string) error {
 		return fmt.Errorf("no current Tailscale IPs; state: %v", st.BackendState)
 	}
 
+	if ipArgs.want1 {
+		ips = ips[:1]
+	}
 	match := false
 	for _, ip := range ips {
 		if ip.Is4() && v4 || ip.Is6() && v6 {
 			match = true
-			fmt.Println(ip)
+			outln(ip)
 		}
 	}
 	if !match {
@@ -95,6 +106,13 @@ func peerMatchingIP(st *ipnstate.Status, ipStr string) (ps *ipnstate.PeerStatus,
 		return
 	}
 	for _, ps = range st.Peer {
+		for _, pip := range ps.TailscaleIPs {
+			if ip == pip {
+				return ps, true
+			}
+		}
+	}
+	if ps := st.Self; ps != nil {
 		for _, pip := range ps.TailscaleIPs {
 			if ip == pip {
 				return ps, true

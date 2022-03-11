@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux
-
 package vms
 
 import (
@@ -41,7 +39,7 @@ type openSUSELeap151MetaDataMeta struct {
 }
 
 func hackOpenSUSE151UserData(t *testing.T, d Distro, dir string) bool {
-	if d.name != "opensuse-leap-15-1" {
+	if d.Name != "opensuse-leap-15-1" {
 		return false
 	}
 
@@ -54,14 +52,14 @@ func hackOpenSUSE151UserData(t *testing.T, d Distro, dir string) bool {
 
 	metadata, err := json.Marshal(openSUSELeap151MetaData{
 		Zone:        "nova",
-		Hostname:    d.name,
+		Hostname:    d.Name,
 		LaunchIndex: "0",
 		Meta: openSUSELeap151MetaDataMeta{
 			Role:      "server",
 			DSMode:    "local",
 			Essential: "false",
 		},
-		Name: d.name,
+		Name: d.Name,
 		UUID: uuid.New().String(),
 	})
 	if err != nil {

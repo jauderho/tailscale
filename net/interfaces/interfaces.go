@@ -28,7 +28,7 @@ var LoginEndpointForProxyDetermination = "https://controlplane.tailscale.com/"
 // If none is found, all zero values are returned.
 // A non-nil error is only returned on a problem listing the system interfaces.
 func Tailscale() ([]netaddr.IP, *net.Interface, error) {
-	ifs, err := net.Interfaces()
+	ifs, err := netInterfaces()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -50,7 +50,7 @@ func Tailscale() ([]netaddr.IP, *net.Interface, error) {
 			}
 		}
 		if len(tsIPs) > 0 {
-			return tsIPs, &iface, nil
+			return tsIPs, iface.Interface, nil
 		}
 	}
 	return nil, nil, nil
@@ -87,20 +87,20 @@ func isProblematicInterface(nif *net.Interface) bool {
 // know of environments where these are used with NAT to provide connectivity.
 func LocalAddresses() (regular, loopback []netaddr.IP, err error) {
 	// TODO(crawshaw): don't serve interface addresses that we are routing
-	ifaces, err := net.Interfaces()
+	ifaces, err := netInterfaces()
 	if err != nil {
 		return nil, nil, err
 	}
 	var regular4, regular6, linklocal4, ula6 []netaddr.IP
-	for i := range ifaces {
-		iface := &ifaces[i]
-		if !isUp(iface) || isProblematicInterface(iface) {
+	for _, iface := range ifaces {
+		stdIf := iface.Interface
+		if !isUp(stdIf) || isProblematicInterface(stdIf) {
 			// Skip down interfaces and ones that are
 			// problematic that we don't want to try to
 			// send Tailscale traffic over.
 			continue
 		}
-		ifcIsLoopback := isLoopback(iface)
+		ifcIsLoopback := isLoopback(stdIf)
 
 		addrs, err := iface.Addrs()
 		if err != nil {
@@ -134,7 +134,7 @@ func LocalAddresses() (regular, loopback []netaddr.IP, err error) {
 					// but their OS supports IPv6 so they have an fe80::
 					// address. We don't want to report all of those
 					// IPv6 LL to Control.
-				} else if ip.Is6() && tsaddr.IsULA(ip) {
+				} else if ip.Is6() && ip.IsPrivate() {
 					// Google Cloud Run uses NAT with IPv6 Unique
 					// Local Addresses to provide IPv6 connectivity.
 					ula6 = append(ula6, ip)
@@ -171,21 +171,34 @@ func sortIPs(s []netaddr.IP) {
 // Interface is a wrapper around Go's net.Interface with some extra methods.
 type Interface struct {
 	*net.Interface
+	AltAddrs []net.Addr // if non-nil, returned by Addrs
+	Desc     string     // extra description (used on Windows)
 }
 
 func (i Interface) IsLoopback() bool { return isLoopback(i.Interface) }
 func (i Interface) IsUp() bool       { return isUp(i.Interface) }
+func (i Interface) Addrs() ([]net.Addr, error) {
+	if i.AltAddrs != nil {
+		return i.AltAddrs, nil
+	}
+	return i.Interface.Addrs()
+}
 
-// ForeachInterfaceAddress calls fn for each interface's address on
-// the machine. The IPPrefix's IP is the IP address assigned to the
-// interface, and Bits are the subnet mask.
+// ForeachInterfaceAddress is a wrapper for GetList, then
+// List.ForeachInterfaceAddress.
 func ForeachInterfaceAddress(fn func(Interface, netaddr.IPPrefix)) error {
-	ifaces, err := net.Interfaces()
+	ifaces, err := GetList()
 	if err != nil {
 		return err
 	}
-	for i := range ifaces {
-		iface := &ifaces[i]
+	return ifaces.ForeachInterfaceAddress(fn)
+}
+
+// ForeachInterfaceAddress calls fn for each interface in ifaces, with
+// all its addresses. The IPPrefix's IP is the IP address assigned to
+// the interface, and Bits are the subnet mask.
+func (ifaces List) ForeachInterfaceAddress(fn func(Interface, netaddr.IPPrefix)) error {
+	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
 			return err
@@ -194,7 +207,7 @@ func ForeachInterfaceAddress(fn func(Interface, netaddr.IPPrefix)) error {
 			switch v := a.(type) {
 			case *net.IPNet:
 				if pfx, ok := netaddr.FromStdIPNet(v); ok {
-					fn(Interface{iface}, pfx)
+					fn(iface, pfx)
 				}
 			}
 		}
@@ -202,16 +215,25 @@ func ForeachInterfaceAddress(fn func(Interface, netaddr.IPPrefix)) error {
 	return nil
 }
 
-// ForeachInterface calls fn for each interface on the machine, with
-// all its addresses. The IPPrefix's IP is the IP address assigned to
-// the interface, and Bits are the subnet mask.
+// ForeachInterface is a wrapper for GetList, then
+// List.ForeachInterface.
 func ForeachInterface(fn func(Interface, []netaddr.IPPrefix)) error {
-	ifaces, err := net.Interfaces()
+	ifaces, err := GetList()
 	if err != nil {
 		return err
 	}
-	for i := range ifaces {
-		iface := &ifaces[i]
+	return ifaces.ForeachInterface(fn)
+}
+
+// ForeachInterface calls fn for each interface in ifaces, with
+// all its addresses. The IPPrefix's IP is the IP address assigned to
+// the interface, and Bits are the subnet mask.
+func (ifaces List) ForeachInterface(fn func(Interface, []netaddr.IPPrefix)) error {
+	ifaces, err := GetList()
+	if err != nil {
+		return err
+	}
+	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
 			return err
@@ -228,7 +250,7 @@ func ForeachInterface(fn func(Interface, []netaddr.IPPrefix)) error {
 		sort.Slice(pfxs, func(i, j int) bool {
 			return pfxs[i].IP().Less(pfxs[j].IP())
 		})
-		fn(Interface{iface}, pfxs)
+		fn(iface, pfxs)
 	}
 	return nil
 }
@@ -257,13 +279,16 @@ type State struct {
 	// instead of Wifi. This field is not populated by GetState.
 	IsExpensive bool
 
-	// DefaultRouteInterface is the interface name for the machine's default route.
+	// DefaultRouteInterface is the interface name for the
+	// machine's default route.
+	//
 	// It is not yet populated on all OSes.
-	// Its exact value should not be assumed to be a map key for
-	// the Interface maps above; it's only used for debugging.
+	//
+	// When non-empty, its value is the map key into Interface and
+	// InterfaceIPs.
 	DefaultRouteInterface string
 
-	// HTTPProxy is the HTTP proxy to use.
+	// HTTPProxy is the HTTP proxy to use, if any.
 	HTTPProxy string
 
 	// PAC is the URL to the Proxy Autoconfig URL, if applicable.
@@ -272,7 +297,13 @@ type State struct {
 
 func (s *State) String() string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "interfaces.State{defaultRoute=%v ifs={", s.DefaultRouteInterface)
+	fmt.Fprintf(&sb, "interfaces.State{defaultRoute=%v ", s.DefaultRouteInterface)
+	if s.DefaultRouteInterface != "" {
+		if iface, ok := s.Interface[s.DefaultRouteInterface]; ok && iface.Desc != "" {
+			fmt.Fprintf(&sb, "(%s) ", iface.Desc)
+		}
+	}
+	sb.WriteString("ifs={")
 	ifs := make([]string, 0, len(s.Interface))
 	for k := range s.Interface {
 		if anyInterestingIP(s.InterfaceIPs[k]) {
@@ -324,9 +355,18 @@ func (s *State) String() string {
 	return sb.String()
 }
 
+// An InterfaceFilter indicates whether EqualFiltered should use i when deciding whether two States are equal.
+// ips are all the IPPrefixes associated with i.
+type InterfaceFilter func(i Interface, ips []netaddr.IPPrefix) bool
+
+// An IPFilter indicates whether EqualFiltered should use ip when deciding whether two States are equal.
+// ip is an ip address associated with some interface under consideration.
+type IPFilter func(ip netaddr.IP) bool
+
 // EqualFiltered reports whether s and s2 are equal,
-// considering only interfaces in s for which filter returns true.
-func (s *State) EqualFiltered(s2 *State, filter func(i Interface, ips []netaddr.IPPrefix) bool) bool {
+// considering only interfaces in s for which filter returns true,
+// and considering only IPs for those interfaces for which filterIP returns true.
+func (s *State) EqualFiltered(s2 *State, useInterface InterfaceFilter, useIP IPFilter) bool {
 	if s == nil && s2 == nil {
 		return true
 	}
@@ -343,7 +383,7 @@ func (s *State) EqualFiltered(s2 *State, filter func(i Interface, ips []netaddr.
 	}
 	for iname, i := range s.Interface {
 		ips := s.InterfaceIPs[iname]
-		if !filter(i, ips) {
+		if !useInterface(i, ips) {
 			continue
 		}
 		i2, ok := s2.Interface[iname]
@@ -354,7 +394,7 @@ func (s *State) EqualFiltered(s2 *State, filter func(i Interface, ips []netaddr.
 		if !ok {
 			return false
 		}
-		if !interfacesEqual(i, i2) || !prefixesEqual(ips, ips2) {
+		if !interfacesEqual(i, i2) || !prefixesEqualFiltered(ips, ips2, useIP) {
 			return false
 		}
 	}
@@ -369,6 +409,21 @@ func interfacesEqual(a, b Interface) bool {
 		bytes.Equal([]byte(a.HardwareAddr), []byte(b.HardwareAddr))
 }
 
+func filteredIPPs(ipps []netaddr.IPPrefix, useIP IPFilter) []netaddr.IPPrefix {
+	// TODO: rewrite prefixesEqualFiltered to avoid making copies
+	x := make([]netaddr.IPPrefix, 0, len(ipps))
+	for _, ipp := range ipps {
+		if useIP(ipp.IP()) {
+			x = append(x, ipp)
+		}
+	}
+	return x
+}
+
+func prefixesEqualFiltered(a, b []netaddr.IPPrefix, useIP IPFilter) bool {
+	return prefixesEqual(filteredIPPs(a, useIP), filteredIPPs(b, useIP))
+}
+
 func prefixesEqual(a, b []netaddr.IPPrefix) bool {
 	if len(a) != len(b) {
 		return false
@@ -381,18 +436,32 @@ func prefixesEqual(a, b []netaddr.IPPrefix) bool {
 	return true
 }
 
-// FilterInteresting reports whether i is an interesting non-Tailscale interface.
-func FilterInteresting(i Interface, ips []netaddr.IPPrefix) bool {
+// UseInterestingInterfaces is an InterfaceFilter that reports whether i is an interesting interface.
+// An interesting interface if it is (a) not owned by Tailscale and (b) routes interesting IP addresses.
+// See UseInterestingIPs for the defition of an interesting IP address.
+func UseInterestingInterfaces(i Interface, ips []netaddr.IPPrefix) bool {
 	return !isTailscaleInterface(i.Name, ips) && anyInterestingIP(ips)
 }
 
-// FilterAll always returns true, to use EqualFiltered against all interfaces.
-func FilterAll(i Interface, ips []netaddr.IPPrefix) bool { return true }
+// UseInterestingIPs is an IPFilter that reports whether ip is an interesting IP address.
+// An IP address is interesting if it is neither a lopback not a link local unicast IP address.
+func UseInterestingIPs(ip netaddr.IP) bool {
+	return isInterestingIP(ip)
+}
+
+// UseAllInterfaces is an InterfaceFilter that includes all interfaces.
+func UseAllInterfaces(i Interface, ips []netaddr.IPPrefix) bool { return true }
+
+// UseAllIPs is an IPFilter that includes all all IPs.
+func UseAllIPs(ips netaddr.IP) bool { return true }
 
 func (s *State) HasPAC() bool { return s != nil && s.PAC != "" }
 
 // AnyInterfaceUp reports whether any interface seems like it has Internet access.
 func (s *State) AnyInterfaceUp() bool {
+	if runtime.GOOS == "js" {
+		return true
+	}
 	return s != nil && (s.HaveV4 || s.HaveV6)
 }
 
@@ -448,7 +517,16 @@ func GetState() (*State, error) {
 		return nil, err
 	}
 
-	s.DefaultRouteInterface, _ = DefaultRouteInterface()
+	dr, _ := DefaultRoute()
+	s.DefaultRouteInterface = dr.InterfaceName
+
+	// Populate description (for Windows, primarily) if present.
+	if desc := dr.InterfaceDesc; desc != "" {
+		if iface, ok := s.Interface[dr.InterfaceName]; ok {
+			iface.Desc = desc
+			s.Interface[dr.InterfaceName] = iface
+		}
+	}
 
 	if s.AnyInterfaceUp() {
 		req, err := http.NewRequest("GET", LoginEndpointForProxyDetermination, nil)
@@ -479,7 +557,7 @@ func HTTPOfListener(ln net.Listener) string {
 	var privateIP string
 	ForeachInterfaceAddress(func(i Interface, pfx netaddr.IPPrefix) {
 		ip := pfx.IP()
-		if isPrivateIP(ip) {
+		if ip.IsPrivate() {
 			if privateIP == "" {
 				privateIP = ip.String()
 			}
@@ -519,19 +597,13 @@ func LikelyHomeRouterIP() (gateway, myIP netaddr.IP, ok bool) {
 		if !i.IsUp() || ip.IsZero() || !myIP.IsZero() {
 			return
 		}
-		for _, prefix := range privatev4s {
-			if prefix.Contains(gateway) && prefix.Contains(ip) {
-				myIP = ip
-				ok = true
-				return
-			}
+		if gateway.IsPrivate() && ip.IsPrivate() {
+			myIP = ip
+			ok = true
+			return
 		}
 	})
 	return gateway, myIP, !myIP.IsZero()
-}
-
-func isPrivateIP(ip netaddr.IP) bool {
-	return private1.Contains(ip) || private2.Contains(ip) || private3.Contains(ip)
 }
 
 // isUsableV4 reports whether ip is a usable IPv4 address which could
@@ -554,23 +626,11 @@ func isUsableV4(ip netaddr.IP) bool {
 // (fc00::/7) are in some environments used with address translation.
 func isUsableV6(ip netaddr.IP) bool {
 	return v6Global1.Contains(ip) ||
-		(tsaddr.IsULA(ip) && !tsaddr.TailscaleULARange().Contains(ip))
-}
-
-func mustCIDR(s string) netaddr.IPPrefix {
-	prefix, err := netaddr.ParseIPPrefix(s)
-	if err != nil {
-		panic(err)
-	}
-	return prefix
+		(ip.Is6() && ip.IsPrivate() && !tsaddr.TailscaleULARange().Contains(ip))
 }
 
 var (
-	private1   = mustCIDR("10.0.0.0/8")
-	private2   = mustCIDR("172.16.0.0/12")
-	private3   = mustCIDR("192.168.0.0/16")
-	privatev4s = []netaddr.IPPrefix{private1, private2, private3}
-	v6Global1  = mustCIDR("2000::/3")
+	v6Global1 = netaddr.MustParseIPPrefix("2000::/3")
 )
 
 // anyInterestingIP reports whether pfxs contains any IP that matches
@@ -588,8 +648,75 @@ func anyInterestingIP(pfxs []netaddr.IPPrefix) bool {
 // should log in interfaces.State logging. We don't need to show
 // localhost or link-local addresses.
 func isInterestingIP(ip netaddr.IP) bool {
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-		return false
+	return !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+}
+
+var altNetInterfaces func() ([]Interface, error)
+
+// RegisterInterfaceGetter sets the function that's used to query
+// the system network interfaces.
+func RegisterInterfaceGetter(getInterfaces func() ([]Interface, error)) {
+	altNetInterfaces = getInterfaces
+}
+
+// List is a list of interfaces on the machine.
+type List []Interface
+
+// GetList returns the list of interfaces on the machine.
+func GetList() (List, error) {
+	return netInterfaces()
+}
+
+// netInterfaces is a wrapper around the standard library's net.Interfaces
+// that returns a []*Interface instead of a []net.Interface.
+// It exists because Android SDK 30 no longer permits Go's net.Interfaces
+// to work (Issue 2293); this wrapper lets us the Android app register
+// an alternate implementation.
+func netInterfaces() ([]Interface, error) {
+	if altNetInterfaces != nil {
+		return altNetInterfaces()
 	}
-	return true
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	ret := make([]Interface, len(ifs))
+	for i := range ifs {
+		ret[i].Interface = &ifs[i]
+	}
+	return ret, nil
+}
+
+// DefaultRouteDetails are the details about a default route returned
+// by DefaultRoute.
+type DefaultRouteDetails struct {
+	// InterfaceName is the interface name. It must always be populated.
+	// It's like "eth0" (Linux), "Ethernet 2" (Windows), "en0" (macOS).
+	InterfaceName string
+
+	// InterfaceDesc is populated on Windows at least. It's a
+	// longer description, like "Red Hat VirtIO Ethernet Adapter".
+	InterfaceDesc string
+
+	// InterfaceIndex is like net.Interface.Index.
+	// Zero means not populated.
+	InterfaceIndex int
+
+	// TODO(bradfitz): break this out into v4-vs-v6 once that need arises.
+}
+
+// DefaultRouteInterface is like DefaultRoute but only returns the
+// interface name.
+func DefaultRouteInterface() (string, error) {
+	dr, err := DefaultRoute()
+	if err != nil {
+		return "", err
+	}
+	return dr.InterfaceName, nil
+}
+
+// DefaultRoute returns details of the network interface that owns
+// the default route, not including any tailscale interfaces.
+func DefaultRoute() (DefaultRouteDetails, error) {
+	return defaultRoute()
 }

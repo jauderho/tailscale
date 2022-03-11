@@ -12,37 +12,47 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 	"inet.af/netaddr"
-	"inet.af/netstack/tcpip"
-	"inet.af/netstack/tcpip/adapters/gonet"
-	"inet.af/netstack/tcpip/buffer"
-	"inet.af/netstack/tcpip/header"
-	"inet.af/netstack/tcpip/link/channel"
-	"inet.af/netstack/tcpip/network/ipv4"
-	"inet.af/netstack/tcpip/network/ipv6"
-	"inet.af/netstack/tcpip/stack"
-	"inet.af/netstack/tcpip/transport/icmp"
-	"inet.af/netstack/tcpip/transport/tcp"
-	"inet.af/netstack/tcpip/transport/udp"
-	"inet.af/netstack/waiter"
+	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
+	"tailscale.com/syncs"
+	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/util/dnsname"
+	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
 )
 
-const debugNetstack = false
+const debugPackets = false
+
+var debugNetstack = envknob.Bool("TS_DEBUG_NETSTACK")
 
 // Impl contains the state for the netstack implementation,
 // and implements wgengine.FakeImpl to act as a userspace network
@@ -54,13 +64,30 @@ type Impl struct {
 	// port other than accepting it and closing it.
 	ForwardTCPIn func(c net.Conn, port uint16)
 
-	ipstack     *stack.Stack
-	linkEP      *channel.Endpoint
-	tundev      *tstun.Wrapper
-	e           wgengine.Engine
-	mc          *magicsock.Conn
-	logf        logger.Logf
-	onlySubnets bool // whether we only want to handle subnet relaying
+	// ProcessLocalIPs is whether netstack should handle incoming
+	// traffic directed at the Node.Addresses (local IPs).
+	// It can only be set before calling Start.
+	ProcessLocalIPs bool
+
+	// ProcessSubnets is whether netstack should handle incoming
+	// traffic destined to non-local IPs (i.e. whether it should
+	// be a subnet router).
+	// It can only be set before calling Start.
+	ProcessSubnets bool
+
+	ipstack   *stack.Stack
+	linkEP    *channel.Endpoint
+	tundev    *tstun.Wrapper
+	e         wgengine.Engine
+	mc        *magicsock.Conn
+	logf      logger.Logf
+	dialer    *tsdial.Dialer
+	ctx       context.Context        // alive until Close
+	ctxCancel context.CancelFunc     // called on Close
+	lb        *ipnlocal.LocalBackend // or nil
+
+	peerapiPort4Atomic uint32 // uint16 port number for IPv4 peerapi
+	peerapiPort6Atomic uint32 // uint16 port number for IPv6 peerapi
 
 	// atomicIsLocalIPFunc holds a func that reports whether an IP
 	// is a local (non-subnet) Tailscale IP address of this
@@ -68,8 +95,7 @@ type Impl struct {
 	// updates.
 	atomicIsLocalIPFunc atomic.Value // of func(netaddr.IP) bool
 
-	mu  sync.Mutex
-	dns DNSMap
+	mu sync.Mutex
 	// connsOpenBySubnetIP keeps track of number of connections open
 	// for each subnet IP temporarily registered on netstack for active
 	// TCP connections, so they can be unregistered when connections are
@@ -77,11 +103,15 @@ type Impl struct {
 	connsOpenBySubnetIP map[netaddr.IP]int
 }
 
+// handleSSH is initialized in ssh.go (on Linux only) to register an SSH server
+// handler. See https://github.com/tailscale/tailscale/issues/3802.
+var handleSSH func(logger.Logf, *ipnlocal.LocalBackend, net.Conn) error
+
 const nicID = 1
 const mtu = 1500
 
 // Create creates and populates a new Impl.
-func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magicsock.Conn, onlySubnets bool) (*Impl, error) {
+func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magicsock.Conn, dialer *tsdial.Dialer) (*Impl, error) {
 	if mc == nil {
 		return nil, errors.New("nil magicsock.Conn")
 	}
@@ -93,6 +123,9 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	}
 	if e == nil {
 		return nil, errors.New("nil Engine")
+	}
+	if dialer == nil {
+		return nil, errors.New("nil Dialer")
 	}
 	ipstack := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
@@ -129,15 +162,44 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 		tundev:              tundev,
 		e:                   e,
 		mc:                  mc,
+		dialer:              dialer,
 		connsOpenBySubnetIP: make(map[netaddr.IP]int),
-		onlySubnets:         onlySubnets,
 	}
+	ns.ctx, ns.ctxCancel = context.WithCancel(context.Background())
 	ns.atomicIsLocalIPFunc.Store(tsaddr.NewContainsIPFunc(nil))
 	return ns, nil
 }
 
-// Start sets up all the handlers so netstack can start working. Implements
+func (ns *Impl) Close() error {
+	ns.ctxCancel()
+	return nil
+}
 
+// SetLocalBackend sets the LocalBackend; it should only be run before
+// the Start method is called.
+func (ns *Impl) SetLocalBackend(lb *ipnlocal.LocalBackend) {
+	ns.lb = lb
+}
+
+// wrapProtoHandler returns protocol handler h wrapped in a version
+// that dynamically reconfigures ns's subnet addresses as needed for
+// outbound traffic.
+func (ns *Impl) wrapProtoHandler(h func(stack.TransportEndpointID, *stack.PacketBuffer) bool) func(stack.TransportEndpointID, *stack.PacketBuffer) bool {
+	return func(tei stack.TransportEndpointID, pb *stack.PacketBuffer) bool {
+		addr := tei.LocalAddress
+		ip, ok := netaddr.FromStdIP(net.IP(addr))
+		if !ok {
+			ns.logf("netstack: could not parse local address for incoming connection")
+			return false
+		}
+		if !ns.isLocalIP(ip) {
+			ns.addSubnetAddress(ip)
+		}
+		return h(tei, pb)
+	}
+}
+
+// Start sets up all the handlers so netstack can start working. Implements
 // wgengine.FakeImpl.
 func (ns *Impl) Start() error {
 	ns.e.AddNetworkMapCallback(ns.updateIPs)
@@ -146,83 +208,35 @@ func (ns *Impl) Start() error {
 	const maxInFlightConnectionAttempts = 16
 	tcpFwd := tcp.NewForwarder(ns.ipstack, tcpReceiveBufferSize, maxInFlightConnectionAttempts, ns.acceptTCP)
 	udpFwd := udp.NewForwarder(ns.ipstack, ns.acceptUDP)
-	ns.ipstack.SetTransportProtocolHandler(tcp.ProtocolNumber, func(tei stack.TransportEndpointID, pb *stack.PacketBuffer) bool {
-		addr := tei.LocalAddress
-		var pn tcpip.NetworkProtocolNumber
-		if addr.To4() != "" {
-			pn = ipv4.ProtocolNumber
-		} else {
-			pn = ipv6.ProtocolNumber
-		}
-		ip, ok := netaddr.FromStdIP(net.IP(addr))
-		if !ok {
-			ns.logf("netstack: could not parse local address %s for incoming TCP connection", ip)
-			return false
-		}
-		if !ns.isLocalIP(ip) {
-			ns.addSubnetAddress(pn, ip)
-		}
-		return tcpFwd.HandlePacket(tei, pb)
-	})
-	ns.ipstack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+	ns.ipstack.SetTransportProtocolHandler(tcp.ProtocolNumber, ns.wrapProtoHandler(tcpFwd.HandlePacket))
+	ns.ipstack.SetTransportProtocolHandler(udp.ProtocolNumber, ns.wrapProtoHandler(udpFwd.HandlePacket))
 	go ns.injectOutbound()
 	ns.tundev.PostFilterIn = ns.injectInbound
 	return nil
 }
 
-// DNSMap maps MagicDNS names (both base + FQDN) to their first IP.
-// It should not be mutated once created.
-type DNSMap map[string]netaddr.IP
-
-func DNSMapFromNetworkMap(nm *netmap.NetworkMap) DNSMap {
-	ret := make(DNSMap)
-	suffix := nm.MagicDNSSuffix()
-	have4 := false
-	if nm.Name != "" && len(nm.Addresses) > 0 {
-		ip := nm.Addresses[0].IP()
-		ret[strings.TrimRight(nm.Name, ".")] = ip
-		if dnsname.HasSuffix(nm.Name, suffix) {
-			ret[dnsname.TrimSuffix(nm.Name, suffix)] = ip
-		}
-		for _, a := range nm.Addresses {
-			if a.IP().Is4() {
-				have4 = true
-			}
-		}
-	}
-	for _, p := range nm.Peers {
-		if p.Name == "" {
-			continue
-		}
-		for _, a := range p.Addresses {
-			ip := a.IP()
-			if ip.Is4() && !have4 {
-				continue
-			}
-			ret[strings.TrimRight(p.Name, ".")] = ip
-			if dnsname.HasSuffix(p.Name, suffix) {
-				ret[dnsname.TrimSuffix(p.Name, suffix)] = ip
-			}
-			break
-		}
-	}
-	return ret
-}
-
-func (ns *Impl) updateDNS(nm *netmap.NetworkMap) {
-	ns.mu.Lock()
-	defer ns.mu.Unlock()
-	ns.dns = DNSMapFromNetworkMap(nm)
-}
-
-func (ns *Impl) addSubnetAddress(pn tcpip.NetworkProtocolNumber, ip netaddr.IP) {
+func (ns *Impl) addSubnetAddress(ip netaddr.IP) {
 	ns.mu.Lock()
 	ns.connsOpenBySubnetIP[ip]++
 	needAdd := ns.connsOpenBySubnetIP[ip] == 1
 	ns.mu.Unlock()
 	// Only register address into netstack for first concurrent connection.
 	if needAdd {
-		ns.ipstack.AddAddress(nicID, pn, tcpip.Address(ip.IPAddr().IP))
+		pa := tcpip.ProtocolAddress{
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   tcpip.Address(ip.IPAddr().IP),
+				PrefixLen: int(ip.BitLen()),
+			},
+		}
+		if ip.Is4() {
+			pa.Protocol = ipv4.ProtocolNumber
+		} else if ip.Is6() {
+			pa.Protocol = ipv6.ProtocolNumber
+		}
+		ns.ipstack.AddProtocolAddress(nicID, pa, stack.AddressProperties{
+			PEB:        stack.CanBePrimaryEndpoint, // zero value default
+			ConfigType: stack.AddressConfigStatic,  // zero value default
+		})
 	}
 }
 
@@ -244,25 +258,36 @@ func ipPrefixToAddressWithPrefix(ipp netaddr.IPPrefix) tcpip.AddressWithPrefix {
 	}
 }
 
+var v4broadcast = netaddr.IPv4(255, 255, 255, 255)
+
 func (ns *Impl) updateIPs(nm *netmap.NetworkMap) {
 	ns.atomicIsLocalIPFunc.Store(tsaddr.NewContainsIPFunc(nm.Addresses))
-	ns.updateDNS(nm)
 
 	oldIPs := make(map[tcpip.AddressWithPrefix]bool)
 	for _, protocolAddr := range ns.ipstack.AllAddresses()[nicID] {
-		oldIPs[protocolAddr.AddressWithPrefix] = true
+		ap := protocolAddr.AddressWithPrefix
+		ip := netaddrIPFromNetstackIP(ap.Address)
+		if ip == v4broadcast && ap.PrefixLen == 32 {
+			// Don't add 255.255.255.255/32 to oldIPs so we don't
+			// delete it later. We didn't install it, so it's not
+			// ours to delete.
+			continue
+		}
+		oldIPs[ap] = true
 	}
 	newIPs := make(map[tcpip.AddressWithPrefix]bool)
 
 	isAddr := map[netaddr.IPPrefix]bool{}
-	for _, ipp := range nm.SelfNode.Addresses {
-		isAddr[ipp] = true
-	}
-	for _, ipp := range nm.SelfNode.AllowedIPs {
-		if ns.onlySubnets && isAddr[ipp] {
-			continue
+	if nm.SelfNode != nil {
+		for _, ipp := range nm.SelfNode.Addresses {
+			isAddr[ipp] = true
+			newIPs[ipPrefixToAddressWithPrefix(ipp)] = true
 		}
-		newIPs[ipPrefixToAddressWithPrefix(ipp)] = true
+		for _, ipp := range nm.SelfNode.AllowedIPs {
+			if !isAddr[ipp] && ns.ProcessSubnets {
+				newIPs[ipPrefixToAddressWithPrefix(ipp)] = true
+			}
+		}
 	}
 
 	ipsToBeAdded := make(map[tcpip.AddressWithPrefix]bool)
@@ -293,12 +318,19 @@ func (ns *Impl) updateIPs(nm *netmap.NetworkMap) {
 		}
 	}
 	for ipp := range ipsToBeAdded {
-		var err tcpip.Error
-		if ipp.Address.To4() == "" {
-			err = ns.ipstack.AddAddressWithPrefix(nicID, ipv6.ProtocolNumber, ipp)
-		} else {
-			err = ns.ipstack.AddAddressWithPrefix(nicID, ipv4.ProtocolNumber, ipp)
+		pa := tcpip.ProtocolAddress{
+			AddressWithPrefix: ipp,
 		}
+		if ipp.Address.To4() == "" {
+			pa.Protocol = ipv6.ProtocolNumber
+		} else {
+			pa.Protocol = ipv4.ProtocolNumber
+		}
+		var err tcpip.Error
+		err = ns.ipstack.AddProtocolAddress(nicID, pa, stack.AddressProperties{
+			PEB:        stack.CanBePrimaryEndpoint, // zero value default
+			ConfigType: stack.AddressConfigStatic,  // zero value default
+		})
 		if err != nil {
 			ns.logf("netstack: could not register IP %s: %v", ipp, err)
 		} else {
@@ -307,65 +339,14 @@ func (ns *Impl) updateIPs(nm *netmap.NetworkMap) {
 	}
 }
 
-// Resolve resolves addr into an IP:port using first the MagicDNS contents
-// of m, else using the system resolver.
-func (m DNSMap) Resolve(ctx context.Context, addr string) (netaddr.IPPort, error) {
-	ipp, pippErr := netaddr.ParseIPPort(addr)
-	if pippErr == nil {
-		return ipp, nil
-	}
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		// addr is malformed.
-		return netaddr.IPPort{}, err
-	}
-	if net.ParseIP(host) != nil {
-		// The host part of addr was an IP, so the netaddr.ParseIPPort above should've
-		// passed. Must've been a bad port number. Return the original error.
-		return netaddr.IPPort{}, pippErr
-	}
-	port16, err := strconv.ParseUint(port, 10, 16)
-	if err != nil {
-		return netaddr.IPPort{}, fmt.Errorf("invalid port in address %q", addr)
-	}
-
-	// Host is not an IP, so assume it's a DNS name.
-
-	// Try MagicDNS first, else otherwise a real DNS lookup.
-	ip := m[host]
-	if !ip.IsZero() {
-		return netaddr.IPPortFrom(ip, uint16(port16)), nil
-	}
-
-	// No MagicDNS name so try real DNS.
-	var r net.Resolver
-	ips, err := r.LookupIP(ctx, "ip", host)
-	if err != nil {
-		return netaddr.IPPort{}, err
-	}
-	if len(ips) == 0 {
-		return netaddr.IPPort{}, fmt.Errorf("DNS lookup returned no results for %q", host)
-	}
-	ip, _ = netaddr.FromStdIP(ips[0])
-	return netaddr.IPPortFrom(ip, uint16(port16)), nil
-}
-
-func (ns *Impl) DialContextTCP(ctx context.Context, addr string) (*gonet.TCPConn, error) {
-	ns.mu.Lock()
-	dnsMap := ns.dns
-	ns.mu.Unlock()
-
-	remoteIPPort, err := dnsMap.Resolve(ctx, addr)
-	if err != nil {
-		return nil, err
-	}
+func (ns *Impl) DialContextTCP(ctx context.Context, ipp netaddr.IPPort) (*gonet.TCPConn, error) {
 	remoteAddress := tcpip.FullAddress{
 		NIC:  nicID,
-		Addr: tcpip.Address(remoteIPPort.IP().IPAddr().IP),
-		Port: remoteIPPort.Port(),
+		Addr: tcpip.Address(ipp.IP().IPAddr().IP),
+		Port: ipp.Port(),
 	}
 	var ipType tcpip.NetworkProtocolNumber
-	if remoteIPPort.IP().Is4() {
+	if ipp.IP().Is4() {
 		ipType = ipv4.ProtocolNumber
 	} else {
 		ipType = ipv6.ProtocolNumber
@@ -374,22 +355,14 @@ func (ns *Impl) DialContextTCP(ctx context.Context, addr string) (*gonet.TCPConn
 	return gonet.DialContextTCP(ctx, ns.ipstack, remoteAddress, ipType)
 }
 
-func (ns *Impl) DialContextUDP(ctx context.Context, addr string) (*gonet.UDPConn, error) {
-	ns.mu.Lock()
-	dnsMap := ns.dns
-	ns.mu.Unlock()
-
-	remoteIPPort, err := dnsMap.Resolve(ctx, addr)
-	if err != nil {
-		return nil, err
-	}
+func (ns *Impl) DialContextUDP(ctx context.Context, ipp netaddr.IPPort) (*gonet.UDPConn, error) {
 	remoteAddress := &tcpip.FullAddress{
 		NIC:  nicID,
-		Addr: tcpip.Address(remoteIPPort.IP().IPAddr().IP),
-		Port: remoteIPPort.Port(),
+		Addr: tcpip.Address(ipp.IP().IPAddr().IP),
+		Port: ipp.Port(),
 	}
 	var ipType tcpip.NetworkProtocolNumber
-	if remoteIPPort.IP().Is4() {
+	if ipp.IP().Is4() {
 		ipType = ipv4.ProtocolNumber
 	} else {
 		ipType = ipv6.ProtocolNumber
@@ -400,12 +373,15 @@ func (ns *Impl) DialContextUDP(ctx context.Context, addr string) (*gonet.UDPConn
 
 func (ns *Impl) injectOutbound() {
 	for {
-		packetInfo, ok := ns.linkEP.ReadContext(context.Background())
-		if !ok {
+		pkt := ns.linkEP.ReadContext(ns.ctx)
+		if pkt == nil {
+			if ns.ctx.Err() != nil {
+				// Return without logging.
+				return
+			}
 			ns.logf("[v2] ReadContext-for-write = ok=false")
 			continue
 		}
-		pkt := packetInfo.Pkt
 		hdrNetwork := pkt.NetworkHeader()
 		hdrTransport := pkt.TransportHeader()
 
@@ -413,7 +389,7 @@ func (ns *Impl) injectOutbound() {
 		full = append(full, hdrNetwork.View()...)
 		full = append(full, hdrTransport.View()...)
 		full = append(full, pkt.Data().AsRange().AsView()...)
-		if debugNetstack {
+		if debugPackets {
 			ns.logf("[v2] packet Write out: % x", full)
 		}
 		if err := ns.tundev.InjectOutbound(full); err != nil {
@@ -430,13 +406,159 @@ func (ns *Impl) isLocalIP(ip netaddr.IP) bool {
 	return ns.atomicIsLocalIPFunc.Load().(func(netaddr.IP) bool)(ip)
 }
 
+func (ns *Impl) processSSH() bool {
+	return ns.lb != nil && ns.lb.ShouldRunSSH()
+}
+
+func (ns *Impl) peerAPIPortAtomic(ip netaddr.IP) *uint32 {
+	if ip.Is4() {
+		return &ns.peerapiPort4Atomic
+	} else {
+		return &ns.peerapiPort6Atomic
+	}
+}
+
+// shouldProcessInbound reports whether an inbound packet should be
+// handled by netstack.
+func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
+	// Handle incoming peerapi connections in netstack.
+	if ns.lb != nil && p.IPProto == ipproto.TCP {
+		var peerAPIPort uint16
+		dstIP := p.Dst.IP()
+		if p.TCPFlags&packet.TCPSynAck == packet.TCPSyn && ns.isLocalIP(dstIP) {
+			if port, ok := ns.lb.GetPeerAPIPort(p.Dst.IP()); ok {
+				peerAPIPort = port
+				atomic.StoreUint32(ns.peerAPIPortAtomic(dstIP), uint32(port))
+			}
+		} else {
+			peerAPIPort = uint16(atomic.LoadUint32(ns.peerAPIPortAtomic(dstIP)))
+		}
+		if p.IPProto == ipproto.TCP && p.Dst.Port() == peerAPIPort {
+			return true
+		}
+	}
+	if ns.isInboundTSSH(p) && ns.processSSH() {
+		return true
+	}
+	if !ns.ProcessLocalIPs && !ns.ProcessSubnets {
+		// Fast path for common case (e.g. Linux server in TUN mode) where
+		// netstack isn't used at all; don't even do an isLocalIP lookup.
+		return false
+	}
+	isLocal := ns.isLocalIP(p.Dst.IP())
+	if ns.ProcessLocalIPs && isLocal {
+		return true
+	}
+	if ns.ProcessSubnets && !isLocal {
+		return true
+	}
+	return false
+}
+
+// setAmbientCapsRaw is non-nil on Linux for Synology, to run ping with
+// CAP_NET_RAW from tailscaled's binary.
+var setAmbientCapsRaw func(*exec.Cmd)
+
+var userPingSem = syncs.NewSemaphore(20) // 20 child ping processes at once
+
+var isSynology = runtime.GOOS == "linux" && distro.Get() == distro.Synology
+
+// userPing tried to ping dstIP and if it succeeds, injects pingResPkt
+// into the tundev.
+//
+// It's used in userspace/netstack mode when we don't have kernel
+// support or raw socket access. As such, this does the dumbest thing
+// that can work: runs the ping command. It's not super efficient, so
+// it bounds the number of pings going on at once. The idea is that
+// people only use ping occasionally to see if their internet's working
+// so this doesn't need to be great.
+//
+// TODO(bradfitz): when we're running on Windows as the system user, use
+// raw socket APIs instead of ping child processes.
+func (ns *Impl) userPing(dstIP netaddr.IP, pingResPkt []byte) {
+	if !userPingSem.TryAcquire() {
+		return
+	}
+	defer userPingSem.Release()
+
+	t0 := time.Now()
+	var err error
+	switch runtime.GOOS {
+	case "windows":
+		err = exec.Command("ping", "-n", "1", "-w", "3000", dstIP.String()).Run()
+	case "darwin":
+		// Note: 2000 ms is actually 1 second + 2,000
+		// milliseconds extra for 3 seconds total.
+		// See https://github.com/tailscale/tailscale/pull/3753 for details.
+		err = exec.Command("ping", "-c", "1", "-W", "2000", dstIP.String()).Run()
+	case "android":
+		ping := "/system/bin/ping"
+		if dstIP.Is6() {
+			ping = "/system/bin/ping6"
+		}
+		err = exec.Command(ping, "-c", "1", "-w", "3", dstIP.String()).Run()
+	default:
+		ping := "ping"
+		if isSynology {
+			ping = "/bin/ping"
+		}
+		cmd := exec.Command(ping, "-c", "1", "-W", "3", dstIP.String())
+		if isSynology && os.Getuid() != 0 {
+			// On DSM7 we run as non-root and need to pass
+			// CAP_NET_RAW if our binary has it.
+			setAmbientCapsRaw(cmd)
+		}
+		err = cmd.Run()
+	}
+	d := time.Since(t0)
+	if err != nil {
+		if d < time.Second/2 {
+			// If it failed quicker than the 3 second
+			// timeout we gave above (500 ms is a
+			// reasonable threshold), then assume the ping
+			// failed for problems finding/running
+			// ping. We don't want to log if the host is
+			// just down.
+			ns.logf("exec ping of %v failed in %v: %v", dstIP, d, err)
+		}
+		return
+	}
+	if debugNetstack {
+		ns.logf("exec pinged %v in %v", dstIP, time.Since(t0))
+	}
+	if err := ns.tundev.InjectOutbound(pingResPkt); err != nil {
+		ns.logf("InjectOutbound ping response: %v", err)
+	}
+}
+
+func (ns *Impl) isInboundTSSH(p *packet.Parsed) bool {
+	return p.IPProto == ipproto.TCP &&
+		p.Dst.Port() == 22 &&
+		ns.isLocalIP(p.Dst.IP())
+}
+
 func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
-	if ns.onlySubnets && ns.isLocalIP(p.Dst.IP()) {
-		// In hybrid ("only subnets") mode, bail out early if
-		// the traffic is destined for an actual Tailscale
-		// address. The real host OS interface will handle it.
+	if !ns.shouldProcessInbound(p, t) {
+		// Let the host network stack (if any) deal with it.
 		return filter.Accept
 	}
+
+	destIP := p.Dst.IP()
+	if p.IsEchoRequest() && ns.ProcessSubnets && !tsaddr.IsTailscaleIP(destIP) {
+		var pong []byte // the reply to the ping, if our relayed ping works
+		if destIP.Is4() {
+			h := p.ICMP4Header()
+			h.ToResponse()
+			pong = packet.Generate(&h, p.Payload())
+		} else if destIP.Is6() {
+			h := p.ICMP6Header()
+			h.ToResponse()
+			pong = packet.Generate(&h, p.Payload())
+		}
+		go ns.userPing(destIP, pong)
+		return filter.DropSilently
+	}
+
 	var pn tcpip.NetworkProtocolNumber
 	switch p.IPVersion {
 	case 4:
@@ -444,7 +566,8 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 	case 6:
 		pn = header.IPv6ProtocolNumber
 	}
-	if debugNetstack {
+	p.RemoveECNBits() // Issue 2642
+	if debugPackets {
 		ns.logf("[v2] packet in (from %v): % x", p.Src, p.Buffer())
 	}
 	vv := buffer.View(append([]byte(nil), p.Buffer()...)).ToVectorisedView()
@@ -452,6 +575,7 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 		Data: vv,
 	})
 	ns.linkEP.InjectInbound(pn, packetBuf)
+	packetBuf.DecRef()
 
 	// We've now delivered this to netstack, so we're done.
 	// Instead of returning a filter.Accept here (which would also
@@ -462,47 +586,99 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper) filter.Respons
 	return filter.DropSilently
 }
 
+func netaddrIPFromNetstackIP(s tcpip.Address) netaddr.IP {
+	switch len(s) {
+	case 4:
+		return netaddr.IPv4(s[0], s[1], s[2], s[3])
+	case 16:
+		var a [16]byte
+		copy(a[:], s)
+		return netaddr.IPFrom16(a)
+	}
+	return netaddr.IP{}
+}
+
 func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	reqDetails := r.ID()
 	if debugNetstack {
 		ns.logf("[v2] TCP ForwarderRequest: %s", stringifyTEI(reqDetails))
 	}
-	dialAddr := reqDetails.LocalAddress
-	dialNetAddr, _ := netaddr.FromStdIP(net.IP(dialAddr))
-	isTailscaleIP := tsaddr.IsTailscaleIP(dialNetAddr)
+	clientRemoteIP := netaddrIPFromNetstackIP(reqDetails.RemoteAddress)
+	if !clientRemoteIP.IsValid() {
+		ns.logf("invalid RemoteAddress in TCP ForwarderRequest: %s", stringifyTEI(reqDetails))
+		r.Complete(true) // sends a RST
+		return
+	}
+
+	dialIP := netaddrIPFromNetstackIP(reqDetails.LocalAddress)
+	isTailscaleIP := tsaddr.IsTailscaleIP(dialIP)
 	defer func() {
 		if !isTailscaleIP {
 			// if this is a subnet IP, we added this in before the TCP handshake
 			// so netstack is happy TCP-handshaking as a subnet IP
-			ns.removeSubnetAddress(dialNetAddr)
+			ns.removeSubnetAddress(dialIP)
 		}
 	}()
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
-		r.Complete(true)
+		ns.logf("CreateEndpoint error for %s: %v", stringifyTEI(reqDetails), err)
+		r.Complete(true) // sends a RST
 		return
 	}
 	r.Complete(false)
+
+	// The ForwarderRequest.CreateEndpoint above asynchronously
+	// starts the TCP handshake. Note that the gonet.TCPConn
+	// methods c.RemoteAddr() and c.LocalAddr() will return nil
+	// until the handshake actually completes. But we have the
+	// remote address in reqDetails instead, so we don't use
+	// gonet.TCPConn.RemoteAddr. The byte copies in both
+	// directions to/from the gonet.TCPConn in forwardTCP will
+	// block until the TCP handshake is complete.
 	c := gonet.NewTCPConn(&wq, ep)
+
+	if ns.lb != nil {
+		if reqDetails.LocalPort == 22 && ns.processSSH() && ns.isLocalIP(dialIP) && handleSSH != nil {
+			ns.logf("handling SSH connection....")
+			if err := handleSSH(ns.logf, ns.lb, c); err != nil {
+				ns.logf("ssh error: %v", err)
+			} else {
+				ns.logf("ssh: ok")
+			}
+			return
+		}
+		if port, ok := ns.lb.GetPeerAPIPort(dialIP); ok {
+			if reqDetails.LocalPort == port && ns.isLocalIP(dialIP) {
+				src := netaddr.IPPortFrom(clientRemoteIP, reqDetails.RemotePort)
+				dst := netaddr.IPPortFrom(dialIP, port)
+				ns.lb.ServePeerAPIConnection(src, dst, c)
+				return
+			}
+		}
+	}
 	if ns.ForwardTCPIn != nil {
 		ns.ForwardTCPIn(c, reqDetails.LocalPort)
 		return
 	}
 	if isTailscaleIP {
-		dialAddr = tcpip.Address(net.ParseIP("127.0.0.1")).To4()
+		dialIP = netaddr.IPv4(127, 0, 0, 1)
 	}
-	ns.forwardTCP(c, &wq, dialAddr, reqDetails.LocalPort)
+	dialAddr := netaddr.IPPortFrom(dialIP, uint16(reqDetails.LocalPort))
+	ns.forwardTCP(c, clientRemoteIP, &wq, dialAddr)
 }
 
-func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, dialAddr tcpip.Address, dialPort uint16) {
+func (ns *Impl) forwardTCP(client *gonet.TCPConn, clientRemoteIP netaddr.IP, wq *waiter.Queue, dialAddr netaddr.IPPort) {
 	defer client.Close()
-	dialAddrStr := net.JoinHostPort(dialAddr.String(), strconv.Itoa(int(dialPort)))
-	ns.logf("[v2] netstack: forwarding incoming connection to %s", dialAddrStr)
+	dialAddrStr := dialAddr.String()
+	if debugNetstack {
+		ns.logf("[v2] netstack: forwarding incoming connection to %s", dialAddrStr)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-	wq.EventRegister(&waitEntry, waiter.EventHUp)
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventHUp) // TODO(bradfitz): right EventMask?
+	wq.EventRegister(&waitEntry)
 	defer wq.EventUnregister(&waitEntry)
 	done := make(chan bool)
 	// netstack doesn't close the notification channel automatically if there was no
@@ -511,6 +687,9 @@ func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, dialAddr tcp
 	go func() {
 		select {
 		case <-notifyCh:
+			if debugNetstack {
+				ns.logf("[v2] netstack: forwardTCP notifyCh fired; canceling context for %s", dialAddrStr)
+			}
 		case <-done:
 		}
 		cancel()
@@ -524,7 +703,6 @@ func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, dialAddr tcp
 	defer server.Close()
 	backendLocalAddr := server.LocalAddr().(*net.TCPAddr)
 	backendLocalIPPort, _ := netaddr.FromStdAddr(backendLocalAddr.IP, backendLocalAddr.Port, backendLocalAddr.Zone)
-	clientRemoteIP, _ := netaddr.FromStdIP(client.RemoteAddr().(*net.TCPAddr).IP)
 	ns.e.RegisterIPPortIdentity(backendLocalIPPort, clientRemoteIP)
 	defer ns.e.UnregisterIPPortIdentity(backendLocalIPPort)
 	connClosed := make(chan error, 2)
@@ -544,9 +722,9 @@ func (ns *Impl) forwardTCP(client *gonet.TCPConn, wq *waiter.Queue, dialAddr tcp
 }
 
 func (ns *Impl) acceptUDP(r *udp.ForwarderRequest) {
-	reqDetails := r.ID()
+	sess := r.ID()
 	if debugNetstack {
-		ns.logf("[v2] UDP ForwarderRequest: %v", stringifyTEI(reqDetails))
+		ns.logf("[v2] UDP ForwarderRequest: %v", stringifyTEI(sess))
 	}
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
@@ -554,30 +732,52 @@ func (ns *Impl) acceptUDP(r *udp.ForwarderRequest) {
 		ns.logf("acceptUDP: could not create endpoint: %v", err)
 		return
 	}
-	localAddr, err := ep.GetLocalAddress()
-	if err != nil {
+	dstAddr, ok := ipPortOfNetstackAddr(sess.LocalAddress, sess.LocalPort)
+	if !ok {
 		return
 	}
-	remoteAddr, err := ep.GetRemoteAddress()
-	if err != nil {
+	srcAddr, ok := ipPortOfNetstackAddr(sess.RemoteAddress, sess.RemotePort)
+	if !ok {
 		return
 	}
+
 	c := gonet.NewUDPConn(ns.ipstack, &wq, ep)
-	go ns.forwardUDP(c, &wq, localAddr, remoteAddr)
+	go ns.forwardUDP(c, &wq, srcAddr, dstAddr)
 }
 
-func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, clientLocalAddr, clientRemoteAddr tcpip.FullAddress) {
-	port := clientLocalAddr.Port
-	ns.logf("[v2] netstack: forwarding incoming UDP connection on port %v", port)
-	backendListenAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(clientRemoteAddr.Port)}
-	backendRemoteAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(port)}
-	backendConn, err := net.ListenUDP("udp4", backendListenAddr)
+// forwardUDP proxies between client (with addr clientAddr) and dstAddr.
+//
+// dstAddr may be either a local Tailscale IP, in which we case we proxy to
+// 127.0.0.1, or any other IP (from an advertised subnet), in which case we
+// proxy to it directly.
+func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, clientAddr, dstAddr netaddr.IPPort) {
+	port, srcPort := dstAddr.Port(), clientAddr.Port()
+	if debugNetstack {
+		ns.logf("[v2] netstack: forwarding incoming UDP connection on port %v", port)
+	}
+
+	var backendListenAddr *net.UDPAddr
+	var backendRemoteAddr *net.UDPAddr
+	isLocal := ns.isLocalIP(dstAddr.IP())
+	if isLocal {
+		backendRemoteAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(port)}
+		backendListenAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(srcPort)}
+	} else {
+		backendRemoteAddr = dstAddr.UDPAddr()
+		if dstAddr.IP().Is4() {
+			backendListenAddr = &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: int(srcPort)}
+		} else {
+			backendListenAddr = &net.UDPAddr{IP: net.ParseIP("::"), Port: int(srcPort)}
+		}
+	}
+
+	backendConn, err := net.ListenUDP("udp", backendListenAddr)
 	if err != nil {
-		ns.logf("netstack: could not bind local port %v: %v, trying again with random port", clientRemoteAddr.Port, err)
+		ns.logf("netstack: could not bind local port %v: %v, trying again with random port", backendListenAddr.Port, err)
 		backendListenAddr.Port = 0
-		backendConn, err = net.ListenUDP("udp4", backendListenAddr)
+		backendConn, err = net.ListenUDP("udp", backendListenAddr)
 		if err != nil {
-			ns.logf("netstack: could not connect to local UDP server on port %v: %v", port, err)
+			ns.logf("netstack: could not create UDP socket, preventing forwarding to %v: %v", dstAddr, err)
 			return
 		}
 	}
@@ -586,28 +786,47 @@ func (ns *Impl) forwardUDP(client *gonet.UDPConn, wq *waiter.Queue, clientLocalA
 	if !ok {
 		ns.logf("could not get backend local IP:port from %v:%v", backendLocalAddr.IP, backendLocalAddr.Port)
 	}
-	clientRemoteIP, _ := netaddr.FromStdIP(net.ParseIP(clientRemoteAddr.Addr.String()))
-	ns.e.RegisterIPPortIdentity(backendLocalIPPort, clientRemoteIP)
+	if isLocal {
+		ns.e.RegisterIPPortIdentity(backendLocalIPPort, dstAddr.IP())
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	timer := time.AfterFunc(2*time.Minute, func() {
-		ns.e.UnregisterIPPortIdentity(backendLocalIPPort)
-		ns.logf("netstack: UDP session between %s and %s timed out", clientRemoteAddr, backendRemoteAddr)
+
+	idleTimeout := 2 * time.Minute
+	if port == 53 {
+		// Make DNS packet copies time out much sooner.
+		//
+		// TODO(bradfitz): make DNS queries over UDP forwarding even
+		// cheaper by adding an additional idleTimeout post-DNS-reply.
+		// For instance, after the DNS response goes back out, then only
+		// wait a few seconds (or zero, really)
+		idleTimeout = 30 * time.Second
+	}
+	timer := time.AfterFunc(idleTimeout, func() {
+		if isLocal {
+			ns.e.UnregisterIPPortIdentity(backendLocalIPPort)
+		}
+		ns.logf("netstack: UDP session between %s and %s timed out", backendListenAddr, backendRemoteAddr)
 		cancel()
 		client.Close()
 		backendConn.Close()
 	})
 	extend := func() {
-		timer.Reset(2 * time.Minute)
+		timer.Reset(idleTimeout)
 	}
-	startPacketCopy(ctx, cancel, client, &net.UDPAddr{
-		IP:   net.ParseIP(clientRemoteAddr.Addr.String()),
-		Port: int(clientRemoteAddr.Port),
-	}, backendConn, ns.logf, extend)
+	startPacketCopy(ctx, cancel, client, clientAddr.UDPAddr(), backendConn, ns.logf, extend)
 	startPacketCopy(ctx, cancel, backendConn, backendRemoteAddr, client, ns.logf, extend)
-
+	if isLocal {
+		// Wait for the copies to be done before decrementing the
+		// subnet address count to potentially remove the route.
+		<-ctx.Done()
+		ns.removeSubnetAddress(dstAddr.IP())
+	}
 }
 
 func startPacketCopy(ctx context.Context, cancel context.CancelFunc, dst net.PacketConn, dstAddr net.Addr, src net.PacketConn, logf logger.Logf, extend func()) {
+	if debugNetstack {
+		logf("[v2] netstack: startPacketCopy to %v (%T) from %T", dstAddr, dst, src)
+	}
 	go func() {
 		defer cancel() // tear down the other direction's copy
 		pkt := make([]byte, mtu)
@@ -643,4 +862,8 @@ func stringifyTEI(tei stack.TransportEndpointID) string {
 	localHostPort := net.JoinHostPort(tei.LocalAddress.String(), strconv.Itoa(int(tei.LocalPort)))
 	remoteHostPort := net.JoinHostPort(tei.RemoteAddress.String(), strconv.Itoa(int(tei.RemotePort)))
 	return fmt.Sprintf("%s -> %s", remoteHostPort, localHostPort)
+}
+
+func ipPortOfNetstackAddr(a tcpip.Address, port uint16) (ipp netaddr.IPPort, ok bool) {
+	return netaddr.FromStdAddr(net.IP(a), int(port), "") // TODO(bradfitz): can do without allocs
 }

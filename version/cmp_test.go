@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/tstest"
 )
 
 func TestParse(t *testing.T) {
@@ -28,6 +29,7 @@ func TestParse(t *testing.T) {
 		{"date.20200612", parsed{Datestamp: 20200612}, true},
 		{"borkbork", parsed{}, false},
 		{"1a.2.3", parsed{}, false},
+		{"", parsed{}, false},
 	}
 
 	for _, test := range tests {
@@ -37,6 +39,12 @@ func TestParse(t *testing.T) {
 		}
 		if diff := cmp.Diff(gotParsed, test.parsed); diff != "" {
 			t.Errorf("parse(%q) diff (-got+want):\n%s", test.version, diff)
+		}
+		err := tstest.MinAllocsPerRun(t, 0, func() {
+			gotParsed, got = parse(test.version)
+		})
+		if err != nil {
+			t.Errorf("parse(%q): %v", test.version, err)
 		}
 	}
 }

@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin,amd64,!go1.16 darwin,go1.16
-// +build !ios
+//go:build darwin && !ios
+// +build darwin,!ios
 
 package portlist
 
@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
@@ -99,10 +98,8 @@ func addProcesses(pl []Port) ([]Port, error) {
 				switch {
 				case p != nil:
 					p.Process = cmd
-				case isLoopbackAddr(val):
-					// ignore
 				default:
-					fmt.Fprintf(os.Stderr, "weird: missing %v\n", pp)
+					// ignore: processes and ports come and go
 				}
 			}
 		}

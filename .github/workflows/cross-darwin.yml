@@ -17,9 +17,9 @@ jobs:
     steps:
 
     - name: Set up Go
-      uses: actions/setup-go@v1
+      uses: actions/setup-go@v2.1.5
       with:
-        go-version: 1.16
+        go-version: 1.17
       id: go
 
     - name: Check out code into the Go module directory
@@ -36,6 +36,12 @@ jobs:
         GOOS: darwin
         GOARCH: amd64
       run: for d in $(go list -f '{{if .TestGoFiles}}{{.Dir}}{{end}}' ./... ); do (echo $d; cd $d && go test -c ); done
+
+    - name: iOS build most
+      env:
+        GOOS: ios
+        GOARCH: arm64
+      run: go install ./ipn/... ./wgengine/ ./types/... ./control/controlclient
 
     - uses: k0kubun/action-slack@v2.0.0
       with:

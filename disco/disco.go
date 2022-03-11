@@ -25,7 +25,9 @@ import (
 	"fmt"
 	"net"
 
+	"go4.org/mem"
 	"inet.af/netaddr"
+	"tailscale.com/types/key"
 )
 
 // Magic is the 6 byte header of all discovery messages.
@@ -55,6 +57,16 @@ func LooksLikeDiscoWrapper(p []byte) bool {
 		return false
 	}
 	return string(p[:len(Magic)]) == Magic
+}
+
+// Source returns the slice of p that represents the
+// disco public key source, and whether p looks like
+// a disco message.
+func Source(p []byte) (src []byte, ok bool) {
+	if !LooksLikeDiscoWrapper(p) {
+		return nil, false
+	}
+	return p[len(Magic):][:keyLen], true
 }
 
 // Parse parses the encrypted part of the message from inside the
@@ -96,12 +108,28 @@ func appendMsgHeader(b []byte, t MessageType, ver uint8, dataLen int) (all, data
 }
 
 type Ping struct {
+	// TxID is a random client-generated per-ping transaction ID.
 	TxID [12]byte
+
+	// NodeKey is allegedly the ping sender's wireguard public key.
+	// Old clients (~1.16.0 and earlier) don't send this field.
+	// It shouldn't be trusted by itself, but can be combined with
+	// netmap data to reduce the discokey:nodekey relation from 1:N to
+	// 1:1.
+	NodeKey key.NodePublic
 }
 
 func (m *Ping) AppendMarshal(b []byte) []byte {
-	ret, d := appendMsgHeader(b, TypePing, v0, 12)
-	copy(d, m.TxID[:])
+	dataLen := 12
+	hasKey := !m.NodeKey.IsZero()
+	if hasKey {
+		dataLen += key.NodePublicRawLen
+	}
+	ret, d := appendMsgHeader(b, TypePing, v0, dataLen)
+	n := copy(d, m.TxID[:])
+	if hasKey {
+		m.NodeKey.AppendTo(d[:n])
+	}
 	return ret
 }
 
@@ -110,7 +138,12 @@ func parsePing(ver uint8, p []byte) (m *Ping, err error) {
 		return nil, errShort
 	}
 	m = new(Ping)
-	copy(m.TxID[:], p)
+	p = p[copy(m.TxID[:], p):]
+	// Deliberately lax on longer-than-expected messages, for future
+	// compatibility.
+	if len(p) >= key.NodePublicRawLen {
+		m.NodeKey = key.NodePublicFromRaw32(mem.B(p[:key.NodePublicRawLen]))
+	}
 	return m, nil
 }
 

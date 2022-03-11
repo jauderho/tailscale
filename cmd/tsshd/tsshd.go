@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !windows
 // +build !windows
 
 // The tsshd binary is an SSH server that accepts connections
@@ -29,8 +30,8 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
-	"github.com/kr/pty"
 	gossh "golang.org/x/crypto/ssh"
 	"inet.af/netaddr"
 	"tailscale.com/net/interfaces"
@@ -156,8 +157,9 @@ func handleSSH(s ssh.Session) {
 		cmd.Process.Kill()
 		if err := cmd.Wait(); err != nil {
 			s.Exit(1)
+		} else {
+			s.Exit(0)
 		}
-		s.Exit(0)
 		return
 	}
 

@@ -15,12 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"go4.org/mem"
 	"inet.af/netaddr"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
+	"tailscale.com/types/key"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
-	"tailscale.com/types/wgkey"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
@@ -41,13 +43,12 @@ func TestPrefsEqual(t *testing.T) {
 		"ExitNodeIP",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
+		"RunSSH",
 		"WantRunning",
 		"LoggedOut",
 		"ShieldsUp",
 		"AdvertiseTags",
 		"Hostname",
-		"OSVersion",
-		"DeviceModel",
 		"NotepadURLs",
 		"ForceDaemon",
 		"AdvertiseRoutes",
@@ -406,7 +407,7 @@ func TestPrefsPretty(t *testing.T) {
 		{
 			Prefs{
 				Persist: &persist.Persist{
-					PrivateNodeKey: wgkey.Private{1: 1},
+					PrivateNodeKey: key.NodePrivateFromRaw32(mem.B([]byte{1: 1, 31: 0})),
 				},
 			},
 			"linux",
@@ -562,8 +563,8 @@ func TestPrefsApplyEdits(t *testing.T) {
 			},
 			edit: &MaskedPrefs{
 				Prefs: Prefs{
-					Hostname:    "bar",
-					DeviceModel: "ignore-this", // not set
+					Hostname:     "bar",
+					OperatorUser: "ignore-this", // not set
 				},
 				HostnameSet: true,
 			},
@@ -576,15 +577,15 @@ func TestPrefsApplyEdits(t *testing.T) {
 			prefs: &Prefs{},
 			edit: &MaskedPrefs{
 				Prefs: Prefs{
-					Hostname:    "bar",
-					DeviceModel: "galaxybrain",
+					Hostname:     "bar",
+					OperatorUser: "galaxybrain",
 				},
-				HostnameSet:    true,
-				DeviceModelSet: true,
+				HostnameSet:     true,
+				OperatorUserSet: true,
 			},
 			want: &Prefs{
-				Hostname:    "bar",
-				DeviceModel: "galaxybrain",
+				Hostname:     "bar",
+				OperatorUser: "galaxybrain",
 			},
 		},
 	}
@@ -614,15 +615,30 @@ func TestMaskedPrefsPretty(t *testing.T) {
 			m: &MaskedPrefs{
 				Prefs: Prefs{
 					Hostname:         "bar",
-					DeviceModel:      "galaxybrain",
+					OperatorUser:     "galaxybrain",
 					AllowSingleHosts: true,
 					RouteAll:         false,
+					ExitNodeID:       "foo",
+					AdvertiseTags:    []string{"tag:foo", "tag:bar"},
+					NetfilterMode:    preftype.NetfilterNoDivert,
 				},
-				RouteAllSet:    true,
-				HostnameSet:    true,
-				DeviceModelSet: true,
+				RouteAllSet:      true,
+				HostnameSet:      true,
+				OperatorUserSet:  true,
+				ExitNodeIDSet:    true,
+				AdvertiseTagsSet: true,
+				NetfilterModeSet: true,
 			},
-			want: `MaskedPrefs{RouteAll=false Hostname="bar" DeviceModel="galaxybrain"}`,
+			want: `MaskedPrefs{RouteAll=false ExitNodeID="foo" AdvertiseTags=["tag:foo" "tag:bar"] Hostname="bar" NetfilterMode=nodivert OperatorUser="galaxybrain"}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					ExitNodeIP: netaddr.IPv4(100, 102, 104, 105),
+				},
+				ExitNodeIPSet: true,
+			},
+			want: `MaskedPrefs{ExitNodeIP=100.102.104.105}`,
 		},
 	}
 	for i, tt := range tests {
@@ -630,5 +646,167 @@ func TestMaskedPrefsPretty(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("%d.\n got: %#q\nwant: %#q\n", i, got, tt.want)
 		}
+	}
+}
+
+func TestPrefsExitNode(t *testing.T) {
+	var p *Prefs
+	if p.AdvertisesExitNode() {
+		t.Errorf("nil shouldn't advertise exit node")
+	}
+	p = NewPrefs()
+	if p.AdvertisesExitNode() {
+		t.Errorf("default shouldn't advertise exit node")
+	}
+	p.AdvertiseRoutes = []netaddr.IPPrefix{
+		netaddr.MustParseIPPrefix("10.0.0.0/16"),
+	}
+	p.SetAdvertiseExitNode(true)
+	if got, want := len(p.AdvertiseRoutes), 3; got != want {
+		t.Errorf("routes = %d; want %d", got, want)
+	}
+	p.SetAdvertiseExitNode(true)
+	if got, want := len(p.AdvertiseRoutes), 3; got != want {
+		t.Errorf("routes = %d; want %d", got, want)
+	}
+	if !p.AdvertisesExitNode() {
+		t.Errorf("not advertising after enable")
+	}
+	p.SetAdvertiseExitNode(false)
+	if p.AdvertisesExitNode() {
+		t.Errorf("advertising after disable")
+	}
+	if got, want := len(p.AdvertiseRoutes), 1; got != want {
+		t.Errorf("routes = %d; want %d", got, want)
+	}
+}
+
+func TestExitNodeIPOfArg(t *testing.T) {
+	mustIP := netaddr.MustParseIP
+	tests := []struct {
+		name    string
+		arg     string
+		st      *ipnstate.Status
+		want    netaddr.IP
+		wantErr string
+	}{
+		{
+			name: "ip_while_stopped_okay",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				BackendState: "Stopped",
+			},
+			want: mustIP("1.2.3.4"),
+		},
+		{
+			name: "ip_not_found",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				BackendState: "Running",
+			},
+			wantErr: `no node found in netmap with IP 1.2.3.4`,
+		},
+		{
+			name: "ip_not_exit",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				BackendState: "Running",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						TailscaleIPs: []netaddr.IP{mustIP("1.2.3.4")},
+					},
+				},
+			},
+			wantErr: `node 1.2.3.4 is not advertising an exit node`,
+		},
+		{
+			name: "ip",
+			arg:  "1.2.3.4",
+			st: &ipnstate.Status{
+				BackendState: "Running",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						TailscaleIPs:   []netaddr.IP{mustIP("1.2.3.4")},
+						ExitNodeOption: true,
+					},
+				},
+			},
+			want: mustIP("1.2.3.4"),
+		},
+		{
+			name:    "no_match",
+			arg:     "unknown",
+			st:      &ipnstate.Status{MagicDNSSuffix: ".foo"},
+			wantErr: `invalid value "unknown" for --exit-node; must be IP or unique node name`,
+		},
+		{
+			name: "name",
+			arg:  "skippy",
+			st: &ipnstate.Status{
+				MagicDNSSuffix: ".foo",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:        "skippy.foo.",
+						TailscaleIPs:   []netaddr.IP{mustIP("1.0.0.2")},
+						ExitNodeOption: true,
+					},
+				},
+			},
+			want: mustIP("1.0.0.2"),
+		},
+		{
+			name: "name_not_exit",
+			arg:  "skippy",
+			st: &ipnstate.Status{
+				MagicDNSSuffix: ".foo",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:      "skippy.foo.",
+						TailscaleIPs: []netaddr.IP{mustIP("1.0.0.2")},
+					},
+				},
+			},
+			wantErr: `node "skippy" is not advertising an exit node`,
+		},
+		{
+			name: "ambiguous",
+			arg:  "skippy",
+			st: &ipnstate.Status{
+				MagicDNSSuffix: ".foo",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:        "skippy.foo.",
+						TailscaleIPs:   []netaddr.IP{mustIP("1.0.0.2")},
+						ExitNodeOption: true,
+					},
+					key.NewNode().Public(): {
+						DNSName:        "SKIPPY.foo.",
+						TailscaleIPs:   []netaddr.IP{mustIP("1.0.0.2")},
+						ExitNodeOption: true,
+					},
+				},
+			},
+			wantErr: `ambiguous exit node name "skippy"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := exitNodeIPOfArg(tt.arg, tt.st)
+			if err != nil {
+				if err.Error() == tt.wantErr {
+					return
+				}
+				if tt.wantErr == "" {
+					t.Fatal(err)
+				}
+				t.Fatalf("error = %#q; want %#q", err, tt.wantErr)
+			}
+			if tt.wantErr != "" {
+				t.Fatalf("got %v; want error %#q", got, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("got %v; want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -8,27 +8,39 @@
 #
 ############################################################################
 #
-# WARNING: Tailscale is not yet officially supported in Docker,
-# Kubernetes, etc.
+# WARNING: Tailscale is not yet officially supported in container
+# environments, such as Docker and Kubernetes. Though it should work, we
+# don't regularly test it, and we know there are some feature limitations.
 #
-# It might work, but we don't regularly test it, and it's not as polished as
-# our currently supported platforms. This is provided for people who know
-# how Tailscale works and what they're doing.
-#
-# Our tracking bug for officially support container use cases is:
-#    https://github.com/tailscale/tailscale/issues/504
-#
-# Also, see the various bugs tagged "containers":
+# See current bugs tagged "containers":
 #    https://github.com/tailscale/tailscale/labels/containers
 #
 ############################################################################
 
 set -eu
 
-eval $(./version/version.sh)
+# Use the "go" binary from the "tool" directory (which is github.com/tailscale/go)
+export PATH=$PWD/tool:$PATH
 
-docker build \
-  --build-arg VERSION_LONG=$VERSION_LONG \
-  --build-arg VERSION_SHORT=$VERSION_SHORT \
-  --build-arg VERSION_GIT_HASH=$VERSION_GIT_HASH \
-  -t tailscale:tailscale .
+eval $(./build_dist.sh shellvars)
+DEFAULT_TAGS="v${VERSION_SHORT},v${VERSION_MINOR}"
+DEFAULT_REPOS="tailscale/tailscale,ghcr.io/tailscale/tailscale"
+DEFAULT_BASE="ghcr.io/tailscale/alpine-base:3.14"
+
+PUSH="${PUSH:-false}"
+REPOS="${REPOS:-${DEFAULT_REPOS}}"
+TAGS="${TAGS:-${DEFAULT_TAGS}}"
+BASE="${BASE:-${DEFAULT_BASE}}"
+
+go run github.com/tailscale/mkctr@latest \
+  --gopaths="\
+    tailscale.com/cmd/tailscale:/usr/local/bin/tailscale, \
+    tailscale.com/cmd/tailscaled:/usr/local/bin/tailscaled" \
+  --ldflags="\
+    -X tailscale.com/version.Long=${VERSION_LONG} \
+    -X tailscale.com/version.Short=${VERSION_SHORT} \
+    -X tailscale.com/version.GitCommit=${VERSION_GIT_HASH}" \
+  --base="${BASE}" \
+  --tags="${TAGS}" \
+  --repos="${REPOS}" \
+  --push="${PUSH}"

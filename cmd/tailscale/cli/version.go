@@ -8,9 +8,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/version"
 )
@@ -20,7 +19,7 @@ var versionCmd = &ffcli.Command{
 	ShortUsage: "version [flags]",
 	ShortHelp:  "Print Tailscale version",
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("version", flag.ExitOnError)
+		fs := newFlagSet("version")
 		fs.BoolVar(&versionArgs.daemon, "daemon", false, "also print local node's daemon version")
 		return fs
 	})(),
@@ -33,19 +32,19 @@ var versionArgs struct {
 
 func runVersion(ctx context.Context, args []string) error {
 	if len(args) > 0 {
-		log.Fatalf("too many non-flag arguments: %q", args)
+		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
 	if !versionArgs.daemon {
-		fmt.Println(version.String())
+		outln(version.String())
 		return nil
 	}
 
-	fmt.Printf("Client: %s\n", version.String())
+	printf("Client: %s\n", version.String())
 
 	st, err := tailscale.StatusWithoutPeers(ctx)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Daemon: %s\n", st.Version)
+	printf("Daemon: %s\n", st.Version)
 	return nil
 }

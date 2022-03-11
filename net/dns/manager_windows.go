@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 )
@@ -34,6 +35,8 @@ const (
 	versionKey = `SOFTWARE\Microsoft\Windows NT\CurrentVersion`
 )
 
+var configureWSL = envknob.Bool("TS_DEBUG_CONFIGURE_WSL")
+
 type windowsManager struct {
 	logf       logger.Logf
 	guid       string
@@ -43,9 +46,10 @@ type windowsManager struct {
 
 func NewOSConfigurator(logf logger.Logf, interfaceName string) (OSConfigurator, error) {
 	ret := windowsManager{
-		logf:      logf,
-		guid:      interfaceName,
-		nrptWorks: isWindows10OrBetter(),
+		logf:       logf,
+		guid:       interfaceName,
+		nrptWorks:  isWindows10OrBetter(),
+		wslManager: newWSLManager(logf),
 	}
 
 	// Best-effort: if our NRPT rule exists, try to delete it. Unlike
@@ -58,9 +62,11 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (OSConfigurator, 
 		ret.delKey(nrptBase)
 	}
 
-	if distros := wslDistros(logf); len(distros) > 0 {
-		logf("WSL distributions: %v", distros)
-		ret.wslManager = newWSLManager(logf, distros)
+	// Log WSL status once at startup.
+	if distros, err := wslDistros(); err != nil {
+		logf("WSL: could not list distributions: %v", err)
+	} else {
+		logf("WSL: found %d distributions", len(distros))
 	}
 
 	return ret, nil
@@ -290,7 +296,7 @@ func (m windowsManager) SetDNS(cfg OSConfig) error {
 		}
 
 		t0 = time.Now()
-		m.logf("running ipconfig /registerdns ...")
+		m.logf("running ipconfig /flushdns ...")
 		cmd = exec.Command("ipconfig", "/flushdns")
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		err = cmd.Run()
@@ -304,15 +310,15 @@ func (m windowsManager) SetDNS(cfg OSConfig) error {
 
 	// On initial setup of WSL, the restart caused by --shutdown is slow,
 	// so we do it out-of-line.
-	go func() {
-		if m.wslManager != nil {
+	if configureWSL {
+		go func() {
 			if err := m.wslManager.SetDNS(cfg); err != nil {
 				m.logf("WSL SetDNS: %v", err) // continue
 			} else {
 				m.logf("WSL SetDNS: success")
 			}
-		}
-	}()
+		}()
+	}
 
 	return nil
 }

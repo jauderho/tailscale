@@ -7,6 +7,7 @@ package safesocket
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -20,6 +21,34 @@ func init() {
 	localTCPPortAndToken = localTCPPortAndTokenDarwin
 }
 
+// localTCPPortAndTokenMacsys returns the localhost TCP port number and auth token
+// from /Library/Tailscale.
+//
+// In that case the files are:
+//    /Library/Tailscale/ipnport => $port (symlink with localhost port number target)
+//    /Library/Tailscale/sameuserproof-$port is a file with auth
+func localTCPPortAndTokenMacsys() (port int, token string, err error) {
+
+	const dir = "/Library/Tailscale"
+	portStr, err := os.Readlink(filepath.Join(dir, "ipnport"))
+	if err != nil {
+		return 0, "", err
+	}
+	port, err = strconv.Atoi(portStr)
+	if err != nil {
+		return 0, "", err
+	}
+	authb, err := os.ReadFile(filepath.Join(dir, "sameuserproof-"+portStr))
+	if err != nil {
+		return 0, "", err
+	}
+	auth := strings.TrimSpace(string(authb))
+	if auth == "" {
+		return 0, "", errors.New("empty auth token in sameuserproof file")
+	}
+	return port, auth, nil
+}
+
 func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 	// There are two ways this binary can be run: as the Mac App Store sandboxed binary,
 	// or a normal binary that somebody built or download and are being run from outside
@@ -27,6 +56,13 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 	// to the local daemon.
 
 	if dir := os.Getenv("TS_MACOS_CLI_SHARED_DIR"); dir != "" {
+		// First see if we're running as the non-AppStore "macsys" variant.
+		if strings.Contains(os.Getenv("HOME"), "/Containers/io.tailscale.ipn.macsys/") {
+			if port, token, err := localTCPPortAndTokenMacsys(); err == nil {
+				return port, token, nil
+			}
+		}
+
 		// The current binary (this process) is sandboxed. The user is
 		// running the CLI via /Applications/Tailscale.app/Contents/MacOS/Tailscale
 		// which sets the TS_MACOS_CLI_SHARED_DIR environment variable.
@@ -51,17 +87,24 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 	}
 
 	// The current process is running outside the sandbox, so use
-	// lsof to find the IPNExtension:
+	// lsof to find the IPNExtension (the Mac App Store variant).
 
-	out, err := exec.Command("lsof",
+	cmd := exec.Command("lsof",
 		"-n",                             // numeric sockets; don't do DNS lookups, etc
 		"-a",                             // logical AND remaining options
 		fmt.Sprintf("-u%d", os.Getuid()), // process of same user only
 		"-c", "IPNExtension",             // starting with IPNExtension
 		"-F", // machine-readable output
-	).Output()
+	)
+	out, err := cmd.Output()
 	if err != nil {
-		return 0, "", fmt.Errorf("failed to run lsof looking for IPNExtension: %w", err)
+		// Before returning an error, see if we're running the
+		// macsys variant at the normal location.
+		if port, token, err := localTCPPortAndTokenMacsys(); err == nil {
+			return port, token, nil
+		}
+
+		return 0, "", fmt.Errorf("failed to run '%s' looking for IPNExtension: %w", cmd, err)
 	}
 	bs := bufio.NewScanner(bytes.NewReader(out))
 	subStr := []byte(".tailscale.ipn.macos/sameuserproof-")
@@ -80,6 +123,12 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 		if err != nil {
 			return 0, "", fmt.Errorf("invalid port %q found in lsof", portStr)
 		}
+		return port, token, nil
+	}
+
+	// Before returning an error, see if we're running the
+	// macsys variant at the normal location.
+	if port, token, err := localTCPPortAndTokenMacsys(); err == nil {
 		return port, token, nil
 	}
 	return 0, "", ErrTokenNotFound

@@ -2,11 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !windows
+//go:build !windows && !js
+// +build !windows,!js
 
 package safesocket
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -21,23 +23,25 @@ import (
 )
 
 // TODO(apenwarr): handle magic cookie auth
-func connect(path string, port uint16) (net.Conn, error) {
-	if runtime.GOOS == "darwin" && path == "" && port == 0 {
+func connect(s *ConnectionStrategy) (net.Conn, error) {
+	if runtime.GOOS == "js" {
+		return nil, errors.New("safesocket.Connect not yet implemented on js/wasm")
+	}
+	if runtime.GOOS == "darwin" && s.fallback && s.path == "" && s.port == 0 {
 		return connectMacOSAppSandbox()
 	}
-	pipe, err := net.Dial("unix", path)
+	pipe, err := net.Dial("unix", s.path)
 	if err != nil {
-		if runtime.GOOS == "darwin" {
-			extConn, err := connectMacOSAppSandbox()
-			if err != nil {
-				log.Printf("safesocket: failed to connect to Tailscale IPNExtension: %v", err)
-			} else {
-				return extConn, nil
+		if runtime.GOOS == "darwin" && s.fallback {
+			extConn, extErr := connectMacOSAppSandbox()
+			if extErr != nil {
+				return nil, fmt.Errorf("safesocket: failed to connect to %v: %v; failed to connect to Tailscale IPNExtension: %v", s.path, err, extErr)
 			}
+			return extConn, nil
 		}
 		return nil, err
 	}
-	return pipe, err
+	return pipe, nil
 }
 
 // TODO(apenwarr): handle magic cookie auth
@@ -113,7 +117,7 @@ func socketPermissionsForOS() os.FileMode {
 // connectMacOSAppSandbox connects to the Tailscale Network Extension,
 // which is necessarily running within the macOS App Sandbox.  Our
 // little dance to connect a regular user binary to the sandboxed
-// nework extension is:
+// network extension is:
 //
 //   * the sandboxed IPNExtension picks a random localhost:0 TCP port
 //     to listen on

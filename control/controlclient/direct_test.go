@@ -6,27 +6,29 @@ package controlclient
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"inet.af/netaddr"
+	"tailscale.com/hostinfo"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/wgkey"
+	"tailscale.com/types/key"
 )
 
 func TestNewDirect(t *testing.T) {
-	hi := NewHostinfo()
+	hi := hostinfo.New()
 	ni := tailcfg.NetInfo{LinkType: "wired"}
 	hi.NetInfo = &ni
 
-	key, err := wgkey.NewPrivate()
-	if err != nil {
-		t.Error(err)
-	}
+	k := key.NewMachine()
 	opts := Options{
 		ServerURL: "https://example.com",
 		Hostinfo:  hi,
-		GetMachinePrivateKey: func() (wgkey.Private, error) {
-			return key, nil
+		GetMachinePrivateKey: func() (key.MachinePrivate, error) {
+			return k, nil
 		},
 	}
 	c, err := NewDirect(opts)
@@ -56,7 +58,7 @@ func TestNewDirect(t *testing.T) {
 	if changed {
 		t.Errorf("c.SetHostinfo(hi) want false got %v", changed)
 	}
-	hi = NewHostinfo()
+	hi = hostinfo.New()
 	hi.Hostname = "different host name"
 	changed = c.SetHostinfo(hi)
 	if !changed {
@@ -92,14 +94,52 @@ func fakeEndpoints(ports ...uint16) (ret []tailcfg.Endpoint) {
 	return
 }
 
-func TestNewHostinfo(t *testing.T) {
-	hi := NewHostinfo()
-	if hi == nil {
-		t.Fatal("no Hostinfo")
+func TestTsmpPing(t *testing.T) {
+	hi := hostinfo.New()
+	ni := tailcfg.NetInfo{LinkType: "wired"}
+	hi.NetInfo = &ni
+
+	k := key.NewMachine()
+	opts := Options{
+		ServerURL: "https://example.com",
+		Hostinfo:  hi,
+		GetMachinePrivateKey: func() (key.MachinePrivate, error) {
+			return k, nil
+		},
 	}
-	j, err := json.MarshalIndent(hi, "  ", "")
+
+	c, err := NewDirect(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("Got: %s", j)
+
+	pingRes := &ipnstate.PingResult{
+		IP:       "123.456.7890",
+		Err:      "",
+		NodeName: "testnode",
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		body := new(ipnstate.PingResult)
+		if err := json.NewDecoder(r.Body).Decode(body); err != nil {
+			t.Fatal(err)
+		}
+		if pingRes.IP != body.IP {
+			t.Fatalf("PingResult did not have the correct IP : got %v, expected : %v", body.IP, pingRes.IP)
+		}
+		w.WriteHeader(200)
+	}))
+	defer ts.Close()
+
+	now := time.Now()
+
+	pr := &tailcfg.PingRequest{
+		URL: ts.URL,
+	}
+
+	err = postPingResult(now, t.Logf, c.httpc, pr, pingRes)
+	if err != nil {
+		t.Fatal(err)
+	}
 }

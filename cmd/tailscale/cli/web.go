@@ -7,22 +7,27 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/http/cgi"
 	"net/url"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
+	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
@@ -48,11 +53,13 @@ func init() {
 }
 
 type tmplData struct {
-	Profile      tailcfg.UserProfile
-	SynologyUser string
-	Status       string
-	DeviceName   string
-	IP           string
+	Profile           tailcfg.UserProfile
+	SynologyUser      string
+	Status            string
+	DeviceName        string
+	IP                string
+	AdvertiseExitNode bool
+	AdvertiseRoutes   string
 }
 
 var webCmd = &ffcli.Command{
@@ -60,8 +67,16 @@ var webCmd = &ffcli.Command{
 	ShortUsage: "web [flags]",
 	ShortHelp:  "Run a web server for controlling Tailscale",
 
+	LongHelp: strings.TrimSpace(`
+"tailscale web" runs a webserver for controlling the Tailscale daemon.
+
+It's primarily intended for use on Synology, QNAP, and other
+NAS devices where a web interface is the natural place to control
+Tailscale, as opposed to a CLI or a native app.
+`),
+
 	FlagSet: (func() *flag.FlagSet {
-		webf := flag.NewFlagSet("web", flag.ExitOnError)
+		webf := newFlagSet("web")
 		webf.StringVar(&webArgs.listen, "listen", "localhost:8088", "listen address; use port 0 for automatic")
 		webf.BoolVar(&webArgs.cgi, "cgi", false, "run as CGI script")
 		return webf
@@ -74,9 +89,32 @@ var webArgs struct {
 	cgi    bool
 }
 
+func tlsConfigFromEnvironment() *tls.Config {
+	crt := os.Getenv("TLS_CRT_PEM")
+	key := os.Getenv("TLS_KEY_PEM")
+	if crt == "" || key == "" {
+		return nil
+	}
+
+	// We support passing in the complete certificate and key from environment
+	// variables because pfSense stores its cert+key in the PHP config. We populate
+	// TLS_CRT_PEM and TLS_KEY_PEM from PHP code before starting tailscale web.
+	// These are the PEM-encoded Certificate and Private Key.
+
+	cert, err := tls.X509KeyPair([]byte(crt), []byte(key))
+	if err != nil {
+		log.Printf("tlsConfigFromEnvironment: %v", err)
+
+		// Fallback to unencrypted HTTP.
+		return nil
+	}
+
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
+}
+
 func runWeb(ctx context.Context, args []string) error {
 	if len(args) > 0 {
-		log.Fatalf("too many non-flag arguments: %q", args)
+		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
 
 	if webArgs.cgi {
@@ -86,7 +124,30 @@ func runWeb(ctx context.Context, args []string) error {
 		}
 		return nil
 	}
-	return http.ListenAndServe(webArgs.listen, http.HandlerFunc(webHandler))
+
+	tlsConfig := tlsConfigFromEnvironment()
+	if tlsConfig != nil {
+		server := &http.Server{
+			Addr:      webArgs.listen,
+			TLSConfig: tlsConfig,
+			Handler:   http.HandlerFunc(webHandler),
+		}
+
+		log.Printf("web server runNIng on: https://%s", server.Addr)
+		return server.ListenAndServeTLS("", "")
+	} else {
+		log.Printf("web server running on: %s", urlOfListenAddr(webArgs.listen))
+		return http.ListenAndServe(webArgs.listen, http.HandlerFunc(webHandler))
+	}
+}
+
+// urlOfListenAddr parses a given listen address into a formatted URL
+func urlOfListenAddr(addr string) string {
+	host, port, _ := net.SplitHostPort(addr)
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s", net.JoinHostPort(host, port))
 }
 
 // authorize returns the name of the user accessing the web UI after verifying
@@ -209,14 +270,14 @@ func synoTokenRedirect(w http.ResponseWriter, r *http.Request) bool {
 	// We need a SynoToken for authenticate.cgi.
 	// So we tell the client to get one.
 	serverURL := r.URL.Scheme + "://" + r.URL.Host
-	fmt.Fprintf(w, synoTokenRedirectHTML, serverURL)
+	synoTokenRedirectHTML.Execute(w, serverURL)
 	return true
 }
 
-const synoTokenRedirectHTML = `<html><body>
+var synoTokenRedirectHTML = template.Must(template.New("redirect").Parse(`<html><body>
 Redirecting with session token...
 <script>
-var serverURL = %q;
+var serverURL = {{ . }};
 var req = new XMLHttpRequest();
 req.overrideMimeType("application/json");
 req.open("GET", serverURL + "/webman/login.cgi", true);
@@ -228,7 +289,7 @@ req.onload = function() {
 req.send(null);
 </script>
 </body></html>
-`
+`))
 
 func webHandler(w http.ResponseWriter, r *http.Request) {
 	if authRedirect(w, r) {
@@ -246,19 +307,54 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == "POST" {
+		defer r.Body.Close()
+		var postData struct {
+			AdvertiseRoutes   string
+			AdvertiseExitNode bool
+			Reauthenticate    bool
+		}
 		type mi map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&postData); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(mi{"error": err.Error()})
+			return
+		}
+		prefs, err := tailscale.GetPrefs(r.Context())
+		if err != nil && !postData.Reauthenticate {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(mi{"error": err.Error()})
+			return
+		} else {
+			routes, err := calcAdvertiseRoutes(postData.AdvertiseRoutes, postData.AdvertiseExitNode)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(mi{"error": err.Error()})
+				return
+			}
+			prefs.AdvertiseRoutes = routes
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		url, err := tailscaleUpForceReauth(r.Context())
+		url, err := tailscaleUp(r.Context(), prefs, postData.Reauthenticate)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(mi{"error": err.Error()})
 			return
 		}
-		json.NewEncoder(w).Encode(mi{"url": url})
+		if url != "" {
+			json.NewEncoder(w).Encode(mi{"url": url})
+		} else {
+			io.WriteString(w, "{}")
+		}
 		return
 	}
 
 	st, err := tailscale.Status(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	prefs, err := tailscale.GetPrefs(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -271,6 +367,18 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 		Profile:      profile,
 		Status:       st.BackendState,
 		DeviceName:   deviceName,
+	}
+	exitNodeRouteV4 := netaddr.MustParseIPPrefix("0.0.0.0/0")
+	exitNodeRouteV6 := netaddr.MustParseIPPrefix("::/0")
+	for _, r := range prefs.AdvertiseRoutes {
+		if r == exitNodeRouteV4 || r == exitNodeRouteV6 {
+			data.AdvertiseExitNode = true
+		} else {
+			if data.AdvertiseRoutes != "" {
+				data.AdvertiseRoutes += ","
+			}
+			data.AdvertiseRoutes += r.String()
+		}
 	}
 	if len(st.TailscaleIPs) != 0 {
 		data.IP = st.TailscaleIPs[0].String()
@@ -285,13 +393,15 @@ func webHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // TODO(crawshaw): some of this is very similar to the code in 'tailscale up', can we share anything?
-func tailscaleUpForceReauth(ctx context.Context) (authURL string, retErr error) {
-	prefs := ipn.NewPrefs()
-	prefs.ControlURL = ipn.DefaultControlURL
-	prefs.WantRunning = true
-	prefs.CorpDNS = true
-	prefs.AllowSingleHosts = true
-	prefs.ForceDaemon = (runtime.GOOS == "windows")
+func tailscaleUp(ctx context.Context, prefs *ipn.Prefs, forceReauth bool) (authURL string, retErr error) {
+	if prefs == nil {
+		prefs = ipn.NewPrefs()
+		prefs.ControlURL = ipn.DefaultControlURL
+		prefs.WantRunning = true
+		prefs.CorpDNS = true
+		prefs.AllowSingleHosts = true
+		prefs.ForceDaemon = (runtime.GOOS == "windows")
+	}
 
 	if distro.Get() == distro.Synology {
 		prefs.NetfilterMode = preftype.NetfilterOff
@@ -338,6 +448,14 @@ func tailscaleUpForceReauth(ctx context.Context) (authURL string, retErr error) 
 			authURL = *url
 			cancel()
 		}
+		if !forceReauth && n.Prefs != nil {
+			p1, p2 := *n.Prefs, *prefs
+			p1.Persist = nil
+			p2.Persist = nil
+			if p1.Equals(&p2) {
+				cancel()
+			}
+		}
 	})
 	// Wait for backend client to be connected so we know
 	// we're subscribed to updates. Otherwise we can miss
@@ -355,10 +473,15 @@ func tailscaleUpForceReauth(ctx context.Context) (authURL string, retErr error) 
 	bc.Start(ipn.Options{
 		StateKey: ipn.GlobalDaemonStateKey,
 	})
-	bc.StartLoginInteractive()
+	if forceReauth {
+		bc.StartLoginInteractive()
+	}
 
 	<-pumpCtx.Done() // wait for authURL or complete failure
 	if authURL == "" && retErr == nil {
+		if !forceReauth {
+			return "", nil // no auth URL is fine
+		}
 		retErr = pumpCtx.Err()
 	}
 	if authURL == "" && retErr == nil {

@@ -8,11 +8,14 @@
 package logpolicy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -22,21 +25,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/term"
 	"tailscale.com/atomicfile"
+	"tailscale.com/envknob"
+	"tailscale.com/log/filelogger"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
+	"tailscale.com/net/dnscache"
+	"tailscale.com/net/dnsfallback"
+	"tailscale.com/net/netknob"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/paths"
+	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/racebuild"
 	"tailscale.com/util/winutil"
 	"tailscale.com/version"
@@ -59,6 +68,15 @@ func getLogTarget() string {
 	})
 
 	return getLogTargetOnce.v
+}
+
+// LogHost returns the hostname only (without port) of the configured
+// logtail server, or the default.
+func LogHost() string {
+	if v := getLogTarget(); v != "" {
+		return v
+	}
+	return logtail.DefaultHost
 }
 
 // Config represents an instance of logs in a collection.
@@ -128,12 +146,40 @@ func (l logWriter) Write(buf []byte) (int, error) {
 // logsDir returns the directory to use for log configuration and
 // buffer storage.
 func logsDir(logf logger.Logf) string {
-	// STATE_DIRECTORY is set by systemd 240+ but we support older
-	// systems-d. For example, Ubuntu 18.04 (Bionic Beaver) is 237.
-	systemdStateDir := os.Getenv("STATE_DIRECTORY")
-	if systemdStateDir != "" {
-		logf("logpolicy: using $STATE_DIRECTORY, %q", systemdStateDir)
-		return systemdStateDir
+	if d := os.Getenv("TS_LOGS_DIR"); d != "" {
+		fi, err := os.Stat(d)
+		if err == nil && fi.IsDir() {
+			return d
+		}
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		if version.CmdName() == "tailscaled" {
+			// In the common case, when tailscaled is run as the Local System (as a service),
+			// we want to use %ProgramData% (C:\ProgramData\Tailscale), aside the
+			// system state config with the machine key, etc. But if that directory's
+			// not accessible, then it's probably because the user is running tailscaled
+			// as a regular user (perhaps in userspace-networking/SOCK5 mode) and we should
+			// just use the %LocalAppData% instead. In a user context, %LocalAppData% isn't
+			// subject to random deletions from Windows system updates.
+			dir := filepath.Join(os.Getenv("ProgramData"), "Tailscale")
+			if winProgramDataAccessible(dir) {
+				logf("logpolicy: using dir %v", dir)
+				return dir
+			}
+		}
+		dir := filepath.Join(os.Getenv("LocalAppData"), "Tailscale")
+		logf("logpolicy: using LocalAppData dir %v", dir)
+		return dir
+	case "linux":
+		// STATE_DIRECTORY is set by systemd 240+ but we support older
+		// systems-d. For example, Ubuntu 18.04 (Bionic Beaver) is 237.
+		systemdStateDir := os.Getenv("STATE_DIRECTORY")
+		if systemdStateDir != "" {
+			logf("logpolicy: using $STATE_DIRECTORY, %q", systemdStateDir)
+			return systemdStateDir
+		}
 	}
 
 	// Default to e.g. /var/lib/tailscale or /var/db/tailscale on Unix.
@@ -180,6 +226,27 @@ func runningUnderSystemd() bool {
 	return false
 }
 
+func redirectStderrToLogPanics() bool {
+	return runningUnderSystemd() || envknob.Bool("TS_PLEASE_PANIC")
+}
+
+// winProgramDataAccessible reports whether the directory (assumed to
+// be a Windows %ProgramData% directory) is accessible to the current
+// process. It's created if needed.
+func winProgramDataAccessible(dir string) bool {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		// TODO: windows ACLs
+		return false
+	}
+	// The C:\ProgramData\Tailscale directory should be locked down
+	// by with ACLs to only be readable by the local system so a
+	// regular user shouldn't be able to do this operation:
+	if _, err := os.ReadDir(dir); err != nil {
+		return false
+	}
+	return true
+}
+
 // tryFixLogStateLocation is a temporary fixup for
 // https://github.com/tailscale/tailscale/issues/247 . We accidentally
 // wrote logging state files to /, and then later to $CACHE_DIRECTORY
@@ -188,7 +255,7 @@ func runningUnderSystemd() bool {
 //
 // If log state for cmdname exists in / or $CACHE_DIRECTORY, and no
 // log state for that command exists in dir, then the log state is
-// moved from whereever it does exist, into dir. Leftover logs state
+// moved from wherever it does exist, into dir. Leftover logs state
 // in / and $CACHE_DIRECTORY is deleted.
 func tryFixLogStateLocation(dir, cmdname string) {
 	switch runtime.GOOS {
@@ -338,7 +405,7 @@ func New(collection string) *Policy {
 	} else {
 		lflags = log.LstdFlags
 	}
-	if v, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_LOG_TIME")); v {
+	if envknob.Bool("TS_DEBUG_LOG_TIME") {
 		lflags = log.LstdFlags | log.Lmicroseconds
 	}
 	if runningUnderSystemd() {
@@ -361,14 +428,44 @@ func New(collection string) *Policy {
 
 	cfgPath := filepath.Join(dir, fmt.Sprintf("%s.log.conf", cmdName))
 
-	// The Windows service previously ran as tailscale-ipn.exe, so
-	// let's keep using that log base name if it exists.
-	if runtime.GOOS == "windows" && cmdName == "tailscaled" {
-		const oldCmdName = "tailscale-ipn"
-		oldPath := filepath.Join(dir, oldCmdName+".log.conf")
-		if fi, err := os.Stat(oldPath); err == nil && fi.Mode().IsRegular() {
-			cfgPath = oldPath
-			cmdName = oldCmdName
+	if runtime.GOOS == "windows" {
+		switch cmdName {
+		case "tailscaled":
+			// Tailscale 1.14 and before stored state under %LocalAppData%
+			// (usually "C:\WINDOWS\system32\config\systemprofile\AppData\Local"
+			// when tailscaled.exe is running as a non-user system service).
+			// However it is frequently cleared for almost any reason: Windows
+			// updates, System Restore, even various System Cleaner utilities.
+			//
+			// The Windows service previously ran as tailscale-ipn.exe, so
+			// machines which ran very old versions might still have their
+			// log conf named %LocalAppData%\tailscale-ipn.log.conf
+			//
+			// Machines which started using Tailscale more recently will have
+			// %LocalAppData%\tailscaled.log.conf
+			//
+			// Attempt to migrate the log conf to C:\ProgramData\Tailscale
+			oldDir := filepath.Join(os.Getenv("LocalAppData"), "Tailscale")
+
+			oldPath := filepath.Join(oldDir, "tailscaled.log.conf")
+			if fi, err := os.Stat(oldPath); err != nil || !fi.Mode().IsRegular() {
+				// *Only* if tailscaled.log.conf does not exist,
+				// check for tailscale-ipn.log.conf
+				oldPathOldCmd := filepath.Join(oldDir, "tailscale-ipn.log.conf")
+				if fi, err := os.Stat(oldPathOldCmd); err == nil && fi.Mode().IsRegular() {
+					oldPath = oldPathOldCmd
+				}
+			}
+
+			cfgPath = paths.TryConfigFileMigration(earlyLogf, oldPath, cfgPath)
+		case "tailscale-ipn":
+			for _, oldBase := range []string{"wg64.log.conf", "wg32.log.conf"} {
+				oldConf := filepath.Join(dir, oldBase)
+				if fi, err := os.Stat(oldConf); err == nil && fi.Mode().IsRegular() {
+					cfgPath = paths.TryConfigFileMigration(earlyLogf, oldConf, cfgPath)
+					break
+				}
+			}
 		}
 	}
 
@@ -418,23 +515,43 @@ func New(collection string) *Policy {
 			}
 			return w
 		},
-		HTTPC: &http.Client{Transport: newLogtailTransport(logtail.DefaultHost)},
+		HTTPC: &http.Client{Transport: NewLogtailTransport(logtail.DefaultHost)},
+	}
+	if collection == logtail.CollectionNode {
+		c.MetricsDelta = clientmetric.EncodeLogTailMetricsDelta
 	}
 
 	if val := getLogTarget(); val != "" {
 		log.Println("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
 		c.BaseURL = val
 		u, _ := url.Parse(val)
-		c.HTTPC = &http.Client{Transport: newLogtailTransport(u.Host)}
+		c.HTTPC = &http.Client{Transport: NewLogtailTransport(u.Host)}
 	}
 
-	filchBuf, filchErr := filch.New(filepath.Join(dir, cmdName), filch.Options{})
+	filchBuf, filchErr := filch.New(filepath.Join(dir, cmdName), filch.Options{
+		ReplaceStderr: redirectStderrToLogPanics(),
+	})
 	if filchBuf != nil {
 		c.Buffer = filchBuf
+		if filchBuf.OrigStderr != nil {
+			c.Stderr = filchBuf.OrigStderr
+		}
 	}
 	lw := logtail.NewLogger(c, log.Printf)
+
+	var logOutput io.Writer = lw
+
+	if runtime.GOOS == "windows" && c.Collection == logtail.CollectionNode {
+		logID := newc.PublicID.String()
+		exe, _ := os.Executable()
+		if strings.EqualFold(filepath.Base(exe), "tailscaled.exe") {
+			diskLogf := filelogger.New("tailscale-service", logID, lw.Logf)
+			logOutput = logger.FuncWriter(diskLogf)
+		}
+	}
+
 	log.SetFlags(0) // other logflags are set on console, not here
-	log.SetOutput(lw)
+	log.SetOutput(logOutput)
 
 	log.Printf("Program starting: v%v, Go %v: %#v",
 		version.Long,
@@ -454,6 +571,16 @@ func New(collection string) *Policy {
 	}
 }
 
+// dialLog is used by NewLogtailTransport to log the happy path of its
+// own dialing.
+//
+// By default it goes nowhere and is only enabled when
+// tailscaled's in verbose mode.
+//
+// log.Printf isn't used so its own logs don't loop back into logtail
+// in the happy path, thus generating more logs.
+var dialLog = log.New(io.Discard, "logtail: ", log.LstdFlags|log.Lmsgprefix)
+
 // SetVerbosityLevel controls the verbosity level that should be
 // written to stderr. 0 is the default (not verbose). Levels 1 or higher
 // are increasingly verbose.
@@ -461,6 +588,9 @@ func New(collection string) *Policy {
 // It should not be changed concurrently with log writes.
 func (p *Policy) SetVerbosityLevel(level int) {
 	p.Logtail.SetVerbosityLevel(level)
+	if level > 0 {
+		dialLog.SetOutput(os.Stderr)
+	}
 }
 
 // Close immediately shuts down the logger.
@@ -480,9 +610,12 @@ func (p *Policy) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// newLogtailTransport returns the HTTP Transport we use for uploading
-// logs to the given host name.
-func newLogtailTransport(host string) *http.Transport {
+// NewLogtailTransport returns an HTTP Transport particularly suited to uploading
+// logs to the given host name. This includes:
+//   - If DNS lookup fails, consult the bootstrap DNS list of Tailscale hostnames.
+//   - If TLS connection fails, try again using LetsEncrypt's built-in root certificate,
+//     for the benefit of older OS platforms which might not include it.
+func NewLogtailTransport(host string) *http.Transport {
 	// Start with a copy of http.DefaultTransport and tweak it a bit.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 
@@ -496,17 +629,47 @@ func newLogtailTransport(host string) *http.Transport {
 
 	// Log whenever we dial:
 	tr.DialContext = func(ctx context.Context, netw, addr string) (net.Conn, error) {
-		nd := netns.FromDialer(&net.Dialer{
+		nd := netns.FromDialer(log.Printf, &net.Dialer{
 			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			KeepAlive: netknob.PlatformTCPKeepAlive(),
 		})
 		t0 := time.Now()
 		c, err := nd.DialContext(ctx, netw, addr)
 		d := time.Since(t0).Round(time.Millisecond)
-		if err != nil {
-			log.Printf("logtail: dial %q failed: %v (in %v)", addr, err, d)
-		} else {
-			log.Printf("logtail: dialed %q in %v", addr, d)
+		if err == nil {
+			dialLog.Printf("dialed %q in %v", addr, d)
+			return c, nil
+		}
+
+		if version.IsWindowsGUI() && strings.HasPrefix(netw, "tcp") {
+			if c, err := safesocket.Connect(safesocket.DefaultConnectionStrategy("")); err == nil {
+				fmt.Fprintf(c, "CONNECT %s HTTP/1.0\r\n\r\n", addr)
+				br := bufio.NewReader(c)
+				res, err := http.ReadResponse(br, nil)
+				if err == nil && res.StatusCode != 200 {
+					err = errors.New(res.Status)
+				}
+				if err != nil {
+					log.Printf("logtail: CONNECT response error from tailscaled: %v", err)
+					c.Close()
+				} else {
+					dialLog.Printf("connected via tailscaled")
+					return c, nil
+				}
+			}
+		}
+
+		// If we failed to dial, try again with bootstrap DNS.
+		log.Printf("logtail: dial %q failed: %v (in %v), trying bootstrap...", addr, err, d)
+		dnsCache := &dnscache.Resolver{
+			Forward:          dnscache.Get().Forward, // use default cache's forwarder
+			UseLastGood:      true,
+			LookupIPFallback: dnsfallback.Lookup,
+		}
+		dialer := dnscache.Dialer(nd.DialContext, dnsCache)
+		c, err = dialer(ctx, netw, addr)
+		if err == nil {
+			log.Printf("logtail: bootstrap dial succeeded")
 		}
 		return c, err
 	}
@@ -520,7 +683,7 @@ func newLogtailTransport(host string) *http.Transport {
 	// TODO(bradfitz): remove this debug knob once we've decided
 	// to upload via HTTP/1 or HTTP/2 (probably HTTP/1). Or we might just enforce
 	// it server-side.
-	if h1, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_FORCE_H1_LOGS")); h1 {
+	if envknob.Bool("TS_DEBUG_FORCE_H1_LOGS") {
 		tr.TLSClientConfig = nil // DefaultTransport's was already initialized w/ h2
 		tr.ForceAttemptHTTP2 = false
 		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}

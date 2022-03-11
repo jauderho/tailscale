@@ -8,18 +8,26 @@ package tstun
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"go4.org/mem"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"inet.af/netaddr"
+	"tailscale.com/disco"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/tsaddr"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -33,6 +41,8 @@ const PacketStartOffset = device.MessageTransportHeaderSize
 // MaxPacketSize is the maximum size (in bytes)
 // of a packet that can be injected into a tstun.Wrapper.
 const MaxPacketSize = device.MaxContentSize
+
+const tapDebug = false // for super verbose TAP debugging
 
 var (
 	// ErrClosed is returned when attempting an operation on a closed Wrapper.
@@ -58,26 +68,41 @@ type FilterFunc func(*packet.Parsed, *Wrapper) filter.Response
 
 // Wrapper augments a tun.Device with packet filtering and injection.
 type Wrapper struct {
-	logf logger.Logf
+	logf        logger.Logf
+	limitedLogf logger.Logf // aggressively rate-limited logf used for potentially high volume errors
 	// tdev is the underlying Wrapper device.
-	tdev tun.Device
+	tdev  tun.Device
+	isTAP bool // whether tdev is a TAP device
 
 	closeOnce sync.Once
 
-	lastActivityAtomic int64 // unix seconds of last send or receive
+	// lastActivityAtomic is read/written atomically.
+	// On 32 bit systems, if the fields above change,
+	// you might need to add a pad32.Four field here.
+	lastActivityAtomic mono.Time // time of last send or receive
 
 	destIPActivity atomic.Value // of map[netaddr.IP]func()
+	destMACAtomic  atomic.Value // of [6]byte
+	discoKey       atomic.Value // of key.DiscoPublic
 
 	// buffer stores the oldest unconsumed packet from tdev.
 	// It is made a static buffer in order to avoid allocations.
 	buffer [maxBufferSize]byte
+	// bufferConsumedMu protects bufferConsumed from concurrent sends and closes.
+	// It does not prevent send-after-close, only data races.
+	bufferConsumedMu sync.Mutex
 	// bufferConsumed synchronizes access to buffer (shared by Read and poll).
+	//
+	// Close closes bufferConsumed. There may be outstanding sends to bufferConsumed
+	// when that happens; we catch any resulting panics.
+	// This lets us avoid expensive multi-case selects.
 	bufferConsumed chan struct{}
 
 	// closed signals poll (by closing) when the device is closed.
 	closed chan struct{}
-	// errors is the error queue populated by poll.
-	errors chan error
+	// outboundMu protects outbound from concurrent sends and closes.
+	// It does not prevent send-after-close, only data races.
+	outboundMu sync.Mutex
 	// outbound is the queue by which packets leave the TUN device.
 	//
 	// The directions are relative to the network, not the device:
@@ -88,7 +113,11 @@ type Wrapper struct {
 	//
 	// Empty reads are skipped by Wireguard, so it is always legal
 	// to discard an empty packet instead of sending it through t.outbound.
-	outbound chan []byte
+	//
+	// Close closes outbound. There may be outstanding sends to outbound
+	// when that happens; we catch any resulting panics.
+	// This lets us avoid expensive multi-case selects.
+	outbound chan tunReadResult
 
 	// eventsUpDown yields up and down tun.Events that arrive on a Wrapper's events channel.
 	eventsUpDown chan tun.Event
@@ -125,18 +154,37 @@ type Wrapper struct {
 	disableTSMPRejected bool
 }
 
+// tunReadResult is the result of a TUN read: Some data and an error.
+// The byte slice is not interpreted in the usual way for a Read method.
+// See the comment in the middle of Wrap.Read.
+type tunReadResult struct {
+	data []byte
+	err  error
+}
+
+func WrapTAP(logf logger.Logf, tdev tun.Device) *Wrapper {
+	return wrap(logf, tdev, true)
+}
+
 func Wrap(logf logger.Logf, tdev tun.Device) *Wrapper {
+	return wrap(logf, tdev, false)
+}
+
+func wrap(logf logger.Logf, tdev tun.Device, isTAP bool) *Wrapper {
+	logf = logger.WithPrefix(logf, "tstun: ")
 	tun := &Wrapper{
-		logf: logger.WithPrefix(logf, "tstun: "),
-		tdev: tdev,
+		logf:        logf,
+		limitedLogf: logger.RateLimitedFn(logf, 1*time.Minute, 2, 10),
+		isTAP:       isTAP,
+		tdev:        tdev,
 		// bufferConsumed is conceptually a condition variable:
 		// a goroutine should not block when setting it, even with no listeners.
 		bufferConsumed: make(chan struct{}, 1),
 		closed:         make(chan struct{}),
-		errors:         make(chan error),
-		outbound:       make(chan []byte),
-		eventsUpDown:   make(chan tun.Event),
-		eventsOther:    make(chan tun.Event),
+		// outbound can be unbuffered; the buffer is an optimization.
+		outbound:     make(chan tunReadResult, 1),
+		eventsUpDown: make(chan tun.Event),
+		eventsOther:  make(chan tun.Event),
 		// TODO(dmytro): (highly rate-limited) hexdumps should happen on unknown packets.
 		filterFlags: filter.LogAccepts | filter.LogDrops,
 	}
@@ -145,6 +193,7 @@ func Wrap(logf logger.Logf, tdev tun.Device) *Wrapper {
 	go tun.pumpEvents()
 	// The buffer starts out consumed.
 	tun.bufferConsumed <- struct{}{}
+	tun.noteActivity()
 
 	return tun
 }
@@ -157,15 +206,54 @@ func (t *Wrapper) SetDestIPActivityFuncs(m map[netaddr.IP]func()) {
 	t.destIPActivity.Store(m)
 }
 
+// SetDiscoKey sets the current discovery key.
+//
+// It is only used for filtering out bogus traffic when network
+// stack(s) get confused; see Issue 1526.
+func (t *Wrapper) SetDiscoKey(k key.DiscoPublic) {
+	t.discoKey.Store(k)
+}
+
+// isSelfDisco reports whether packet p
+// looks like a Disco packet from ourselves.
+// See Issue 1526.
+func (t *Wrapper) isSelfDisco(p *packet.Parsed) bool {
+	if p.IPProto != ipproto.UDP {
+		return false
+	}
+	pkt := p.Payload()
+	discobs, ok := disco.Source(pkt)
+	if !ok {
+		return false
+	}
+	discoSrc := key.DiscoPublicFromRaw32(mem.B(discobs))
+	selfDiscoPub, ok := t.discoKey.Load().(key.DiscoPublic)
+	return ok && selfDiscoPub == discoSrc
+}
+
 func (t *Wrapper) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
-		// Other channels need not be closed: poll will exit gracefully after this.
 		close(t.closed)
-
+		t.bufferConsumedMu.Lock()
+		close(t.bufferConsumed)
+		t.bufferConsumedMu.Unlock()
+		t.outboundMu.Lock()
+		close(t.outbound)
+		t.outboundMu.Unlock()
 		err = t.tdev.Close()
 	})
 	return err
+}
+
+// isClosed reports whether t is closed.
+func (t *Wrapper) isClosed() bool {
+	select {
+	case <-t.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 // pumpEvents copies events from t.tdev to t.eventsUpDown and t.eventsOther.
@@ -230,63 +318,134 @@ func (t *Wrapper) Name() (string, error) {
 	return t.tdev.Name()
 }
 
+// allowSendOnClosedChannel suppresses panics due to sending on a closed channel.
+// This allows us to avoid synchronization between poll and Close.
+// Such synchronization (particularly multi-case selects) is too expensive
+// for code like poll or Read that is on the hot path of every packet.
+// If this makes you sad or angry, you may want to join our
+// weekly Go Performance Delinquents Anonymous meetings on Monday nights.
+func allowSendOnClosedChannel() {
+	r := recover()
+	if r == nil {
+		return
+	}
+	e, _ := r.(error)
+	if e != nil && e.Error() == "send on closed channel" {
+		return
+	}
+	panic(r)
+}
+
+const ethernetFrameSize = 14 // 2 six byte MACs, 2 bytes ethertype
+
 // poll polls t.tdev.Read, placing the oldest unconsumed packet into t.buffer.
 // This is needed because t.tdev.Read in general may block (it does on Windows),
 // so packets may be stuck in t.outbound if t.Read called t.tdev.Read directly.
 func (t *Wrapper) poll() {
-	for {
-		select {
-		case <-t.closed:
-			return
-		case <-t.bufferConsumed:
-			// continue
-		}
-
+	for range t.bufferConsumed {
+	DoRead:
+		var n int
+		var err error
 		// Read may use memory in t.buffer before PacketStartOffset for mandatory headers.
 		// This is the rationale behind the tun.Wrapper.{Read,Write} interfaces
 		// and the reason t.buffer has size MaxMessageSize and not MaxContentSize.
-		n, err := t.tdev.Read(t.buffer[:], PacketStartOffset)
-		if err != nil {
-			select {
-			case <-t.closed:
+		// In principle, read errors are not fatal (but wireguard-go disagrees).
+		// We loop here until we get a non-empty (or failed) read.
+		// We don't need this loop for correctness,
+		// but wireguard-go will skip an empty read,
+		// so we might as well avoid the send through t.outbound.
+		for n == 0 && err == nil {
+			if t.isClosed() {
 				return
-			case t.errors <- err:
-				// In principle, read errors are not fatal (but wireguard-go disagrees).
-				t.bufferConsumed <- struct{}{}
 			}
-			continue
+			if t.isTAP {
+				n, err = t.tdev.Read(t.buffer[:], PacketStartOffset-ethernetFrameSize)
+				if tapDebug {
+					s := fmt.Sprintf("% x", t.buffer[:])
+					for strings.HasSuffix(s, " 00") {
+						s = strings.TrimSuffix(s, " 00")
+					}
+					t.logf("TAP read %v, %v: %s", n, err, s)
+				}
+			} else {
+				n, err = t.tdev.Read(t.buffer[:], PacketStartOffset)
+			}
 		}
-
-		// Wireguard will skip an empty read,
-		// so we might as well do it here to avoid the send through t.outbound.
-		if n == 0 {
-			t.bufferConsumed <- struct{}{}
-			continue
+		if t.isTAP {
+			if err == nil {
+				ethernetFrame := t.buffer[PacketStartOffset-ethernetFrameSize:][:n]
+				if t.handleTAPFrame(ethernetFrame) {
+					goto DoRead
+				}
+			}
+			// Fall through. We got an IP packet.
+			if n >= ethernetFrameSize {
+				n -= ethernetFrameSize
+			}
+			if tapDebug {
+				t.logf("tap regular frame: %x", t.buffer[PacketStartOffset:PacketStartOffset+n])
+			}
 		}
-
-		select {
-		case <-t.closed:
-			return
-		case t.outbound <- t.buffer[PacketStartOffset : PacketStartOffset+n]:
-			// continue
-		}
+		t.sendOutbound(tunReadResult{data: t.buffer[PacketStartOffset : PacketStartOffset+n], err: err})
 	}
 }
 
-var magicDNSIPPort = netaddr.MustParseIPPort("100.100.100.100:0")
+// sendBufferConsumed does t.bufferConsumed <- struct{}{}.
+// It protects against any panics or data races that that send could cause.
+func (t *Wrapper) sendBufferConsumed() {
+	defer allowSendOnClosedChannel()
+	t.bufferConsumedMu.Lock()
+	defer t.bufferConsumedMu.Unlock()
+	t.bufferConsumed <- struct{}{}
+}
+
+// sendOutbound does t.outboundMu <- r.
+// It protects against any panics or data races that that send could cause.
+func (t *Wrapper) sendOutbound(r tunReadResult) {
+	defer allowSendOnClosedChannel()
+	t.outboundMu.Lock()
+	defer t.outboundMu.Unlock()
+	t.outbound <- r
+}
+
+var (
+	magicDNSIPPort   = netaddr.IPPortFrom(tsaddr.TailscaleServiceIP(), 0) // 100.100.100.100:0
+	magicDNSIPPortv6 = netaddr.IPPortFrom(tsaddr.TailscaleServiceIPv6(), 0)
+)
 
 func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 	// Fake ICMP echo responses to MagicDNS (100.100.100.100).
-	if p.IsEchoRequest() && p.Dst == magicDNSIPPort {
-		header := p.ICMP4Header()
-		header.ToResponse()
-		outp := packet.Generate(&header, p.Payload())
-		t.InjectInboundCopy(outp)
-		return filter.DropSilently // don't pass on to OS; already handled
+	if p.IsEchoRequest() {
+		switch p.Dst {
+		case magicDNSIPPort:
+			header := p.ICMP4Header()
+			header.ToResponse()
+			outp := packet.Generate(&header, p.Payload())
+			t.InjectInboundCopy(outp)
+			return filter.DropSilently // don't pass on to OS; already handled
+		case magicDNSIPPortv6:
+			header := p.ICMP6Header()
+			header.ToResponse()
+			outp := packet.Generate(&header, p.Payload())
+			t.InjectInboundCopy(outp)
+			return filter.DropSilently // don't pass on to OS; already handled
+		}
+	}
+
+	// Issue 1526 workaround: if we sent disco packets over
+	// Tailscale from ourselves, then drop them, as that shouldn't
+	// happen unless a networking stack is confused, as it seems
+	// macOS in Network Extension mode might be.
+	if p.IPProto == ipproto.UDP && // disco is over UDP; avoid isSelfDisco call for TCP/etc
+		t.isSelfDisco(p) {
+		t.limitedLogf("[unexpected] received self disco out packet over tstun; dropping")
+		metricPacketOutDropSelfDisco.Add(1)
+		return filter.DropSilently
 	}
 
 	if t.PreFilterOut != nil {
 		if res := t.PreFilterOut(p, t); res.IsDrop() {
+			// Handled by userspaceEngine.handleLocalPackets (quad-100 DNS primarily).
 			return res
 		}
 	}
@@ -298,6 +457,7 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 	}
 
 	if filt.RunOut(p, t.filterFlags) != filter.Accept {
+		metricPacketOutDropFilter.Add(1)
 		return filter.Drop
 	}
 
@@ -312,39 +472,37 @@ func (t *Wrapper) filterOut(p *packet.Parsed) filter.Response {
 
 // noteActivity records that there was a read or write at the current time.
 func (t *Wrapper) noteActivity() {
-	atomic.StoreInt64(&t.lastActivityAtomic, time.Now().Unix())
+	t.lastActivityAtomic.StoreAtomic(mono.Now())
 }
 
 // IdleDuration reports how long it's been since the last read or write to this device.
 //
-// Its value is only accurate to roughly second granularity.
-// If there's never been activity, the duration is since 1970.
+// Its value should only be presumed accurate to roughly 10ms granularity.
+// If there's never been activity, the duration is since the wrapper was created.
 func (t *Wrapper) IdleDuration() time.Duration {
-	sec := atomic.LoadInt64(&t.lastActivityAtomic)
-	return time.Since(time.Unix(sec, 0))
+	return mono.Since(t.lastActivityAtomic.LoadAtomic())
 }
 
 func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
-	var n int
-
-	wasInjectedPacket := false
-
-	select {
-	case <-t.closed:
+	res, ok := <-t.outbound
+	if !ok {
+		// Wrapper is closed.
 		return 0, io.EOF
-	case err := <-t.errors:
-		return 0, err
-	case pkt := <-t.outbound:
-		n = copy(buf[offset:], pkt)
-		// t.buffer has a fixed location in memory,
-		// so this is the easiest way to tell when it has been consumed.
-		// &pkt[0] can be used because empty packets do not reach t.outbound.
-		if &pkt[0] == &t.buffer[PacketStartOffset] {
-			t.bufferConsumed <- struct{}{}
-		} else {
-			// If the packet is not from t.buffer, then it is an injected packet.
-			wasInjectedPacket = true
-		}
+	}
+	if res.err != nil {
+		return 0, res.err
+	}
+
+	metricPacketOut.Add(1)
+	pkt := res.data
+	n := copy(buf[offset:], pkt)
+	// t.buffer has a fixed location in memory.
+	// If the packet is not from t.buffer, then it is an injected packet.
+	// &pkt[0] can be used because empty packets do not reach t.outbound.
+	isInjectedPacket := &pkt[0] != &t.buffer[PacketStartOffset]
+	if !isInjectedPacket {
+		// We are done with t.buffer. Let poll re-use it.
+		t.sendBufferConsumed()
 	}
 
 	p := parsedPacketPool.Get().(*packet.Parsed)
@@ -357,15 +515,11 @@ func (t *Wrapper) Read(buf []byte, offset int) (int, error) {
 		}
 	}
 
-	// For injected packets, we return early to bypass filtering.
-	if wasInjectedPacket {
-		t.noteActivity()
-		return n, nil
-	}
-
-	if !t.disableFilter {
+	// Do not filter injected packets.
+	if !isInjectedPacket && !t.disableFilter {
 		response := t.filterOut(p)
 		if response != filter.Accept {
+			metricPacketOutDrop.Add(1)
 			// Wireguard considers read errors fatal; pretend nothing was read
 			return 0, nil
 		}
@@ -390,6 +544,17 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 				f(data)
 			}
 		}
+	}
+
+	// Issue 1526 workaround: if we see disco packets over
+	// Tailscale from ourselves, then drop them, as that shouldn't
+	// happen unless a networking stack is confused, as it seems
+	// macOS in Network Extension mode might be.
+	if p.IPProto == ipproto.UDP && // disco is over UDP; avoid isSelfDisco call for TCP/etc
+		t.isSelfDisco(p) {
+		t.limitedLogf("[unexpected] received self disco in packet over tstun; dropping")
+		metricPacketInDropSelfDisco.Add(1)
+		return filter.DropSilently
 	}
 
 	if t.PreFilterIn != nil {
@@ -418,6 +583,7 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 	}
 
 	if outcome != filter.Accept {
+		metricPacketInDropFilter.Add(1)
 
 		// Tell them, via TSMP, we're dropping them due to the ACL.
 		// Their host networking stack can translate this into ICMP
@@ -456,8 +622,10 @@ func (t *Wrapper) filterIn(buf []byte) filter.Response {
 // Write accepts an incoming packet. The packet begins at buf[offset:],
 // like wireguard-go/tun.Device.Write.
 func (t *Wrapper) Write(buf []byte, offset int) (int, error) {
+	metricPacketIn.Add(1)
 	if !t.disableFilter {
 		if t.filterIn(buf[offset:]) != filter.Accept {
+			metricPacketInDrop.Add(1)
 			// If we're not accepting the packet, lie to wireguard-go and pretend
 			// that everything is okay with a nil error, so wireguard-go
 			// doesn't log about this Write "failure".
@@ -476,6 +644,13 @@ func (t *Wrapper) Write(buf []byte, offset int) (int, error) {
 	}
 
 	t.noteActivity()
+	return t.tdevWrite(buf, offset)
+}
+
+func (t *Wrapper) tdevWrite(buf []byte, offset int) (int, error) {
+	if t.isTAP {
+		return t.tapWrite(buf, offset)
+	}
 	return t.tdev.Write(buf, offset)
 }
 
@@ -508,7 +683,7 @@ func (t *Wrapper) InjectInboundDirect(buf []byte, offset int) error {
 	}
 
 	// Write to the underlying device to skip filters.
-	_, err := t.tdev.Write(buf, offset)
+	_, err := t.tdevWrite(buf, offset)
 	return err
 }
 
@@ -566,15 +741,23 @@ func (t *Wrapper) InjectOutbound(packet []byte) error {
 	if len(packet) == 0 {
 		return nil
 	}
-	select {
-	case <-t.closed:
-		return ErrClosed
-	case t.outbound <- packet:
-		return nil
-	}
+	t.sendOutbound(tunReadResult{data: packet})
+	return nil
 }
 
 // Unwrap returns the underlying tun.Device.
 func (t *Wrapper) Unwrap() tun.Device {
 	return t.tdev
 }
+
+var (
+	metricPacketIn              = clientmetric.NewGauge("tstun_in_from_wg")
+	metricPacketInDrop          = clientmetric.NewGauge("tstun_in_from_wg_drop")
+	metricPacketInDropFilter    = clientmetric.NewGauge("tstun_in_from_wg_drop_filter")
+	metricPacketInDropSelfDisco = clientmetric.NewGauge("tstun_in_from_wg_drop_self_disco")
+
+	metricPacketOut              = clientmetric.NewGauge("tstun_out_to_wg")
+	metricPacketOutDrop          = clientmetric.NewGauge("tstun_out_to_wg_drop")
+	metricPacketOutDropFilter    = clientmetric.NewGauge("tstun_out_to_wg_drop_filter")
+	metricPacketOutDropSelfDisco = clientmetric.NewGauge("tstun_out_to_wg_drop_self_disco")
+)

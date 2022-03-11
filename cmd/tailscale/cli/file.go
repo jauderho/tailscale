@@ -11,25 +11,24 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/time/rate"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/tailcfg"
 	"tailscale.com/version"
 )
 
@@ -55,7 +54,7 @@ var fileCpCmd = &ffcli.Command{
 	ShortHelp:  "Copy file(s) to a host",
 	Exec:       runCp,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("cp", flag.ExitOnError)
+		fs := newFlagSet("cp")
 		fs.StringVar(&cpArgs.name, "name", "", "alternate filename to use, especially useful when <file> is \"-\" (stdin)")
 		fs.BoolVar(&cpArgs.verbose, "verbose", false, "verbose output")
 		fs.BoolVar(&cpArgs.targets, "targets", false, "list possible file cp targets")
@@ -91,17 +90,17 @@ func runCp(ctx context.Context, args []string) error {
 	} else if hadBrackets && (err != nil || !ip.Is6()) {
 		return errors.New("unexpected brackets around target")
 	}
-	ip, err := tailscaleIPFromArg(ctx, target)
+	ip, _, err := tailscaleIPFromArg(ctx, target)
 	if err != nil {
 		return err
 	}
 
-	peerAPIBase, isOffline, err := discoverPeerAPIBase(ctx, ip)
+	stableID, isOffline, err := getTargetStableID(ctx, ip)
 	if err != nil {
 		return fmt.Errorf("can't send to %s: %v", target, err)
 	}
 	if isOffline {
-		fmt.Fprintf(os.Stderr, "# warning: %s is offline\n", target)
+		fmt.Fprintf(Stderr, "# warning: %s is offline\n", target)
 	}
 
 	if len(files) > 1 {
@@ -149,37 +148,26 @@ func runCp(ctx context.Context, args []string) error {
 				name = filepath.Base(fileArg)
 			}
 
-			if slow, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_SLOW_PUSH")); slow {
+			if envknob.Bool("TS_DEBUG_SLOW_PUSH") {
 				fileContents = &slowReader{r: fileContents}
 			}
 		}
 
-		dstURL := peerAPIBase + "/v0/put/" + url.PathEscape(name)
-		req, err := http.NewRequestWithContext(ctx, "PUT", dstURL, fileContents)
-		if err != nil {
-			return err
-		}
-		req.ContentLength = contentLength
 		if cpArgs.verbose {
-			log.Printf("sending to %v ...", dstURL)
+			log.Printf("sending %q to %v/%v/%v ...", name, target, ip, stableID)
 		}
-		res, err := http.DefaultClient.Do(req)
+		err := tailscale.PushFile(ctx, stableID, contentLength, name, fileContents)
 		if err != nil {
 			return err
 		}
-		if res.StatusCode == 200 {
-			io.Copy(ioutil.Discard, res.Body)
-			res.Body.Close()
-			continue
+		if cpArgs.verbose {
+			log.Printf("sent %q", name)
 		}
-		io.Copy(os.Stdout, res.Body)
-		res.Body.Close()
-		return errors.New(res.Status)
 	}
 	return nil
 }
 
-func discoverPeerAPIBase(ctx context.Context, ipStr string) (base string, isOffline bool, err error) {
+func getTargetStableID(ctx context.Context, ipStr string) (id tailcfg.StableNodeID, isOffline bool, err error) {
 	ip, err := netaddr.ParseIP(ipStr)
 	if err != nil {
 		return "", false, err
@@ -195,7 +183,7 @@ func discoverPeerAPIBase(ctx context.Context, ipStr string) (base string, isOffl
 				continue
 			}
 			isOffline = n.Online != nil && !*n.Online
-			return ft.PeerAPIURL, isOffline, nil
+			return n.StableID, isOffline, nil
 		}
 	}
 	return "", false, fileTargetErrorDetail(ctx, ip)
@@ -293,7 +281,7 @@ func runCpTargets(ctx context.Context, args []string) error {
 		if detail != "" {
 			detail = "\t" + detail
 		}
-		fmt.Printf("%s\t%s%s\n", n.Addresses[0].IP(), n.ComputedName, detail)
+		printf("%s\t%s%s\n", n.Addresses[0].IP(), n.ComputedName, detail)
 	}
 	return nil
 }
@@ -304,7 +292,7 @@ var fileGetCmd = &ffcli.Command{
 	ShortHelp:  "Move files out of the Tailscale file inbox",
 	Exec:       runFileGet,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("get", flag.ExitOnError)
+		fs := newFlagSet("get")
 		fs.BoolVar(&getArgs.wait, "wait", false, "wait for a file to arrive if inbox is empty")
 		fs.BoolVar(&getArgs.verbose, "verbose", false, "verbose output")
 		return fs
@@ -336,7 +324,7 @@ func runFileGet(ctx context.Context, args []string) error {
 	for {
 		wfs, err = tailscale.WaitingFiles(ctx)
 		if err != nil {
-			return fmt.Errorf("getting WaitingFiles: %v", err)
+			return fmt.Errorf("getting WaitingFiles: %w", err)
 		}
 		if len(wfs) != 0 || !getArgs.wait {
 			break
@@ -391,7 +379,7 @@ func wipeInbox(ctx context.Context) error {
 	}
 	wfs, err := tailscale.WaitingFiles(ctx)
 	if err != nil {
-		return fmt.Errorf("getting WaitingFiles: %v", err)
+		return fmt.Errorf("getting WaitingFiles: %w", err)
 	}
 	deleted := 0
 	for _, wf := range wfs {
@@ -415,7 +403,7 @@ func waitForFile(ctx context.Context) error {
 	fileWaiting := make(chan bool, 1)
 	bc.SetNotifyCallback(func(n ipn.Notify) {
 		if n.ErrMessage != nil {
-			log.Fatal(*n.ErrMessage)
+			fatalf("Notify.ErrMessage: %v\n", *n.ErrMessage)
 		}
 		if n.FilesWaiting != nil {
 			select {

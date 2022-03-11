@@ -9,8 +9,13 @@
 package integration
 
 import (
-	"crypto/rand"
+	"bytes"
 	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -24,9 +29,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+	"go4.org/mem"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/logtail"
 	"tailscale.com/net/stun/stuntest"
+	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -34,38 +43,68 @@ import (
 	"tailscale.com/version"
 )
 
-// Binaries are the paths to a tailscaled and tailscale binary.
-// These can be shared by multiple nodes.
-type Binaries struct {
-	Dir    string // temp dir for tailscale & tailscaled
-	Daemon string // tailscaled
-	CLI    string // tailscale
-}
-
-// BuildTestBinaries builds tailscale and tailscaled, failing the test
-// if they fail to compile.
-func BuildTestBinaries(t testing.TB) *Binaries {
-	td := t.TempDir()
-	build(t, td, "tailscale.com/cmd/tailscaled", "tailscale.com/cmd/tailscale")
-	return &Binaries{
-		Dir:    td,
-		Daemon: filepath.Join(td, "tailscaled"+exe()),
-		CLI:    filepath.Join(td, "tailscale"+exe()),
+// CleanupBinaries cleans up any resources created by calls to BinaryDir, TailscaleBinary, or TailscaledBinary.
+// It should be called from TestMain after all tests have completed.
+func CleanupBinaries() {
+	buildOnce.Do(func() {})
+	if binDir != "" {
+		os.RemoveAll(binDir)
 	}
 }
 
-// buildMu limits our use of "go build" to one at a time, so we don't
-// fight Go's built-in caching trying to do the same build concurrently.
-var buildMu sync.Mutex
+// BinaryDir returns a directory containing test tailscale and tailscaled binaries.
+// If any test calls BinaryDir, there must be a TestMain function that calls
+// CleanupBinaries after all tests are complete.
+func BinaryDir(tb testing.TB) string {
+	buildOnce.Do(func() {
+		binDir, buildErr = buildTestBinaries()
+	})
+	if buildErr != nil {
+		tb.Fatal(buildErr)
+	}
+	return binDir
+}
 
-func build(t testing.TB, outDir string, targets ...string) {
-	buildMu.Lock()
-	defer buildMu.Unlock()
+// TailscaleBinary returns the path to the test tailscale binary.
+// If any test calls TailscaleBinary, there must be a TestMain function that calls
+// CleanupBinaries after all tests are complete.
+func TailscaleBinary(tb testing.TB) string {
+	return filepath.Join(BinaryDir(tb), "tailscale"+exe())
+}
 
-	t0 := time.Now()
-	defer func() { t.Logf("built %s in %v", targets, time.Since(t0).Round(time.Millisecond)) }()
+// TailscaledBinary returns the path to the test tailscaled binary.
+// If any test calls TailscaleBinary, there must be a TestMain function that calls
+// CleanupBinaries after all tests are complete.
+func TailscaledBinary(tb testing.TB) string {
+	return filepath.Join(BinaryDir(tb), "tailscaled"+exe())
+}
 
-	goBin := findGo(t)
+var (
+	buildOnce sync.Once
+	buildErr  error
+	binDir    string
+)
+
+// buildTestBinaries builds tailscale and tailscaled.
+// It returns the dir containing the binaries.
+func buildTestBinaries() (string, error) {
+	bindir, err := ioutil.TempDir("", "")
+	if err != nil {
+		return "", err
+	}
+	err = build(bindir, "tailscale.com/cmd/tailscaled", "tailscale.com/cmd/tailscale")
+	if err != nil {
+		os.RemoveAll(bindir)
+		return "", err
+	}
+	return bindir, nil
+}
+
+func build(outDir string, targets ...string) error {
+	goBin, err := findGo()
+	if err != nil {
+		return err
+	}
 	cmd := exec.Command(goBin, "install")
 	if version.IsRace() {
 		cmd.Args = append(cmd.Args, "-race")
@@ -74,7 +113,7 @@ func build(t testing.TB, outDir string, targets ...string) {
 	cmd.Env = append(os.Environ(), "GOARCH="+runtime.GOARCH, "GOBIN="+outDir)
 	errOut, err := cmd.CombinedOutput()
 	if err == nil {
-		return
+		return nil
 	}
 	if strings.Contains(string(errOut), "when GOBIN is set") {
 		// Fallback slow path for cross-compiled binaries.
@@ -83,25 +122,25 @@ func build(t testing.TB, outDir string, targets ...string) {
 			cmd := exec.Command(goBin, "build", "-o", outFile, target)
 			cmd.Env = append(os.Environ(), "GOARCH="+runtime.GOARCH)
 			if errOut, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("failed to build %v with %v: %v, %s", target, goBin, err, errOut)
+				return fmt.Errorf("failed to build %v with %v: %v, %s", target, goBin, err, errOut)
 			}
 		}
-		return
+		return nil
 	}
-	t.Fatalf("failed to build %v with %v: %v, %s", targets, goBin, err, errOut)
+	return fmt.Errorf("failed to build %v with %v: %v, %s", targets, goBin, err, errOut)
 }
 
-func findGo(t testing.TB) string {
+func findGo() (string, error) {
 	goBin := filepath.Join(runtime.GOROOT(), "bin", "go"+exe())
 	if fi, err := os.Stat(goBin); err != nil {
 		if os.IsNotExist(err) {
-			t.Fatalf("failed to find go at %v", goBin)
+			return "", fmt.Errorf("failed to find go at %v", goBin)
 		}
-		t.Fatalf("looking for go binary: %v", err)
+		return "", fmt.Errorf("looking for go binary: %v", err)
 	} else if !fi.Mode().IsRegular() {
-		t.Fatalf("%v is unexpected %v", goBin, fi.Mode())
+		return "", fmt.Errorf("%v is unexpected %v", goBin, fi.Mode())
 	}
-	return goBin
+	return goBin, nil
 }
 
 func exe() string {
@@ -117,13 +156,15 @@ func exe() string {
 func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *tailcfg.DERPMap) {
 	t.Helper()
 
-	var serverPrivateKey key.Private
-	if _, err := rand.Read(serverPrivateKey[:]); err != nil {
+	d := derp.NewServer(key.NewNode(), logf)
+
+	ln, err := net.Listen("tcp", net.JoinHostPort(ipAddress, "0"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	d := derp.NewServer(serverPrivateKey, logf)
 
 	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
+	httpsrv.Listener = ln
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
 	httpsrv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
 	httpsrv.StartTLS()
@@ -137,26 +178,160 @@ func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *
 				RegionCode: "test",
 				Nodes: []*tailcfg.DERPNode{
 					{
-						Name:         "t1",
-						RegionID:     1,
-						HostName:     ipAddress,
-						IPv4:         ipAddress,
-						IPv6:         "none",
-						STUNPort:     stunAddr.Port,
-						DERPTestPort: httpsrv.Listener.Addr().(*net.TCPAddr).Port,
-						STUNTestIP:   stunAddr.IP.String(),
+						Name:             "t1",
+						RegionID:         1,
+						HostName:         ipAddress,
+						IPv4:             ipAddress,
+						IPv6:             "none",
+						STUNPort:         stunAddr.Port,
+						DERPPort:         httpsrv.Listener.Addr().(*net.TCPAddr).Port,
+						InsecureForTests: true,
+						STUNTestIP:       ipAddress,
 					},
 				},
 			},
 		},
 	}
 
+	t.Logf("DERP httpsrv listener: %v", httpsrv.Listener.Addr())
+
 	t.Cleanup(func() {
 		httpsrv.CloseClientConnections()
 		httpsrv.Close()
 		d.Close()
 		stunCleanup()
+		ln.Close()
 	})
 
 	return m
+}
+
+// LogCatcher is a minimal logcatcher for the logtail upload client.
+type LogCatcher struct {
+	mu     sync.Mutex
+	logf   logger.Logf
+	buf    bytes.Buffer
+	gotErr error
+	reqs   int
+	raw    bool // indicates whether to store the raw JSON logs uploaded, instead of just the text
+}
+
+// UseLogf makes the logcatcher implementation use a given logf function
+// to dump all logs to.
+func (lc *LogCatcher) UseLogf(fn logger.Logf) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	lc.logf = fn
+}
+
+// StoreRawJSON instructs lc to save the raw JSON uploads, rather than just the text.
+func (lc *LogCatcher) StoreRawJSON() {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	lc.raw = true
+}
+
+func (lc *LogCatcher) logsContains(sub mem.RO) bool {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return mem.Contains(mem.B(lc.buf.Bytes()), sub)
+}
+
+func (lc *LogCatcher) numRequests() int {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.reqs
+}
+
+func (lc *LogCatcher) logsString() string {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.buf.String()
+}
+
+// Reset clears the buffered logs from memory.
+func (lc *LogCatcher) Reset() {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	lc.buf.Reset()
+}
+
+func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// POST /c/<collection-name>/<private-ID>
+	if r.Method != "POST" {
+		log.Printf("bad logcatcher method: %v", r.Method)
+		http.Error(w, "only POST is supported", 400)
+		return
+	}
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/c/"), "/")
+	if len(pathParts) != 2 {
+		log.Printf("bad logcatcher path: %q", r.URL.Path)
+		http.Error(w, "bad URL", 400)
+		return
+	}
+	// collectionName := pathPaths[0]
+	privID, err := logtail.ParsePrivateID(pathParts[1])
+	if err != nil {
+		log.Printf("bad log ID: %q: %v", r.URL.Path, err)
+	}
+
+	var body io.Reader = r.Body
+	if r.Header.Get("Content-Encoding") == "zstd" {
+		var err error
+		var dec *zstd.Decoder
+		dec, err = smallzstd.NewDecoder(body)
+		if err != nil {
+			log.Printf("bad caught zstd: %v", err)
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		defer dec.Close()
+		body = dec
+	}
+	bodyBytes, _ := ioutil.ReadAll(body)
+
+	type Entry struct {
+		Logtail struct {
+			ClientTime time.Time `json:"client_time"`
+			ServerTime time.Time `json:"server_time"`
+			Error      struct {
+				BadData string `json:"bad_data"`
+			} `json:"error"`
+		} `json:"logtail"`
+		Text string `json:"text"`
+	}
+	var jreq []Entry
+	if len(bodyBytes) > 0 && bodyBytes[0] == '[' {
+		err = json.Unmarshal(bodyBytes, &jreq)
+	} else {
+		var ent Entry
+		err = json.Unmarshal(bodyBytes, &ent)
+		jreq = append(jreq, ent)
+	}
+
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	lc.reqs++
+	if lc.gotErr == nil && err != nil {
+		lc.gotErr = err
+	}
+	if err != nil {
+		fmt.Fprintf(&lc.buf, "error from %s of %#q: %v\n", r.Method, bodyBytes, err)
+		if lc.logf != nil {
+			lc.logf("error from %s of %#q: %v\n", r.Method, bodyBytes, err)
+		}
+	} else {
+		id := privID.Public().String()[:3] // good enough for integration tests
+		for _, ent := range jreq {
+			if lc.raw {
+				lc.buf.Write(bodyBytes)
+				continue
+			}
+			fmt.Fprintf(&lc.buf, "%s\n", strings.TrimSpace(ent.Text))
+			if lc.logf != nil {
+				lc.logf("logcatch:%s: %s", id, strings.TrimSpace(ent.Text))
+			}
+		}
+	}
+	w.WriteHeader(200) // must have no content, but not a 204
 }

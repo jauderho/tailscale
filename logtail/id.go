@@ -7,6 +7,7 @@ package logtail
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -112,6 +113,16 @@ func ParsePublicID(s string) (PublicID, error) {
 	return p, nil
 }
 
+// MustParsePublicID calls ParsePublicID and panics in case of an error.
+// It is intended for use with constant strings, typically in tests.
+func MustParsePublicID(s string) PublicID {
+	id, err := ParsePublicID(s)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
 func (id PublicID) MarshalText() ([]byte, error) {
 	b := make([]byte, hex.EncodedLen(len(id)))
 	if i := hex.Encode(b, id[:]); i != len(b) {
@@ -155,4 +166,22 @@ func fromHexChar(c byte) (byte, bool) {
 	}
 
 	return 0, false
+}
+
+func (id1 PublicID) Less(id2 PublicID) bool {
+	for i, c1 := range id1[:] {
+		c2 := id2[i]
+		if c1 != c2 {
+			return c1 < c2
+		}
+	}
+	return false // equal
+}
+
+func (id PublicID) IsZero() bool {
+	return id == PublicID{}
+}
+
+func (id PublicID) Prefix64() uint64 {
+	return binary.BigEndian.Uint64(id[:8])
 }

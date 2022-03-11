@@ -2,19 +2,21 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux
+//go:build !windows
+// +build !windows
 
 package vms
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"text/template"
 
-	"tailscale.com/tstest/integration"
 	"tailscale.com/types/logger"
 )
 
@@ -119,7 +121,10 @@ in {
   boot.extraModulePackages = [ ];
 
   # Curl is needed for one of the steps in cloud-final
-  systemd.services.cloud-final.path = [ pkgs.curl ];
+  systemd.services.cloud-final.path = with pkgs; [ curl ];
+
+  # Curl is needed for one of the integration tests
+  environment.systemPackages = with pkgs; [ curl ];
 
   # yolo, this vm can sudo freely.
   security.sudo.wheelNeedsPassword = false;
@@ -142,33 +147,46 @@ in {
     # Use the Tailscale package we just assembled.
     package = testTailscale;
   };
+
+  # Override TS_LOG_TARGET to our private logcatcher.
+  systemd.services.tailscaled.environment."TS_LOG_TARGET" = "{{.LogTarget}}";
 }`
 
-func copyUnit(t *testing.T, bins *integration.Binaries) {
+func (h *Harness) copyUnit(t *testing.T) {
 	t.Helper()
 
 	data, err := os.ReadFile("../../../cmd/tailscaled/tailscaled.service")
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.MkdirAll(filepath.Join(bins.Dir, "systemd"), 0755)
-	err = os.WriteFile(filepath.Join(bins.Dir, "systemd", "tailscaled.service"), data, 0666)
+	os.MkdirAll(filepath.Join(h.binaryDir, "systemd"), 0755)
+	err = os.WriteFile(filepath.Join(h.binaryDir, "systemd", "tailscaled.service"), data, 0666)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-func makeNixOSImage(t *testing.T, d Distro, cdir string, bins *integration.Binaries) string {
-	copyUnit(t, bins)
+func (h *Harness) makeNixOSImage(t *testing.T, d Distro, cdir string) string {
+	if d.Name == "nixos-unstable" {
+		t.Skip("https://github.com/NixOS/nixpkgs/issues/131098")
+	}
+
+	h.copyUnit(t)
 	dir := t.TempDir()
-	fname := filepath.Join(dir, d.name+".nix")
+	fname := filepath.Join(dir, d.Name+".nix")
 	fout, err := os.Create(fname)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	tmpl := template.Must(template.New("base.nix").Parse(nixosConfigTemplate))
-	err = tmpl.Execute(fout, struct{ BinPath string }{BinPath: bins.Dir})
+	err = tmpl.Execute(fout, struct {
+		BinPath   string
+		LogTarget string
+	}{
+		BinPath:   h.binaryDir,
+		LogTarget: h.loginServerURL,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,25 +200,34 @@ func makeNixOSImage(t *testing.T, d Distro, cdir string, bins *integration.Binar
 	os.MkdirAll(outpath, 0755)
 
 	t.Cleanup(func() {
-		os.RemoveAll(filepath.Join(outpath, d.name)) // makes the disk image a candidate for GC
+		os.RemoveAll(filepath.Join(outpath, d.Name)) // makes the disk image a candidate for GC
 	})
 
-	cmd := exec.Command("nixos-generate", "-f", "qcow", "-o", filepath.Join(outpath, d.name), "-c", fname)
+	cmd := exec.Command("nixos-generate", "-f", "qcow", "-o", filepath.Join(outpath, d.Name), "-c", fname)
 	if *verboseNixOutput {
 		cmd.Stdout = logger.FuncWriter(t.Logf)
 		cmd.Stderr = logger.FuncWriter(t.Logf)
 	} else {
-		t.Log("building nixos image...")
+		fname := fmt.Sprintf("nix-build-%s-%s", os.Getenv("GITHUB_RUN_NUMBER"), strings.Replace(t.Name(), "/", "-", -1))
+		t.Logf("writing nix logs to %s", fname)
+		fout, err := os.Create(fname)
+		if err != nil {
+			t.Fatalf("can't make log file for nix build: %v", err)
+		}
+		cmd.Stdout = fout
+		cmd.Stderr = fout
+		defer fout.Close()
 	}
-	cmd.Env = append(os.Environ(), "NIX_PATH=nixpkgs="+d.url)
+	cmd.Env = append(os.Environ(), "NIX_PATH=nixpkgs="+d.URL)
 	cmd.Dir = outpath
+	t.Logf("running %s %#v", "nixos-generate", cmd.Args)
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("error while making NixOS image for %s: %v", d.name, err)
+		t.Fatalf("error while making NixOS image for %s: %v", d.Name, err)
 	}
 
 	if !*verboseNixOutput {
 		t.Log("done")
 	}
 
-	return filepath.Join(outpath, d.name, "nixos.qcow2")
+	return filepath.Join(outpath, d.Name, "nixos.qcow2")
 }

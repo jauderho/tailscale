@@ -5,12 +5,15 @@
 package dns
 
 import (
+	"bufio"
 	"runtime"
 	"time"
 
 	"inet.af/netaddr"
+	"tailscale.com/health"
 	"tailscale.com/net/dns/resolver"
-	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tsdial"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine/monitor"
@@ -33,39 +36,49 @@ type Manager struct {
 
 	resolver *resolver.Resolver
 	os       OSConfigurator
-
-	config Config
 }
 
 // NewManagers created a new manager from the given config.
-func NewManager(logf logger.Logf, oscfg OSConfigurator, linkMon *monitor.Mon, linkSel resolver.ForwardLinkSelector) *Manager {
+func NewManager(logf logger.Logf, oscfg OSConfigurator, linkMon *monitor.Mon, dialer *tsdial.Dialer, linkSel resolver.ForwardLinkSelector) *Manager {
+	if dialer == nil {
+		panic("nil Dialer")
+	}
 	logf = logger.WithPrefix(logf, "dns: ")
 	m := &Manager{
 		logf:     logf,
-		resolver: resolver.New(logf, linkMon, linkSel),
+		resolver: resolver.New(logf, linkMon, linkSel, dialer),
 		os:       oscfg,
 	}
 	m.logf("using %T", m.os)
 	return m
 }
 
+// Resolver returns the Manager's DNS Resolver.
+func (m *Manager) Resolver() *resolver.Resolver { return m.resolver }
+
 func (m *Manager) Set(cfg Config) error {
-	m.logf("Set: %+v", cfg)
+	m.logf("Set: %v", logger.ArgWriter(func(w *bufio.Writer) {
+		cfg.WriteToBufioWriter(w)
+	}))
 
 	rcfg, ocfg, err := m.compileConfig(cfg)
 	if err != nil {
 		return err
 	}
 
-	m.logf("Resolvercfg: %+v", rcfg)
+	m.logf("Resolvercfg: %v", logger.ArgWriter(func(w *bufio.Writer) {
+		rcfg.WriteToBufioWriter(w)
+	}))
 	m.logf("OScfg: %+v", ocfg)
 
 	if err := m.resolver.SetConfig(rcfg); err != nil {
 		return err
 	}
 	if err := m.os.SetDNS(ocfg); err != nil {
+		health.SetDNSOSHealth(err)
 		return err
 	}
+	health.SetDNSOSHealth(nil)
 
 	return nil
 }
@@ -77,7 +90,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	// authoritative suffixes, even if we don't propagate MagicDNS to
 	// the OS.
 	rcfg.Hosts = cfg.Hosts
-	routes := map[dnsname.FQDN][]netaddr.IPPort{} // assigned conditionally to rcfg.Routes below.
+	routes := map[dnsname.FQDN][]dnstype.Resolver{} // assigned conditionally to rcfg.Routes below.
 	for suffix, resolvers := range cfg.Routes {
 		if len(resolvers) == 0 {
 			rcfg.LocalDomains = append(rcfg.LocalDomains, suffix)
@@ -95,9 +108,12 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 		// case where cfg is entirely zero, in which case these
 		// configs clear all Tailscale DNS settings.
 		return rcfg, ocfg, nil
-	case cfg.hasDefaultResolversOnly():
+	case cfg.hasDefaultIPResolversOnly():
 		// Trivial CorpDNS configuration, just override the OS
 		// resolver.
+		// TODO: for OSes that support it, pass IP:port and DoH
+		// addresses directly to OS.
+		// https://github.com/tailscale/tailscale/issues/1666
 		ocfg.Nameservers = toIPsOnly(cfg.DefaultResolvers)
 		return rcfg, ocfg, nil
 	case cfg.hasDefaultResolvers():
@@ -105,7 +121,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 		// through quad-100.
 		rcfg.Routes = routes
 		rcfg.Routes["."] = cfg.DefaultResolvers
-		ocfg.Nameservers = []netaddr.IP{tsaddr.TailscaleServiceIP()}
+		ocfg.Nameservers = []netaddr.IP{cfg.serviceIP()}
 		return rcfg, ocfg, nil
 	}
 
@@ -142,7 +158,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	// or routes + MagicDNS, or just MagicDNS, or on an OS that cannot
 	// split-DNS. Install a split config pointing at quad-100.
 	rcfg.Routes = routes
-	ocfg.Nameservers = []netaddr.IP{tsaddr.TailscaleServiceIP()}
+	ocfg.Nameservers = []netaddr.IP{cfg.serviceIP()}
 
 	// If the OS can't do native split-dns, read out the underlying
 	// resolver config and blend it into our config.
@@ -152,24 +168,30 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	if !m.os.SupportsSplitDNS() || isWindows {
 		bcfg, err := m.os.GetBaseConfig()
 		if err != nil {
+			health.SetDNSOSHealth(err)
 			return resolver.Config{}, OSConfig{}, err
 		}
-		rcfg.Routes["."] = toIPPorts(bcfg.Nameservers)
+		var defaultRoutes []dnstype.Resolver
+		for _, ip := range bcfg.Nameservers {
+			defaultRoutes = append(defaultRoutes, dnstype.ResolverFromIP(ip))
+		}
+		rcfg.Routes["."] = defaultRoutes
 		ocfg.SearchDomains = append(ocfg.SearchDomains, bcfg.SearchDomains...)
 	}
 
 	return rcfg, ocfg, nil
 }
 
-// toIPsOnly returns only the IP portion of ipps.
-// TODO: this discards port information on the assumption that we're
-// always pointing at port 53.
-// https://github.com/tailscale/tailscale/issues/1666 tracks making
-// that not true, if we ever want to.
-func toIPsOnly(ipps []netaddr.IPPort) (ret []netaddr.IP) {
-	ret = make([]netaddr.IP, 0, len(ipps))
-	for _, ipp := range ipps {
-		ret = append(ret, ipp.IP())
+// toIPsOnly returns only the IP portion of dnstype.Resolver.
+// Only safe to use if the resolvers slice has been cleared of
+// DoH or custom-port entries with something like hasDefaultIPResolversOnly.
+func toIPsOnly(resolvers []dnstype.Resolver) (ret []netaddr.IP) {
+	for _, r := range resolvers {
+		if ipp, err := netaddr.ParseIPPort(r.Addr); err == nil && ipp.Port() == 53 {
+			ret = append(ret, ipp.IP())
+		} else if ip, err := netaddr.ParseIP(r.Addr); err == nil {
+			ret = append(ret, ip)
+		}
 	}
 	return ret
 }
@@ -198,6 +220,10 @@ func (m *Manager) Down() error {
 	return nil
 }
 
+func (m *Manager) FlushCaches() error {
+	return flushCaches()
+}
+
 // Cleanup restores the system DNS configuration to its original state
 // in case the Tailscale daemon terminated without closing the router.
 // No other state needs to be instantiated before this runs.
@@ -207,7 +233,7 @@ func Cleanup(logf logger.Logf, interfaceName string) {
 		logf("creating dns cleanup: %v", err)
 		return
 	}
-	dns := NewManager(logf, oscfg, nil, nil)
+	dns := NewManager(logf, oscfg, nil, new(tsdial.Dialer), nil)
 	if err := dns.Down(); err != nil {
 		logf("dns down: %v", err)
 	}

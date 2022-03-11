@@ -14,9 +14,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"github.com/toqueteos/webbrowser"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
@@ -30,9 +29,24 @@ var statusCmd = &ffcli.Command{
 	Name:       "status",
 	ShortUsage: "status [--active] [--web] [--json]",
 	ShortHelp:  "Show state of tailscaled and its connections",
-	Exec:       runStatus,
+	LongHelp: strings.TrimSpace(`
+
+JSON FORMAT
+
+Warning: this format has changed between releases and might change more
+in the future.
+
+For a description of the fields, see the "type Status" declaration at:
+
+https://github.com/tailscale/tailscale/blob/main/ipn/ipnstate/ipnstate.go
+
+(and be sure to select branch/tag that corresponds to the version
+ of Tailscale you're running)
+
+`),
+	Exec: runStatus,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("status", flag.ExitOnError)
+		fs := newFlagSet("status")
 		fs.BoolVar(&statusArgs.json, "json", false, "output in JSON format (WARNING: format subject to change)")
 		fs.BoolVar(&statusArgs.web, "web", false, "run webserver with HTML showing status")
 		fs.BoolVar(&statusArgs.active, "active", false, "filter output to only peers with active sessions (not applicable to web mode)")
@@ -57,12 +71,12 @@ var statusArgs struct {
 func runStatus(ctx context.Context, args []string) error {
 	st, err := tailscale.Status(ctx)
 	if err != nil {
-		return err
+		return fixTailscaledConnectError(err)
 	}
 	if statusArgs.json {
 		if statusArgs.active {
 			for peer, ps := range st.Peer {
-				if !peerActive(ps) {
+				if !ps.Active {
 					delete(st.Peer, peer)
 				}
 			}
@@ -71,7 +85,7 @@ func runStatus(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s", j)
+		printf("%s", j)
 		return nil
 	}
 	if statusArgs.web {
@@ -80,7 +94,7 @@ func runStatus(ctx context.Context, args []string) error {
 			return err
 		}
 		statusURL := interfaces.HTTPOfListener(ln)
-		fmt.Printf("Serving Tailscale status at %v ...\n", statusURL)
+		printf("Serving Tailscale status at %v ...\n", statusURL)
 		go func() {
 			<-ctx.Done()
 			ln.Close()
@@ -107,30 +121,23 @@ func runStatus(ctx context.Context, args []string) error {
 		return err
 	}
 
-	switch st.BackendState {
-	default:
-		fmt.Fprintf(os.Stderr, "unexpected state: %s\n", st.BackendState)
+	description, ok := isRunningOrStarting(st)
+	if !ok {
+		outln(description)
 		os.Exit(1)
-	case ipn.Stopped.String():
-		fmt.Println("Tailscale is stopped.")
-		os.Exit(1)
-	case ipn.NeedsLogin.String():
-		fmt.Println("Logged out.")
-		if st.AuthURL != "" {
-			fmt.Printf("\nLog in at: %s\n", st.AuthURL)
+	}
+
+	if len(st.Health) > 0 {
+		printf("# Health check:\n")
+		for _, m := range st.Health {
+			printf("#     - %s\n", m)
 		}
-		os.Exit(1)
-	case ipn.NeedsMachineAuth.String():
-		fmt.Println("Machine is not yet authorized by tailnet admin.")
-		os.Exit(1)
-	case ipn.Running.String():
-		// Run below.
+		outln()
 	}
 
 	var buf bytes.Buffer
 	f := func(format string, a ...interface{}) { fmt.Fprintf(&buf, format, a...) }
 	printPS := func(ps *ipnstate.PeerStatus) {
-		active := peerActive(ps)
 		f("%-15s %-20s %-12s %-7s ",
 			firstIPString(ps.TailscaleIPs),
 			dnsOrQuoteHostname(st, ps),
@@ -139,11 +146,19 @@ func runStatus(ctx context.Context, args []string) error {
 		)
 		relay := ps.Relay
 		anyTraffic := ps.TxBytes != 0 || ps.RxBytes != 0
-		if !active {
+		var offline string
+		if !ps.Online {
+			offline = "; offline"
+		}
+		if !ps.Active {
 			if ps.ExitNode {
-				f("idle; exit node")
+				f("idle; exit node" + offline)
+			} else if ps.ExitNodeOption {
+				f("idle; offers exit node" + offline)
 			} else if anyTraffic {
-				f("idle")
+				f("idle" + offline)
+			} else if !ps.Online {
+				f("offline")
 			} else {
 				f("-")
 			}
@@ -151,11 +166,16 @@ func runStatus(ctx context.Context, args []string) error {
 			f("active; ")
 			if ps.ExitNode {
 				f("exit node; ")
+			} else if ps.ExitNodeOption {
+				f("offers exit node; ")
 			}
 			if relay != "" && ps.CurAddr == "" {
 				f("relay %q", relay)
 			} else if ps.CurAddr != "" {
 				f("direct %s", ps.CurAddr)
+			}
+			if !ps.Online {
+				f("; offline")
 			}
 		}
 		if anyTraffic {
@@ -178,22 +198,35 @@ func runStatus(ctx context.Context, args []string) error {
 		}
 		ipnstate.SortPeers(peers)
 		for _, ps := range peers {
-			active := peerActive(ps)
-			if statusArgs.active && !active {
+			if statusArgs.active && !ps.Active {
 				continue
 			}
 			printPS(ps)
 		}
 	}
-	os.Stdout.Write(buf.Bytes())
+	Stdout.Write(buf.Bytes())
 	return nil
 }
 
-// peerActive reports whether ps has recent activity.
-//
-// TODO: have the server report this bool instead.
-func peerActive(ps *ipnstate.PeerStatus) bool {
-	return !ps.LastWrite.IsZero() && time.Since(ps.LastWrite) < 2*time.Minute
+// isRunningOrStarting reports whether st is in state Running or Starting.
+// It also returns a description of the status suitable to display to a user.
+func isRunningOrStarting(st *ipnstate.Status) (description string, ok bool) {
+	switch st.BackendState {
+	default:
+		return fmt.Sprintf("unexpected state: %s", st.BackendState), false
+	case ipn.Stopped.String():
+		return "Tailscale is stopped.", false
+	case ipn.NeedsLogin.String():
+		s := "Logged out."
+		if st.AuthURL != "" {
+			s += fmt.Sprintf("\nLog in at: %s", st.AuthURL)
+		}
+		return s, false
+	case ipn.NeedsMachineAuth.String():
+		return "Machine is not yet authorized by tailnet admin.", false
+	case ipn.Running.String(), ipn.Starting.String():
+		return st.BackendState, true
+	}
 }
 
 func dnsOrQuoteHostname(st *ipnstate.Status, ps *ipnstate.PeerStatus) string {

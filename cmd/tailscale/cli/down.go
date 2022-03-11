@@ -7,10 +7,8 @@ package cli
 import (
 	"context"
 	"fmt"
-	"log"
-	"os"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 )
@@ -25,7 +23,7 @@ var downCmd = &ffcli.Command{
 
 func runDown(ctx context.Context, args []string) error {
 	if len(args) > 0 {
-		log.Fatalf("too many non-flag arguments: %q", args)
+		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
 
 	st, err := tailscale.Status(ctx)
@@ -33,7 +31,7 @@ func runDown(ctx context.Context, args []string) error {
 		return fmt.Errorf("error fetching current status: %w", err)
 	}
 	if st.BackendState == "Stopped" {
-		fmt.Fprintf(os.Stderr, "Tailscale was already stopped.\n")
+		fmt.Fprintf(Stderr, "Tailscale was already stopped.\n")
 		return nil
 	}
 	_, err = tailscale.EditPrefs(ctx, &ipn.MaskedPrefs{

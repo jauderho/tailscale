@@ -11,10 +11,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -45,7 +46,7 @@ relay node.
 `),
 	Exec: runPing,
 	FlagSet: (func() *flag.FlagSet {
-		fs := flag.NewFlagSet("ping", flag.ExitOnError)
+		fs := newFlagSet("ping")
 		fs.BoolVar(&pingArgs.verbose, "verbose", false, "verbose output")
 		fs.BoolVar(&pingArgs.untilDirect, "until-direct", true, "stop once a direct path is established")
 		fs.BoolVar(&pingArgs.tsmp, "tsmp", false, "do a TSMP-level ping (through IP + wireguard, but not involving host OS stack)")
@@ -64,6 +65,16 @@ var pingArgs struct {
 }
 
 func runPing(ctx context.Context, args []string) error {
+	st, err := tailscale.Status(ctx)
+	if err != nil {
+		return fixTailscaledConnectError(err)
+	}
+	description, ok := isRunningOrStarting(st)
+	if !ok {
+		printf("%s\n", description)
+		os.Exit(1)
+	}
+
 	c, bc, ctx, cancel := connect(ctx)
 	defer cancel()
 
@@ -74,7 +85,7 @@ func runPing(ctx context.Context, args []string) error {
 	prc := make(chan *ipnstate.PingResult, 1)
 	bc.SetNotifyCallback(func(n ipn.Notify) {
 		if n.ErrMessage != nil {
-			log.Fatal(*n.ErrMessage)
+			fatalf("Notify.ErrMessage: %v", *n.ErrMessage)
 		}
 		if pr := n.PingResult; pr != nil && pr.IP == ip {
 			prc <- pr
@@ -84,9 +95,13 @@ func runPing(ctx context.Context, args []string) error {
 	go func() { pumpErr <- pump(ctx, bc, c) }()
 
 	hostOrIP := args[0]
-	ip, err := tailscaleIPFromArg(ctx, hostOrIP)
+	ip, self, err := tailscaleIPFromArg(ctx, hostOrIP)
 	if err != nil {
 		return err
+	}
+	if self {
+		printf("%v is local Tailscale IP\n", ip)
+		return nil
 	}
 
 	if pingArgs.verbose && ip != hostOrIP {
@@ -101,12 +116,16 @@ func runPing(ctx context.Context, args []string) error {
 		timer := time.NewTimer(pingArgs.timeout)
 		select {
 		case <-timer.C:
-			fmt.Printf("timeout waiting for ping reply\n")
+			printf("timeout waiting for ping reply\n")
 		case err := <-pumpErr:
 			return err
 		case pr := <-prc:
 			timer.Stop()
 			if pr.Err != "" {
+				if pr.IsLocalIP {
+					outln(pr.Err)
+					return nil
+				}
 				return errors.New(pr.Err)
 			}
 			latency := time.Duration(pr.LatencySeconds * float64(time.Second)).Round(time.Millisecond)
@@ -124,7 +143,7 @@ func runPing(ctx context.Context, args []string) error {
 			if pr.PeerAPIPort != 0 {
 				extra = fmt.Sprintf(", %d", pr.PeerAPIPort)
 			}
-			fmt.Printf("pong from %s (%s%s) via %v in %v\n", pr.NodeName, pr.NodeIP, extra, via, latency)
+			printf("pong from %s (%s%s) via %v in %v\n", pr.NodeName, pr.NodeIP, extra, via, latency)
 			if pingArgs.tsmp {
 				return nil
 			}
@@ -147,33 +166,39 @@ func runPing(ctx context.Context, args []string) error {
 	}
 }
 
-func tailscaleIPFromArg(ctx context.Context, hostOrIP string) (ip string, err error) {
+func tailscaleIPFromArg(ctx context.Context, hostOrIP string) (ip string, self bool, err error) {
 	// If the argument is an IP address, use it directly without any resolution.
 	if net.ParseIP(hostOrIP) != nil {
-		return hostOrIP, nil
+		return hostOrIP, false, nil
 	}
 
 	// Otherwise, try to resolve it first from the network peer list.
 	st, err := tailscale.Status(ctx)
 	if err != nil {
-		return "", err
+		return "", false, err
+	}
+	match := func(ps *ipnstate.PeerStatus) bool {
+		return strings.EqualFold(hostOrIP, dnsOrQuoteHostname(st, ps)) || hostOrIP == ps.DNSName
 	}
 	for _, ps := range st.Peer {
-		if hostOrIP == dnsOrQuoteHostname(st, ps) || hostOrIP == ps.DNSName {
+		if match(ps) {
 			if len(ps.TailscaleIPs) == 0 {
-				return "", errors.New("node found but lacks an IP")
+				return "", false, errors.New("node found but lacks an IP")
 			}
-			return ps.TailscaleIPs[0].String(), nil
+			return ps.TailscaleIPs[0].String(), false, nil
 		}
+	}
+	if match(st.Self) && len(st.Self.TailscaleIPs) > 0 {
+		return st.Self.TailscaleIPs[0].String(), true, nil
 	}
 
 	// Finally, use DNS.
 	var res net.Resolver
 	if addrs, err := res.LookupHost(ctx, hostOrIP); err != nil {
-		return "", fmt.Errorf("error looking up IP of %q: %v", hostOrIP, err)
+		return "", false, fmt.Errorf("error looking up IP of %q: %v", hostOrIP, err)
 	} else if len(addrs) == 0 {
-		return "", fmt.Errorf("no IPs found for %q", hostOrIP)
+		return "", false, fmt.Errorf("no IPs found for %q", hostOrIP)
 	} else {
-		return addrs[0], nil
+		return addrs[0], false, nil
 	}
 }

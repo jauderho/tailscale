@@ -6,10 +6,10 @@ package cli
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"strings"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
 )
 
@@ -28,7 +28,7 @@ a reauthentication.
 
 func runLogout(ctx context.Context, args []string) error {
 	if len(args) > 0 {
-		log.Fatalf("too many non-flag arguments: %q", args)
+		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
 	return tailscale.Logout(ctx)
 }

@@ -23,6 +23,7 @@ import (
 
 	"inet.af/netaddr"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/tailcfg"
 )
@@ -89,12 +90,13 @@ func Lookup(ctx context.Context, host string) ([]netaddr.IP, error) {
 // serverName and serverIP of are, say, "derpN.tailscale.com".
 // queryName is the name being sought (e.g. "controlplane.tailscale.com"), passed as hint.
 func bootstrapDNSMap(ctx context.Context, serverName string, serverIP netaddr.IP, queryName string) (dnsMap, error) {
-	dialer := netns.NewDialer()
+	dialer := netns.NewDialer(log.Printf)
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = tshttpproxy.ProxyFromEnvironment
 	tr.DialContext = func(ctx context.Context, netw, addr string) (net.Conn, error) {
 		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(serverIP.String(), "443"))
 	}
+	tr.TLSClientConfig = tlsdial.Config(serverName, tr.TLSClientConfig)
 	c := &http.Client{Transport: tr}
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+serverName+"/bootstrap-dns?q="+url.QueryEscape(queryName), nil)
 	if err != nil {

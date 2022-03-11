@@ -5,10 +5,10 @@
 package interfaces
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/url"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -92,7 +92,7 @@ func likelyHomeRouterIPWindows() (ret netaddr.IP, ok bool) {
 		}
 	}
 
-	if !ret.IsZero() && !isPrivateIP(ret) {
+	if !ret.IsZero() && !ret.IsPrivate() {
 		// Default route has a non-private gateway
 		return netaddr.IP{}, false
 	}
@@ -111,22 +111,40 @@ func NonTailscaleMTUs() (map[winipcfg.LUID]uint32, error) {
 	return mtus, err
 }
 
+func notTailscaleInterface(iface *winipcfg.IPAdapterAddresses) bool {
+	// TODO(bradfitz): do this without the Description method's
+	// utf16-to-string allocation. But at least we only do it for
+	// the virtual interfaces, for which there won't be many.
+	if iface.IfType != winipcfg.IfTypePropVirtual {
+		return true
+	}
+	desc := iface.Description()
+	return !(strings.Contains(desc, tsconst.WintunInterfaceDesc) ||
+		strings.Contains(desc, tsconst.WintunInterfaceDesc0_14))
+}
+
 // NonTailscaleInterfaces returns a map of interface LUID to interface
 // for all interfaces except Tailscale tunnels.
 func NonTailscaleInterfaces() (map[winipcfg.LUID]*winipcfg.IPAdapterAddresses, error) {
-	ifs, err := winipcfg.GetAdaptersAddresses(windows.AF_UNSPEC, winipcfg.GAAFlagIncludeAllInterfaces)
+	return getInterfaces(windows.AF_UNSPEC, winipcfg.GAAFlagIncludeAllInterfaces, notTailscaleInterface)
+}
+
+// getInterfaces returns a map of interfaces keyed by their LUID for
+// all interfaces matching the provided match predicate.
+//
+// The family (AF_UNSPEC, AF_INET, or AF_INET6) and flags are passed
+// to winipcfg.GetAdaptersAddresses.
+func getInterfaces(family winipcfg.AddressFamily, flags winipcfg.GAAFlags, match func(*winipcfg.IPAdapterAddresses) bool) (map[winipcfg.LUID]*winipcfg.IPAdapterAddresses, error) {
+	ifs, err := winipcfg.GetAdaptersAddresses(family, flags)
 	if err != nil {
 		return nil, err
 	}
-
 	ret := map[winipcfg.LUID]*winipcfg.IPAdapterAddresses{}
 	for _, iface := range ifs {
-		if iface.Description() == tsconst.WintunInterfaceDesc {
-			continue
+		if match(iface) {
+			ret[iface.LUID] = iface
 		}
-		ret[iface.LUID] = iface
 	}
-
 	return ret, nil
 }
 
@@ -134,8 +152,26 @@ func NonTailscaleInterfaces() (map[winipcfg.LUID]*winipcfg.IPAdapterAddresses, e
 // default route for the given address family.
 //
 // It returns (nil, nil) if no interface is found.
+//
+// The family must be one of AF_INET or AF_INET6.
 func GetWindowsDefault(family winipcfg.AddressFamily) (*winipcfg.IPAdapterAddresses, error) {
-	ifs, err := NonTailscaleInterfaces()
+	ifs, err := getInterfaces(family, winipcfg.GAAFlagIncludeAllInterfaces, func(iface *winipcfg.IPAdapterAddresses) bool {
+		switch iface.IfType {
+		case winipcfg.IfTypeSoftwareLoopback:
+			return false
+		}
+		switch family {
+		case windows.AF_INET:
+			if iface.Flags&winipcfg.IPAAFlagIpv4Enabled == 0 {
+				return false
+			}
+		case windows.AF_INET6:
+			if iface.Flags&winipcfg.IPAAFlagIpv6Enabled == 0 {
+				return false
+			}
+		}
+		return iface.OperStatus == winipcfg.IfOperStatusUp && notTailscaleInterface(iface)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -148,12 +184,31 @@ func GetWindowsDefault(family winipcfg.AddressFamily) (*winipcfg.IPAdapterAddres
 	bestMetric := ^uint32(0)
 	var bestIface *winipcfg.IPAdapterAddresses
 	for _, route := range routes {
-		iface := ifs[route.InterfaceLUID]
-		if route.DestinationPrefix.PrefixLength != 0 || iface == nil {
+		if route.DestinationPrefix.PrefixLength != 0 {
+			// Not a default route.
 			continue
 		}
-		if iface.OperStatus == winipcfg.IfOperStatusUp && route.Metric < bestMetric {
-			bestMetric = route.Metric
+		iface := ifs[route.InterfaceLUID]
+		if iface == nil {
+			continue
+		}
+
+		// Microsoft docs say:
+		//
+		// "The actual route metric used to compute the route
+		// preferences for IPv4 is the summation of the route
+		// metric offset specified in the Metric member of the
+		// MIB_IPFORWARD_ROW2 structure and the interface
+		// metric specified in this member for IPv4"
+		metric := route.Metric
+		switch family {
+		case windows.AF_INET:
+			metric += iface.Ipv4Metric
+		case windows.AF_INET6:
+			metric += iface.Ipv6Metric
+		}
+		if metric < bestMetric {
+			bestMetric = metric
 			bestIface = iface
 		}
 	}
@@ -161,15 +216,20 @@ func GetWindowsDefault(family winipcfg.AddressFamily) (*winipcfg.IPAdapterAddres
 	return bestIface, nil
 }
 
-func DefaultRouteInterface() (string, error) {
+func defaultRoute() (d DefaultRouteDetails, err error) {
+	// We always return the IPv4 default route.
+	// TODO(bradfitz): adjust API if/when anything cares. They could in theory differ, though,
+	// in which case we might send traffic to the wrong interface.
 	iface, err := GetWindowsDefault(windows.AF_INET)
 	if err != nil {
-		return "", err
+		return d, err
 	}
-	if iface == nil {
-		return "(none)", nil
+	if iface != nil {
+		d.InterfaceName = iface.FriendlyName()
+		d.InterfaceDesc = iface.Description()
+		d.InterfaceIndex = int(iface.IfIndex)
 	}
-	return fmt.Sprintf("%s (%s)", iface.FriendlyName(), iface.Description()), nil
+	return d, nil
 }
 
 var (
@@ -198,6 +258,10 @@ func getPACWindows() string {
 		}
 		defer globalFree.Call(uintptr(unsafe.Pointer(res)))
 		s := windows.UTF16PtrToString(res)
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return "" // Issue 2357: invalid URL "\n" from winhttp; ignoring
+		}
 		if _, err := url.Parse(s); err != nil {
 			log.Printf("getPACWindows: invalid URL %q from winhttp; ignoring", s)
 			return ""

@@ -13,7 +13,8 @@ import (
 	"time"
 
 	"inet.af/netaddr"
-	"tailscale.com/types/wgkey"
+	"tailscale.com/tstest"
+	"tailscale.com/types/key"
 	"tailscale.com/version"
 )
 
@@ -31,7 +32,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"ShieldsUp", "ShareeNode",
 		"GoArch",
 		"RoutableIPs", "RequestTags",
-		"Services", "NetInfo",
+		"Services", "NetInfo", "SSH_HostKeys",
 	}
 	if have := fieldsOf(reflect.TypeOf(Hostinfo{})); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -180,6 +181,11 @@ func TestHostinfoEqual(t *testing.T) {
 			&Hostinfo{},
 			false,
 		},
+		{
+			&Hostinfo{SSH_HostKeys: []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO.... root@bar"}},
+			&Hostinfo{},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
@@ -189,12 +195,89 @@ func TestHostinfoEqual(t *testing.T) {
 	}
 }
 
+func TestHostinfoHowEqual(t *testing.T) {
+	tests := []struct {
+		a, b *Hostinfo
+		want []string
+	}{
+		{
+			a:    nil,
+			b:    nil,
+			want: nil,
+		},
+		{
+			a:    new(Hostinfo),
+			b:    nil,
+			want: []string{"nil"},
+		},
+		{
+			a:    nil,
+			b:    new(Hostinfo),
+			want: []string{"nil"},
+		},
+		{
+			a:    new(Hostinfo),
+			b:    new(Hostinfo),
+			want: nil,
+		},
+		{
+			a: &Hostinfo{
+				IPNVersion:  "1",
+				ShieldsUp:   false,
+				RoutableIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.2.3.0/24")},
+			},
+			b: &Hostinfo{
+				IPNVersion:  "2",
+				ShieldsUp:   true,
+				RoutableIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.2.3.0/25")},
+			},
+			want: []string{"IPNVersion", "ShieldsUp", "RoutableIPs"},
+		},
+		{
+			a: &Hostinfo{
+				IPNVersion: "1",
+			},
+			b: &Hostinfo{
+				IPNVersion: "2",
+				NetInfo:    new(NetInfo),
+			},
+			want: []string{"IPNVersion", "NetInfo.nil"},
+		},
+		{
+			a: &Hostinfo{
+				IPNVersion: "1",
+				NetInfo: &NetInfo{
+					WorkingIPv6:   "true",
+					HavePortMap:   true,
+					LinkType:      "foo",
+					PreferredDERP: 123,
+					DERPLatency: map[string]float64{
+						"foo": 1.0,
+					},
+				},
+			},
+			b: &Hostinfo{
+				IPNVersion: "2",
+				NetInfo:    &NetInfo{},
+			},
+			want: []string{"IPNVersion", "NetInfo.WorkingIPv6", "NetInfo.HavePortMap", "NetInfo.PreferredDERP", "NetInfo.LinkType", "NetInfo.DERPLatency"},
+		},
+	}
+	for i, tt := range tests {
+		got := tt.a.HowUnequal(tt.b)
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("%d. got %q; want %q", i, got, tt.want)
+		}
+	}
+}
+
 func TestNodeEqual(t *testing.T) {
 	nodeHandles := []string{
 		"ID", "StableID", "Name", "User", "Sharer",
 		"Key", "KeyExpiry", "Machine", "DiscoKey",
 		"Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo",
-		"Created", "LastSeen", "Online", "KeepAlive", "MachineAuthorized",
+		"Created", "Tags", "PrimaryRoutes",
+		"LastSeen", "Online", "KeepAlive", "MachineAuthorized",
 		"Capabilities",
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
 	}
@@ -203,15 +286,8 @@ func TestNodeEqual(t *testing.T) {
 			have, nodeHandles)
 	}
 
-	newPublicKey := func(t *testing.T) wgkey.Key {
-		t.Helper()
-		k, err := wgkey.NewPrivate()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return k.Public()
-	}
-	n1 := newPublicKey(t)
+	n1 := key.NewNode().Public()
+	m1 := key.NewMachine().Public()
 	now := time.Now()
 
 	tests := []struct {
@@ -269,13 +345,13 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Key: NodeKey(n1)},
-			&Node{Key: NodeKey(newPublicKey(t))},
+			&Node{Key: n1},
+			&Node{Key: key.NewNode().Public()},
 			false,
 		},
 		{
-			&Node{Key: NodeKey(n1)},
-			&Node{Key: NodeKey(n1)},
+			&Node{Key: n1},
+			&Node{Key: n1},
 			true,
 		},
 		{
@@ -289,13 +365,13 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Machine: MachineKey(n1)},
-			&Node{Machine: MachineKey(newPublicKey(t))},
+			&Node{Machine: m1},
+			&Node{Machine: key.NewMachine().Public()},
 			false,
 		},
 		{
-			&Node{Machine: MachineKey(n1)},
-			&Node{Machine: MachineKey(n1)},
+			&Node{Machine: m1},
+			&Node{Machine: m1},
 			true,
 		},
 		{
@@ -329,13 +405,13 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Hostinfo: Hostinfo{Hostname: "alice"}},
-			&Node{Hostinfo: Hostinfo{Hostname: "bob"}},
+			&Node{Hostinfo: (&Hostinfo{Hostname: "alice"}).View()},
+			&Node{Hostinfo: (&Hostinfo{Hostname: "bob"}).View()},
 			false,
 		},
 		{
-			&Node{Hostinfo: Hostinfo{}},
-			&Node{Hostinfo: Hostinfo{}},
+			&Node{Hostinfo: (&Hostinfo{}).View()},
+			&Node{Hostinfo: (&Hostinfo{}).View()},
 			true,
 		},
 		{
@@ -361,6 +437,26 @@ func TestNodeEqual(t *testing.T) {
 		{
 			&Node{DERP: "foo"},
 			&Node{DERP: "bar"},
+			false,
+		},
+		{
+			&Node{Tags: []string{"tag:foo"}},
+			&Node{Tags: []string{"tag:foo"}},
+			true,
+		},
+		{
+			&Node{Tags: []string{"tag:foo", "tag:bar"}},
+			&Node{Tags: []string{"tag:bar"}},
+			false,
+		},
+		{
+			&Node{Tags: []string{"tag:foo"}},
+			&Node{Tags: []string{"tag:bar"}},
+			false,
+		},
+		{
+			&Node{Tags: []string{"tag:foo"}},
+			&Node{},
 			false,
 		},
 	}
@@ -390,30 +486,6 @@ func TestNetInfoFields(t *testing.T) {
 		t.Errorf("NetInfo.Clone/BasicallyEqually check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, handled)
 	}
-}
-
-func TestMachineKeyMarshal(t *testing.T) {
-	var k1, k2 MachineKey
-	for i := range k1 {
-		k1[i] = byte(i)
-	}
-	testKey(t, "mkey:", k1, &k2)
-}
-
-func TestNodeKeyMarshal(t *testing.T) {
-	var k1, k2 NodeKey
-	for i := range k1 {
-		k1[i] = byte(i)
-	}
-	testKey(t, "nodekey:", k1, &k2)
-}
-
-func TestDiscoKeyMarshal(t *testing.T) {
-	var k1, k2 DiscoKey
-	for i := range k1 {
-		k1[i] = byte(i)
-	}
-	testKey(t, "discokey:", k1, &k2)
 }
 
 type keyIn interface {
@@ -535,19 +607,18 @@ func TestAppendKeyAllocs(t *testing.T) {
 		t.Skip("skipping in race detector") // append(b, make([]byte, N)...) not optimized in compiler with race
 	}
 	var k [32]byte
-	n := int(testing.AllocsPerRun(1000, func() {
+	err := tstest.MinAllocsPerRun(t, 1, func() {
 		sinkBytes = keyMarshalText("prefix", k)
-	}))
-	if n != 1 {
-		t.Fatalf("allocs = %v; want 1", n)
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestDiscoKeyAppend(t *testing.T) {
-	d := DiscoKey{1: 1, 2: 2}
-	got := string(d.AppendTo([]byte("foo")))
-	want := "foodiscokey:0001020000000000000000000000000000000000000000000000000000000000"
-	if got != want {
-		t.Errorf("got %q; want %q", got, want)
+func TestRegisterRequestNilClone(t *testing.T) {
+	var nilReq *RegisterRequest
+	got := nilReq.Clone()
+	if got != nil {
+		t.Errorf("got = %v; want nil", got)
 	}
 }

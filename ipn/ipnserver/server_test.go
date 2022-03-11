@@ -13,6 +13,8 @@ import (
 
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
+	"tailscale.com/ipn/store/mem"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
 	"tailscale.com/wgengine"
 )
@@ -32,10 +34,11 @@ func TestRunMultipleAccepts(t *testing.T) {
 		t.Logf(format, args...)
 	}
 
+	s := safesocket.DefaultConnectionStrategy(socketPath)
 	connect := func() {
 		for i := 1; i <= 2; i++ {
 			logf("connect %d ...", i)
-			c, err := safesocket.Connect(socketPath, 0)
+			c, err := safesocket.Connect(s)
 			if err != nil {
 				t.Fatalf("safesocket.Connect: %v\n", err)
 			}
@@ -60,12 +63,18 @@ func TestRunMultipleAccepts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer eng.Close()
+	t.Cleanup(eng.Close)
 
-	opts := ipnserver.Options{
-		SocketPath: socketPath,
-	}
+	opts := ipnserver.Options{}
 	t.Logf("pre-Run")
-	err = ipnserver.Run(ctx, logTriggerTestf, "dummy_logid", ipnserver.FixedEngine(eng), opts)
+	store := new(mem.Store)
+
+	ln, _, err := safesocket.Listen(socketPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	err = ipnserver.Run(ctx, logTriggerTestf, ln, store, nil /* mon */, new(tsdial.Dialer), "dummy_logid", ipnserver.FixedEngine(eng), opts)
 	t.Logf("ipnserver.Run = %v", err)
 }

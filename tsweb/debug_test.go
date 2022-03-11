@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,25 @@ func TestDebugger(t *testing.T) {
 	if dbg2 != dbg1 {
 		t.Fatal("Debugger returned different debuggers for the same mux")
 	}
+
+	t.Run("cpu_pprof", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping second long test")
+		}
+		switch runtime.GOOS {
+		case "linux", "darwin":
+		default:
+			t.Skipf("skipping test on %v", runtime.GOOS)
+		}
+		req := httptest.NewRequest("GET", "/debug/pprof/profile?seconds=1", nil)
+		req.RemoteAddr = "100.101.102.103:1234"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		res := rec.Result()
+		if res.StatusCode != 200 {
+			t.Errorf("unexpected %v", res.Status)
+		}
+	})
 }
 
 func get(m http.Handler, path, srcIP string) (int, string) {
@@ -153,7 +173,7 @@ func ExampleDebugHandler_KV() {
 	dbg := Debugger(mux)
 	// Adds two list items to /debug/, showing that the condition is
 	// red and there are 42 donuts.
-	dbg.KV("Conditon", "red")
+	dbg.KV("Condition", "red")
 	dbg.KV("Donuts", 42)
 }
 

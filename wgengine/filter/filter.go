@@ -7,14 +7,14 @@ package filter
 
 import (
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
-	"golang.org/x/time/rate"
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 	"tailscale.com/net/flowtrack"
 	"tailscale.com/net/packet"
+	"tailscale.com/tstime/rate"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
 )
@@ -103,7 +103,8 @@ func NewAllowAllForTest(logf logger.Logf) *Filter {
 	any6 := netaddr.IPPrefixFrom(netaddr.IPFrom16([16]byte{}), 0)
 	ms := []Match{
 		{
-			Srcs: []netaddr.IPPrefix{any4},
+			IPProto: []ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv4},
+			Srcs:    []netaddr.IPPrefix{any4},
 			Dsts: []NetPortRange{
 				{
 					Net: any4,
@@ -115,7 +116,8 @@ func NewAllowAllForTest(logf logger.Logf) *Filter {
 			},
 		},
 		{
-			Srcs: []netaddr.IPPrefix{any6},
+			IPProto: []ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv6},
+			Srcs:    []netaddr.IPPrefix{any6},
 			Dsts: []NetPortRange{
 				{
 					Net: any6,
@@ -223,7 +225,7 @@ var dropBucket = rate.NewLimiter(rate.Every(5*time.Second), 10)
 //   effectively disable the limits on the log rate by setting the limit
 //   to 1 millisecond. This should capture everything.
 func init() {
-	if os.Getenv("TS_DEBUG_FILTER_RATE_LIMIT_LOGS") != "all" {
+	if envknob.String("TS_DEBUG_FILTER_RATE_LIMIT_LOGS") != "all" {
 		return
 	}
 
@@ -382,6 +384,9 @@ func (f *Filter) runIn4(q *packet.Parsed) (r Response, why string) {
 	case ipproto.TSMP:
 		return Accept, "tsmp ok"
 	default:
+		if f.matches4.matchProtoAndIPsOnlyIfAllPorts(q) {
+			return Accept, "otherproto ok"
+		}
 		return Drop, "Unknown proto"
 	}
 	return Drop, "no rules matched"
@@ -439,6 +444,9 @@ func (f *Filter) runIn6(q *packet.Parsed) (r Response, why string) {
 	case ipproto.TSMP:
 		return Accept, "tsmp ok"
 	default:
+		if f.matches6.matchProtoAndIPsOnlyIfAllPorts(q) {
+			return Accept, "otherproto ok"
+		}
 		return Drop, "Unknown proto"
 	}
 	return Drop, "no rules matched"

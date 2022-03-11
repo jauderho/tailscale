@@ -19,16 +19,34 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/syncs"
+	"tailscale.com/version/distro"
 )
+
+var Stderr io.Writer = os.Stderr
+var Stdout io.Writer = os.Stdout
+
+func printf(format string, a ...interface{}) {
+	fmt.Fprintf(Stdout, format, a...)
+}
+
+// outln is like fmt.Println in the common case, except when Stdout is
+// changed (as in js/wasm).
+//
+// It's not named println because that looks like the Go built-in
+// which goes to stderr and formats slightly differently.
+func outln(a ...interface{}) {
+	fmt.Fprintln(Stdout, a...)
+}
 
 // ActLikeCLI reports whether a GUI application should act like the
 // CLI based on os.Args, GOOS, the context the process is running in
@@ -76,13 +94,62 @@ func ActLikeCLI() bool {
 	return false
 }
 
+func newFlagSet(name string) *flag.FlagSet {
+	onError := flag.ExitOnError
+	if runtime.GOOS == "js" {
+		onError = flag.ContinueOnError
+	}
+	fs := flag.NewFlagSet(name, onError)
+	fs.SetOutput(Stderr)
+	return fs
+}
+
+// CleanUpArgs rewrites command line arguments for simplicity and backwards compatibility.
+// In particular, it rewrites --authkey to --auth-key.
+func CleanUpArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		// Rewrite --authkey to --auth-key, and --authkey=x to --auth-key=x,
+		// and the same for the -authkey variant.
+		switch {
+		case arg == "--authkey", arg == "-authkey":
+			arg = "--auth-key"
+		case strings.HasPrefix(arg, "--authkey="), strings.HasPrefix(arg, "-authkey="):
+			arg = strings.TrimLeft(arg, "-")
+			arg = strings.TrimPrefix(arg, "authkey=")
+			arg = "--auth-key=" + arg
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
 // Run runs the CLI. The args do not include the binary name.
-func Run(args []string) error {
+func Run(args []string) (err error) {
 	if len(args) == 1 && (args[0] == "-V" || args[0] == "--version") {
 		args = []string{"version"}
 	}
+	if runtime.GOOS == "linux" && distro.Get() == distro.Gokrazy &&
+		os.Getenv("GOKRAZY_FIRST_START") == "1" {
+		defer func() {
+			// Exit with 125 otherwise the CLI binary is restarted
+			// forever in a loop by the Gokrazy process supervisor.
+			// See https://gokrazy.org/userguide/process-interface/
+			if err != nil {
+				log.Println(err)
+			}
+			os.Exit(125)
+		}()
+	}
 
-	rootfs := flag.NewFlagSet("tailscale", flag.ExitOnError)
+	var warnOnce sync.Once
+	tailscale.SetVersionMismatchHandler(func(clientVer, serverVer string) {
+		warnOnce.Do(func() {
+			fmt.Fprintf(Stderr, "Warning: client version %q != tailscaled server version %q\n", clientVer, serverVer)
+		})
+	})
+
+	rootfs := newFlagSet("tailscale")
 	rootfs.StringVar(&rootArgs.socket, "socket", paths.DefaultTailscaledSocket(), "path to tailscaled's unix socket")
 
 	rootCmd := &ffcli.Command{
@@ -107,6 +174,7 @@ change in the future.
 			webCmd,
 			fileCmd,
 			bugReportCmd,
+			certCmd,
 		},
 		FlagSet:   rootfs,
 		Exec:      func(context.Context, []string) error { return flag.ErrHelp },
@@ -120,24 +188,45 @@ change in the future.
 	if strSliceContains(args, "debug") {
 		rootCmd.Subcommands = append(rootCmd.Subcommands, debugCmd)
 	}
+	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
+		rootCmd.Subcommands = append(rootCmd.Subcommands, configureHostCmd)
+	}
 
 	if err := rootCmd.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 
 	tailscale.TailscaledSocket = rootArgs.socket
+	rootfs.Visit(func(f *flag.Flag) {
+		if f.Name == "socket" {
+			tailscale.TailscaledSocketSetExplicitly = true
+		}
+	})
 
-	err := rootCmd.Run(context.Background())
-	if err == flag.ErrHelp {
+	err = rootCmd.Run(context.Background())
+	if tailscale.IsAccessDeniedError(err) && os.Getuid() != 0 && runtime.GOOS != "windows" {
+		return fmt.Errorf("%v\n\nUse 'sudo tailscale %s' or 'tailscale up --operator=$USER' to not require root.", err, strings.Join(args, " "))
+	}
+	if errors.Is(err, flag.ErrHelp) {
 		return nil
 	}
 	return err
 }
 
 func fatalf(format string, a ...interface{}) {
+	if Fatalf != nil {
+		Fatalf(format, a...)
+		return
+	}
 	log.SetFlags(0)
 	log.Fatalf(format, a...)
 }
+
+// Fatalf, if non-nil, is used instead of log.Fatalf.
+var Fatalf func(format string, a ...interface{})
 
 var rootArgs struct {
 	socket string
@@ -146,7 +235,8 @@ var rootArgs struct {
 var gotSignal syncs.AtomicBool
 
 func connect(ctx context.Context) (net.Conn, *ipn.BackendClient, context.Context, context.CancelFunc) {
-	c, err := safesocket.Connect(rootArgs.socket, 41112)
+	s := safesocket.DefaultConnectionStrategy(rootArgs.socket)
+	c, err := safesocket.Connect(s)
 	if err != nil {
 		if runtime.GOOS != "windows" && rootArgs.socket == "" {
 			fatalf("--socket cannot be empty")

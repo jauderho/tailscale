@@ -14,7 +14,7 @@ import (
 
 	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/wgkey"
+	"tailscale.com/types/key"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -26,19 +26,21 @@ type NetworkMap struct {
 	// Core networking
 
 	SelfNode   *tailcfg.Node
-	NodeKey    tailcfg.NodeKey
-	PrivateKey wgkey.Private
+	NodeKey    key.NodePublic
+	PrivateKey key.NodePrivate
 	Expiry     time.Time
 	// Name is the DNS name assigned to this node.
 	Name          string
 	Addresses     []netaddr.IPPrefix // same as tailcfg.Node.Addresses (IP addresses of this Node directly)
 	LocalPort     uint16             // used for debugging
 	MachineStatus tailcfg.MachineStatus
-	MachineKey    tailcfg.MachineKey
+	MachineKey    key.MachinePublic
 	Peers         []*tailcfg.Node // sorted by Node.ID
 	DNS           tailcfg.DNSConfig
-	Hostinfo      tailcfg.Hostinfo
-	PacketFilter  []filter.Match
+	// TODO(maisem) : replace with View.
+	Hostinfo     tailcfg.Hostinfo
+	PacketFilter []filter.Match
+	SSHPolicy    *tailcfg.SSHPolicy // or nil, if not enabled/allowed
 
 	// CollectServices reports whether this node's Tailnet has
 	// requested that info about services be included in HostInfo.
@@ -53,9 +55,18 @@ type NetworkMap struct {
 	// Debug knobs from control server for debug or feature gating.
 	Debug *tailcfg.Debug
 
+	// ControlHealth are the list of health check problems for this
+	// node from the perspective of the control plane.
+	// If empty, there are no known problems from the control plane's
+	// point of view, but the node might know about its own health
+	// check problems.
+	ControlHealth []string
+
 	// ACLs
 
-	User   tailcfg.UserID
+	User tailcfg.UserID
+
+	// Domain is the current Tailnet name.
 	Domain string
 
 	UserProfiles map[tailcfg.UserID]tailcfg.UserProfile
@@ -84,6 +95,12 @@ func (nm *NetworkMap) Concise() string {
 	for _, p := range nm.Peers {
 		printPeerConcise(buf, p)
 	}
+	return buf.String()
+}
+
+func (nm *NetworkMap) VeryConcise() string {
+	buf := new(strings.Builder)
+	nm.printConciseHeader(buf)
 	return buf.String()
 }
 
@@ -132,7 +149,7 @@ func (a *NetworkMap) equalConciseHeader(b *NetworkMap) bool {
 	return (a.Debug == nil && b.Debug == nil) || reflect.DeepEqual(a.Debug, b.Debug)
 }
 
-// printPeerConcise appends to buf a line repsenting the peer p.
+// printPeerConcise appends to buf a line representing the peer p.
 //
 // If this function is changed to access different fields of p, keep
 // in nodeConciseEqual in sync.

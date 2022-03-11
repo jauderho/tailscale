@@ -8,7 +8,6 @@
 package ipnstate
 
 import (
-	"bytes"
 	"fmt"
 	"html"
 	"io"
@@ -21,6 +20,7 @@ import (
 	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 )
 
@@ -38,12 +38,19 @@ type Status struct {
 	TailscaleIPs []netaddr.IP // Tailscale IP(s) assigned to this node
 	Self         *PeerStatus
 
-	// MagicDNSSuffix is the network's MagicDNS suffix for nodes
-	// in the network such as "userfoo.tailscale.net".
-	// There are no surrounding dots.
-	// MagicDNSSuffix should be populated regardless of whether a domain
-	// has MagicDNS enabled.
+	// Health contains health check problems.
+	// Empty means everything is good. (or at least that no known
+	// problems are detected)
+	Health []string
+
+	// This field is the legacy name of CurrentTailnet.MagicDNSSuffix.
+	//
+	// Deprecated: use CurrentTailnet.MagicDNSSuffix instead.
 	MagicDNSSuffix string
+
+	// CurrentTailnet is information about the tailnet that the node
+	// is currently connected to. When not connected, this field is nil.
+	CurrentTailnet *TailnetStatus
 
 	// CertDomains are the set of DNS names for which the control
 	// plane server will assist with provisioning TLS
@@ -52,49 +59,88 @@ type Status struct {
 	// trailing periods, and without any "_acme-challenge." prefix.
 	CertDomains []string
 
-	Peer map[key.Public]*PeerStatus
+	Peer map[key.NodePublic]*PeerStatus
 	User map[tailcfg.UserID]tailcfg.UserProfile
 }
 
-func (s *Status) Peers() []key.Public {
-	kk := make([]key.Public, 0, len(s.Peer))
+// TailnetStatus is information about a Tailscale network ("tailnet").
+type TailnetStatus struct {
+	// Name is the name of the network that's currently in use.
+	Name string
+
+	// MagicDNSSuffix is the network's MagicDNS suffix for nodes
+	// in the network such as "userfoo.tailscale.net".
+	// There are no surrounding dots.
+	// MagicDNSSuffix should be populated regardless of whether a domain
+	// has MagicDNS enabled.
+	MagicDNSSuffix string
+
+	// MagicDNSEnabled is whether or not the network has MagicDNS enabled.
+	// Note that the current device may still not support MagicDNS if
+	// `--accept-dns=false` was used.
+	MagicDNSEnabled bool
+}
+
+func (s *Status) Peers() []key.NodePublic {
+	kk := make([]key.NodePublic, 0, len(s.Peer))
 	for k := range s.Peer {
 		kk = append(kk, k)
 	}
-	sort.Slice(kk, func(i, j int) bool { return bytes.Compare(kk[i][:], kk[j][:]) < 0 })
+	sort.Slice(kk, func(i, j int) bool { return kk[i].Less(kk[j]) })
 	return kk
 }
 
 type PeerStatusLite struct {
+	// TxBytes/RxBytes is the total number of bytes transmitted to/received from this peer.
 	TxBytes, RxBytes int64
-	LastHandshake    time.Time
-	NodeKey          tailcfg.NodeKey
+	// LastHandshake is the last time a handshake succeeded with this peer.
+	// (Or we got key confirmation via the first data message,
+	// which is approximately the same thing.)
+	LastHandshake time.Time
+	// NodeKey is this peer's public node key.
+	NodeKey key.NodePublic
 }
 
 type PeerStatus struct {
-	ID        tailcfg.StableNodeID
-	PublicKey key.Public
-	HostName  string // HostInfo's Hostname (not a DNS name or necessarily unique)
-	DNSName   string
-	OS        string // HostInfo.OS
-	UserID    tailcfg.UserID
+	ID           tailcfg.StableNodeID
+	PublicKey    key.NodePublic
+	HostName     string // HostInfo's Hostname (not a DNS name or necessarily unique)
+	DNSName      string
+	OS           string // HostInfo.OS
+	UserID       tailcfg.UserID
+	TailscaleIPs []netaddr.IP // Tailscale IP(s) assigned to this node
 
-	TailAddrDeprecated string       `json:"TailAddr"` // Tailscale IP
-	TailscaleIPs       []netaddr.IP // Tailscale IP(s) assigned to this node
+	// Tags are the list of ACL tags applied to this node.
+	// See tailscale.com/tailcfg#Node.Tags for more information.
+	Tags *views.StringSlice `json:",omitempty"`
+
+	// PrimaryRoutes are the routes this node is currently the primary
+	// subnet router for, as determined by the control plane. It does
+	// not include the IPs in TailscaleIPs.
+	PrimaryRoutes *views.IPPrefixSlice `json:",omitempty"`
 
 	// Endpoints:
 	Addrs   []string
 	CurAddr string // one of Addrs, or unique if roaming
 	Relay   string // DERP region
 
-	RxBytes       int64
-	TxBytes       int64
-	Created       time.Time // time registered with tailcontrol
-	LastWrite     time.Time // time last packet sent
-	LastSeen      time.Time // last seen to tailcontrol
-	LastHandshake time.Time // with local wireguard
-	KeepAlive     bool
-	ExitNode      bool // true if this is the currently selected exit node.
+	RxBytes        int64
+	TxBytes        int64
+	Created        time.Time // time registered with tailcontrol
+	LastWrite      time.Time // time last packet sent
+	LastSeen       time.Time // last seen to tailcontrol; only present if offline
+	LastHandshake  time.Time // with local wireguard
+	Online         bool      // whether node is connected to the control plane
+	KeepAlive      bool
+	ExitNode       bool // true if this is the currently selected exit node.
+	ExitNodeOption bool // true if this node can be an exit node (offered && approved)
+
+	// Active is whether the node was recently active. The
+	// definition is somewhat undefined but has historically and
+	// currently means that there was some packet sent to this
+	// peer in the past two minutes. That definition is subject to
+	// change.
+	Active bool
 
 	PeerAPIURL   []string
 	Capabilities []string `json:",omitempty"`
@@ -189,7 +235,7 @@ func (sb *StatusBuilder) AddTailscaleIP(ip netaddr.IP) {
 // AddPeer adds a peer node to the status.
 //
 // Its PeerStatus is mixed with any previous status already added.
-func (sb *StatusBuilder) AddPeer(peer key.Public, st *PeerStatus) {
+func (sb *StatusBuilder) AddPeer(peer key.NodePublic, st *PeerStatus) {
 	if st == nil {
 		panic("nil PeerStatus")
 	}
@@ -202,7 +248,7 @@ func (sb *StatusBuilder) AddPeer(peer key.Public, st *PeerStatus) {
 	}
 
 	if sb.st.Peer == nil {
-		sb.st.Peer = make(map[key.Public]*PeerStatus)
+		sb.st.Peer = make(map[key.NodePublic]*PeerStatus)
 	}
 	e, ok := sb.st.Peer[peer]
 	if !ok {
@@ -226,11 +272,14 @@ func (sb *StatusBuilder) AddPeer(peer key.Public, st *PeerStatus) {
 	if v := st.UserID; v != 0 {
 		e.UserID = v
 	}
-	if v := st.TailAddrDeprecated; v != "" {
-		e.TailAddrDeprecated = v
-	}
 	if v := st.TailscaleIPs; v != nil {
 		e.TailscaleIPs = v
+	}
+	if v := st.PrimaryRoutes; v != nil && !v.IsNil() {
+		e.PrimaryRoutes = v
+	}
+	if v := st.Tags; v != nil && !v.IsNil() {
+		e.Tags = v
 	}
 	if v := st.OS; v != "" {
 		e.OS = st.OS
@@ -259,6 +308,9 @@ func (sb *StatusBuilder) AddPeer(peer key.Public, st *PeerStatus) {
 	if v := st.LastWrite; !v.IsZero() {
 		e.LastWrite = v
 	}
+	if st.Online {
+		e.Online = true
+	}
 	if st.InNetworkMap {
 		e.InNetworkMap = true
 	}
@@ -274,8 +326,14 @@ func (sb *StatusBuilder) AddPeer(peer key.Public, st *PeerStatus) {
 	if st.ExitNode {
 		e.ExitNode = true
 	}
+	if st.ExitNodeOption {
+		e.ExitNodeOption = true
+	}
 	if st.ShareeNode {
 		e.ShareeNode = true
+	}
+	if st.Active {
+		e.Active = true
 	}
 }
 
@@ -377,9 +435,7 @@ table tbody tr:nth-child(even) td { background-color: #f5f5f5; }
 		)
 		f("<td>")
 
-		// TODO: let server report this active bool instead
-		active := !ps.LastWrite.IsZero() && time.Since(ps.LastWrite) < 2*time.Minute
-		if active {
+		if ps.Active {
 			if ps.Relay != "" && ps.CurAddr == "" {
 				f("relay <b>%s</b>", html.EscapeString(ps.Relay))
 			} else if ps.CurAddr != "" {
@@ -443,6 +499,10 @@ type PingResult struct {
 	// running the server on.
 	PeerAPIPort uint16 `json:",omitempty"`
 
+	// IsLocalIP is whether the ping request error is due to it being
+	// a ping to the local node.
+	IsLocalIP bool `json:",omitempty"`
+
 	// TODO(bradfitz): details like whether port mapping was used on either side? (Once supported)
 }
 
@@ -461,5 +521,6 @@ func sortKey(ps *PeerStatus) string {
 	if len(ps.TailscaleIPs) > 0 {
 		return ps.TailscaleIPs[0].String()
 	}
-	return string(ps.PublicKey[:])
+	raw := ps.PublicKey.Raw32()
+	return string(raw[:])
 }

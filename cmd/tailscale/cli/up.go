@@ -6,9 +6,12 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"runtime"
@@ -17,15 +20,18 @@ import (
 	"sync"
 
 	shellquote "github.com/kballard/go-shellquote"
-	"github.com/peterbourgon/ff/v2/ffcli"
+	"github.com/peterbourgon/ff/v3/ffcli"
+	qrcode "github.com/skip2/go-qrcode"
 	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/preftype"
+	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
 
@@ -44,32 +50,61 @@ down").
 
 If flags are specified, the flags must be the complete set of desired
 settings. An error is returned if any setting would be changed as a
-result of an unspecified flag's default value, unless the --reset
-flag is also used.
+result of an unspecified flag's default value, unless the --reset flag
+is also used. (The flags --authkey, --force-reauth, and --qr are not
+considered settings that need to be re-specified when modifying
+settings.)
 `),
 	FlagSet: upFlagSet,
 	Exec:    runUp,
 }
 
-var upFlagSet = newUpFlagSet(runtime.GOOS, &upArgs)
+func effectiveGOOS() string {
+	if v := os.Getenv("TS_DEBUG_UP_FLAG_GOOS"); v != "" {
+		return v
+	}
+	return runtime.GOOS
+}
+
+// acceptRouteDefault returns the CLI's default value of --accept-routes as
+// a function of the platform it's running on.
+func acceptRouteDefault(goos string) bool {
+	switch goos {
+	case "windows":
+		return true
+	case "darwin":
+		return version.IsSandboxedMacOS()
+	default:
+		return false
+	}
+}
+
+var upFlagSet = newUpFlagSet(effectiveGOOS(), &upArgs)
+
+func inTest() bool { return flag.Lookup("test.v") != nil }
 
 func newUpFlagSet(goos string, upArgs *upArgsT) *flag.FlagSet {
-	upf := flag.NewFlagSet("up", flag.ExitOnError)
+	upf := newFlagSet("up")
 
+	upf.BoolVar(&upArgs.qr, "qr", false, "show QR code for login URLs")
+	upf.BoolVar(&upArgs.json, "json", false, "output in JSON format (WARNING: format subject to change)")
 	upf.BoolVar(&upArgs.forceReauth, "force-reauth", false, "force reauthentication")
 	upf.BoolVar(&upArgs.reset, "reset", false, "reset unspecified settings to their default values")
 
 	upf.StringVar(&upArgs.server, "login-server", ipn.DefaultControlURL, "base URL of control server")
-	upf.BoolVar(&upArgs.acceptRoutes, "accept-routes", false, "accept routes advertised by other Tailscale nodes")
+	upf.BoolVar(&upArgs.acceptRoutes, "accept-routes", acceptRouteDefault(goos), "accept routes advertised by other Tailscale nodes")
 	upf.BoolVar(&upArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
 	upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, "install host routes to other Tailscale nodes")
-	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale IP of the exit node for internet traffic")
+	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP or base name) for internet traffic, or empty string to not use an exit node")
 	upf.BoolVar(&upArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
 	upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
+	if envknob.UseWIPCode() || inTest() {
+		upf.BoolVar(&upArgs.runSSH, "ssh", false, "run an SSH server, permitting access per tailnet admin's declared policy")
+	}
 	upf.StringVar(&upArgs.advertiseTags, "advertise-tags", "", "comma-separated ACL tags to request; each must start with \"tag:\" (e.g. \"tag:eng,tag:montreal,tag:ssh\")")
-	upf.StringVar(&upArgs.authKey, "authkey", "", "node authorization key")
+	upf.StringVar(&upArgs.authKeyOrFile, "auth-key", "", `node authorization key; if it begins with "file:", then it's a path to a file containing the authkey`)
 	upf.StringVar(&upArgs.hostname, "hostname", "", "hostname to use instead of the one provided by the OS")
-	upf.StringVar(&upArgs.advertiseRoutes, "advertise-routes", "", "routes to advertise to other nodes (comma-separated, e.g. \"10.0.0.0/8,192.168.0.0/24\")")
+	upf.StringVar(&upArgs.advertiseRoutes, "advertise-routes", "", "routes to advertise to other nodes (comma-separated, e.g. \"10.0.0.0/8,192.168.0.0/24\") or empty string to not advertise routes")
 	upf.BoolVar(&upArgs.advertiseDefaultRoute, "advertise-exit-node", false, "offer to be an exit node for internet traffic for the tailnet")
 	if safesocket.GOOSUsesPeerCreds(goos) {
 		upf.StringVar(&upArgs.opUser, "operator", "", "Unix username to allow to operate on tailscaled without sudo")
@@ -92,6 +127,7 @@ func defaultNetfilterMode() string {
 }
 
 type upArgsT struct {
+	qr                     bool
 	reset                  bool
 	server                 string
 	acceptRoutes           bool
@@ -100,6 +136,7 @@ type upArgsT struct {
 	exitNodeIP             string
 	exitNodeAllowLANAccess bool
 	shieldsUp              bool
+	runSSH                 bool
 	forceReauth            bool
 	forceDaemon            bool
 	advertiseRoutes        string
@@ -107,15 +144,56 @@ type upArgsT struct {
 	advertiseTags          string
 	snat                   bool
 	netfilterMode          string
-	authKey                string
+	authKeyOrFile          string // "secret" or "file:/path/to/secret"
 	hostname               string
 	opUser                 string
+	json                   bool
+}
+
+func (a upArgsT) getAuthKey() (string, error) {
+	v := a.authKeyOrFile
+	if strings.HasPrefix(v, "file:") {
+		file := strings.TrimPrefix(v, "file:")
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return v, nil
 }
 
 var upArgs upArgsT
 
+// Fields output when `tailscale up --json` is used. Two JSON blocks will be output.
+//
+// When "tailscale up" is run it first outputs a block with AuthURL and QR populated,
+// providing the link for where to authenticate this client. BackendState would be
+// valid but boring, as it will almost certainly be "NeedsLogin". Error would be
+// populated if something goes badly wrong.
+//
+// When the client is authenticated by having someone visit the AuthURL, a second
+// JSON block will be output. The AuthURL and QR fields will not be present, the
+// BackendState and Error fields will give the result of the authentication.
+// Ex:
+// {
+//    "AuthURL": "https://login.tailscale.com/a/0123456789abcdef",
+//    "QR": "data:image/png;base64,0123...cdef"
+//    "BackendState": "NeedsLogin"
+// }
+// {
+//    "BackendState": "Running"
+// }
+//
+type upOutputJSON struct {
+	AuthURL      string `json:",omitempty"` // Authentication URL of the form https://login.tailscale.com/a/0123456789
+	QR           string `json:",omitempty"` // a DataURL (base64) PNG of a QR code AuthURL
+	BackendState string `json:",omitempty"` // name of state like Running or NeedsMachineAuth
+	Error        string `json:",omitempty"` // description of an error
+}
+
 func warnf(format string, args ...interface{}) {
-	fmt.Printf("Warning: "+format+"\n", args...)
+	printf("Warning: "+format+"\n", args...)
 }
 
 var (
@@ -123,17 +201,11 @@ var (
 	ipv6default = netaddr.MustParseIPPrefix("::/0")
 )
 
-// prefsFromUpArgs returns the ipn.Prefs for the provided args.
-//
-// Note that the parameters upArgs and warnf are named intentionally
-// to shadow the globals to prevent accidental misuse of them. This
-// function exists for testing and should have no side effects or
-// outside interactions (e.g. no making Tailscale local API calls).
-func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goos string) (*ipn.Prefs, error) {
+func calcAdvertiseRoutes(advertiseRoutes string, advertiseDefaultRoute bool) ([]netaddr.IPPrefix, error) {
 	routeMap := map[netaddr.IPPrefix]bool{}
-	var default4, default6 bool
-	if upArgs.advertiseRoutes != "" {
-		advroutes := strings.Split(upArgs.advertiseRoutes, ",")
+	if advertiseRoutes != "" {
+		var default4, default6 bool
+		advroutes := strings.Split(advertiseRoutes, ",")
 		for _, s := range advroutes {
 			ipp, err := netaddr.ParseIPPrefix(s)
 			if err != nil {
@@ -155,7 +227,7 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 			return nil, fmt.Errorf("%s advertised without its IPv6 counterpart, please also advertise %s", ipv6default, ipv4default)
 		}
 	}
-	if upArgs.advertiseDefaultRoute {
+	if advertiseDefaultRoute {
 		routeMap[netaddr.MustParseIPPrefix("0.0.0.0/0")] = true
 		routeMap[netaddr.MustParseIPPrefix("::/0")] = true
 	}
@@ -169,24 +241,23 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 		}
 		return routes[i].IP().Less(routes[j].IP())
 	})
+	return routes, nil
+}
 
-	var exitNodeIP netaddr.IP
-	if upArgs.exitNodeIP != "" {
-		var err error
-		exitNodeIP, err = netaddr.ParseIP(upArgs.exitNodeIP)
-		if err != nil {
-			return nil, fmt.Errorf("invalid IP address %q for --exit-node: %v", upArgs.exitNodeIP, err)
-		}
-	} else if upArgs.exitNodeAllowLANAccess {
-		return nil, fmt.Errorf("--exit-node-allow-lan-access can only be used with --exit-node")
+// prefsFromUpArgs returns the ipn.Prefs for the provided args.
+//
+// Note that the parameters upArgs and warnf are named intentionally
+// to shadow the globals to prevent accidental misuse of them. This
+// function exists for testing and should have no side effects or
+// outside interactions (e.g. no making Tailscale local API calls).
+func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goos string) (*ipn.Prefs, error) {
+	routes, err := calcAdvertiseRoutes(upArgs.advertiseRoutes, upArgs.advertiseDefaultRoute)
+	if err != nil {
+		return nil, err
 	}
 
-	if upArgs.exitNodeIP != "" {
-		for _, ip := range st.TailscaleIPs {
-			if exitNodeIP == ip {
-				return nil, fmt.Errorf("cannot use %s as the exit node as it is a local IP address to this machine, did you mean --advertise-exit-node?", upArgs.exitNodeIP)
-			}
-		}
+	if upArgs.exitNodeIP == "" && upArgs.exitNodeAllowLANAccess {
+		return nil, fmt.Errorf("--exit-node-allow-lan-access can only be used with --exit-node")
 	}
 
 	var tags []string
@@ -208,11 +279,22 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	prefs.ControlURL = upArgs.server
 	prefs.WantRunning = true
 	prefs.RouteAll = upArgs.acceptRoutes
-	prefs.ExitNodeIP = exitNodeIP
+
+	if upArgs.exitNodeIP != "" {
+		if err := prefs.SetExitNodeIP(upArgs.exitNodeIP, st); err != nil {
+			var e ipn.ExitNodeLocalIPError
+			if errors.As(err, &e) {
+				return nil, fmt.Errorf("%w; did you mean --advertise-exit-node?", err)
+			}
+			return nil, err
+		}
+	}
+
 	prefs.ExitNodeAllowLANAccess = upArgs.exitNodeAllowLANAccess
 	prefs.CorpDNS = upArgs.acceptDNS
 	prefs.AllowSingleHosts = upArgs.singleRoutes
 	prefs.ShieldsUp = upArgs.shieldsUp
+	prefs.RunSSH = upArgs.runSSH
 	prefs.AdvertiseRoutes = routes
 	prefs.AdvertiseTags = tags
 	prefs.Hostname = upArgs.hostname
@@ -240,6 +322,61 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	return prefs, nil
 }
 
+// updatePrefs returns how to edit preferences based on the
+// flag-provided 'prefs' and the currently active 'curPrefs'.
+//
+// It returns a non-nil justEditMP if we're already running and none of
+// the flags require a restart, so we can just do an EditPrefs call and
+// change the prefs at runtime (e.g. changing hostname, changing
+// advertised routes, etc).
+//
+// It returns simpleUp if we're running a simple "tailscale up" to
+// transition to running from a previously-logged-in but down state,
+// without changing any settings.
+func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, justEditMP *ipn.MaskedPrefs, err error) {
+	if !env.upArgs.reset {
+		applyImplicitPrefs(prefs, curPrefs, env.user)
+
+		if err := checkForAccidentalSettingReverts(prefs, curPrefs, env); err != nil {
+			return false, nil, err
+		}
+	}
+
+	controlURLChanged := curPrefs.ControlURL != prefs.ControlURL &&
+		!(ipn.IsLoginServerSynonym(curPrefs.ControlURL) && ipn.IsLoginServerSynonym(prefs.ControlURL))
+	if controlURLChanged && env.backendState == ipn.Running.String() && !env.upArgs.forceReauth {
+		return false, nil, fmt.Errorf("can't change --login-server without --force-reauth")
+	}
+
+	tagsChanged := !reflect.DeepEqual(curPrefs.AdvertiseTags, prefs.AdvertiseTags)
+
+	simpleUp = env.flagSet.NFlag() == 0 &&
+		curPrefs.Persist != nil &&
+		curPrefs.Persist.LoginName != "" &&
+		env.backendState != ipn.NeedsLogin.String()
+
+	justEdit := env.backendState == ipn.Running.String() &&
+		!env.upArgs.forceReauth &&
+		env.upArgs.authKeyOrFile == "" &&
+		!controlURLChanged &&
+		!tagsChanged
+
+	if justEdit {
+		justEditMP = new(ipn.MaskedPrefs)
+		justEditMP.WantRunningSet = true
+		justEditMP.Prefs = *prefs
+		visitFlags := env.flagSet.Visit
+		if env.upArgs.reset {
+			visitFlags = env.flagSet.VisitAll
+		}
+		visitFlags(func(f *flag.Flag) {
+			updateMaskedPrefsFromUpFlag(justEditMP, f.Name)
+		})
+	}
+
+	return simpleUp, justEditMP, nil
+}
+
 func runUp(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		fatalf("too many non-flag arguments: %q", args)
@@ -247,14 +384,14 @@ func runUp(ctx context.Context, args []string) error {
 
 	st, err := tailscale.Status(ctx)
 	if err != nil {
-		fatalf("can't fetch status from tailscaled: %v", err)
+		return fixTailscaledConnectError(err)
 	}
 	origAuthURL := st.AuthURL
 
 	// printAuthURL reports whether we should print out the
 	// provided auth URL from an IPN notify.
 	printAuthURL := func(url string) bool {
-		if upArgs.authKey != "" {
+		if upArgs.authKeyOrFile != "" {
 			// Issue 1755: when using an authkey, don't
 			// show an authURL that might still be pending
 			// from a previous non-completed interactive
@@ -280,7 +417,7 @@ func runUp(ctx context.Context, args []string) error {
 		}
 	}
 
-	prefs, err := prefsFromUpArgs(upArgs, warnf, st, runtime.GOOS)
+	prefs, err := prefsFromUpArgs(upArgs, warnf, st, effectiveGOOS())
 	if err != nil {
 		fatalf("%s", err)
 	}
@@ -296,62 +433,35 @@ func runUp(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if !upArgs.reset {
-		applyImplicitPrefs(prefs, curPrefs, os.Getenv("USER"))
-
-		if err := checkForAccidentalSettingReverts(upFlagSet, curPrefs, prefs, upCheckEnv{
-			goos:          runtime.GOOS,
-			curExitNodeIP: exitNodeIP(prefs, st),
-		}); err != nil {
-			fatalf("%s", err)
-		}
+	env := upCheckEnv{
+		goos:          effectiveGOOS(),
+		distro:        distro.Get(),
+		user:          os.Getenv("USER"),
+		flagSet:       upFlagSet,
+		upArgs:        upArgs,
+		backendState:  st.BackendState,
+		curExitNodeIP: exitNodeIP(curPrefs, st),
 	}
-
-	controlURLChanged := curPrefs.ControlURL != prefs.ControlURL
-	if controlURLChanged && st.BackendState == ipn.Running.String() && !upArgs.forceReauth {
-		fatalf("can't change --login-server without --force-reauth")
+	simpleUp, justEditMP, err := updatePrefs(prefs, curPrefs, env)
+	if err != nil {
+		fatalf("%s", err)
 	}
-
-	// If we're already running and none of the flags require a
-	// restart, we can just do an EditPrefs call and change the
-	// prefs at runtime (e.g. changing hostname, changing
-	// advertised tags, routes, etc)
-	justEdit := st.BackendState == ipn.Running.String() &&
-		!upArgs.forceReauth &&
-		!upArgs.reset &&
-		upArgs.authKey == "" &&
-		!controlURLChanged
-	if justEdit {
-		mp := new(ipn.MaskedPrefs)
-		mp.WantRunningSet = true
-		mp.Prefs = *prefs
-		upFlagSet.Visit(func(f *flag.Flag) {
-			updateMaskedPrefsFromUpFlag(mp, f.Name)
-		})
-
-		_, err := tailscale.EditPrefs(ctx, mp)
+	if justEditMP != nil {
+		_, err := tailscale.EditPrefs(ctx, justEditMP)
 		return err
 	}
-
-	// simpleUp is whether we're running a simple "tailscale up"
-	// to transition to running from a previously-logged-in but
-	// down state, without changing any settings.
-	simpleUp := upFlagSet.NFlag() == 0 &&
-		curPrefs.Persist != nil &&
-		curPrefs.Persist.LoginName != "" &&
-		st.BackendState != ipn.NeedsLogin.String()
 
 	// At this point we need to subscribe to the IPN bus to watch
 	// for state transitions and possible need to authenticate.
 	c, bc, pumpCtx, cancel := connect(ctx)
 	defer cancel()
 
-	startingOrRunning := make(chan bool, 1) // gets value once starting or running
-	gotEngineUpdate := make(chan bool, 1)   // gets value upon an engine update
+	running := make(chan bool, 1)         // gets value once in state ipn.Running
+	gotEngineUpdate := make(chan bool, 1) // gets value upon an engine update
 	pumpErr := make(chan error, 1)
 	go func() { pumpErr <- pump(pumpCtx, bc, c) }()
 
-	printed := !simpleUp
+	var printed bool // whether we've yet printed anything to stdout or stderr
 	var loginOnce sync.Once
 	startLoginInteractive := func() { loginOnce.Do(func() { bc.StartLoginInteractive() }) }
 
@@ -365,7 +475,7 @@ func runUp(ctx context.Context, args []string) error {
 		if n.ErrMessage != nil {
 			msg := *n.ErrMessage
 			if msg == ipn.ErrMsgPermissionDenied {
-				switch runtime.GOOS {
+				switch effectiveGOOS() {
 				case "windows":
 					msg += " (Tailscale service in use by other user?)"
 				default:
@@ -377,19 +487,24 @@ func runUp(ctx context.Context, args []string) error {
 		if s := n.State; s != nil {
 			switch *s {
 			case ipn.NeedsLogin:
-				printed = true
 				startLoginInteractive()
 			case ipn.NeedsMachineAuth:
 				printed = true
-				fmt.Fprintf(os.Stderr, "\nTo authorize your machine, visit (as admin):\n\n\t%s/admin/machines\n\n", upArgs.server)
-			case ipn.Starting, ipn.Running:
+				if env.upArgs.json {
+					printUpDoneJSON(ipn.NeedsMachineAuth, "")
+				} else {
+					fmt.Fprintf(Stderr, "\nTo authorize your machine, visit (as admin):\n\n\t%s\n\n", prefs.AdminPageURL())
+				}
+			case ipn.Running:
 				// Done full authentication process
-				if printed {
+				if env.upArgs.json {
+					printUpDoneJSON(ipn.Running, "")
+				} else if printed {
 					// Only need to print an update if we printed the "please click" message earlier.
-					fmt.Fprintf(os.Stderr, "Success.\n")
+					fmt.Fprintf(Stderr, "Success.\n")
 				}
 				select {
-				case startingOrRunning <- true:
+				case running <- true:
 				default:
 				}
 				cancel()
@@ -397,7 +512,34 @@ func runUp(ctx context.Context, args []string) error {
 		}
 		if url := n.BrowseToURL; url != nil && printAuthURL(*url) {
 			printed = true
-			fmt.Fprintf(os.Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
+			if upArgs.json {
+				js := &upOutputJSON{AuthURL: *url, BackendState: st.BackendState}
+
+				q, err := qrcode.New(*url, qrcode.Medium)
+				if err == nil {
+					png, err := q.PNG(128)
+					if err == nil {
+						js.QR = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+					}
+				}
+
+				data, err := json.MarshalIndent(js, "", "\t")
+				if err != nil {
+					log.Printf("upOutputJSON marshalling error: %v", err)
+				} else {
+					fmt.Println(string(data))
+				}
+			} else {
+				fmt.Fprintf(Stderr, "\nTo authenticate, visit:\n\n\t%s\n\n", *url)
+				if upArgs.qr {
+					q, err := qrcode.New(*url, qrcode.Medium)
+					if err != nil {
+						log.Printf("QR code error: %v", err)
+					} else {
+						fmt.Fprintf(Stderr, "%s\n", q.ToString(false))
+					}
+				}
+			}
 		}
 	})
 	// Wait for backend client to be connected so we know
@@ -426,9 +568,13 @@ func runUp(ctx context.Context, args []string) error {
 			return err
 		}
 	} else {
+		authKey, err := upArgs.getAuthKey()
+		if err != nil {
+			return err
+		}
 		opts := ipn.Options{
 			StateKey:    ipn.GlobalDaemonStateKey,
-			AuthKey:     upArgs.authKey,
+			AuthKey:     authKey,
 			UpdatePrefs: prefs,
 		}
 		// On Windows, we still run in mostly the "legacy" way that
@@ -439,7 +585,7 @@ func runUp(ctx context.Context, args []string) error {
 		// Windows service (~tailscaled) is the one that computes the
 		// StateKey based on the connection identity. So for now, just
 		// do as the Windows GUI's always done:
-		if runtime.GOOS == "windows" {
+		if effectiveGOOS() == "windows" {
 			// The Windows service will set this as needed based
 			// on our connection's identity.
 			opts.StateKey = ""
@@ -452,18 +598,40 @@ func runUp(ctx context.Context, args []string) error {
 		}
 	}
 
+	// This whole 'up' mechanism is too complicated and results in
+	// hairy stuff like this select. We're ultimately waiting for
+	// 'running' to be done, but even in the case where
+	// it succeeds, other parts may shut down concurrently so we
+	// need to prioritize reads from 'running' if it's
+	// readable; its send does happen before the pump mechanism
+	// shuts down. (Issue 2333)
 	select {
-	case <-startingOrRunning:
+	case <-running:
 		return nil
 	case <-pumpCtx.Done():
 		select {
-		case <-startingOrRunning:
+		case <-running:
 			return nil
 		default:
 		}
 		return pumpCtx.Err()
 	case err := <-pumpErr:
+		select {
+		case <-running:
+			return nil
+		default:
+		}
 		return err
+	}
+}
+
+func printUpDoneJSON(state ipn.State, errorString string) {
+	js := &upOutputJSON{BackendState: state.String(), Error: errorString}
+	data, err := json.MarshalIndent(js, "", "  ")
+	if err != nil {
+		log.Printf("printUpDoneJSON marshalling error: %v", err)
+	} else {
+		fmt.Println(string(data))
 	}
 }
 
@@ -492,6 +660,7 @@ func init() {
 	addPrefFlagMapping("exit-node-allow-lan-access", "ExitNodeAllowLANAccess")
 	addPrefFlagMapping("unattended", "ForceDaemon")
 	addPrefFlagMapping("operator", "OperatorUser")
+	addPrefFlagMapping("ssh", "RunSSH")
 }
 
 func addPrefFlagMapping(flagName string, prefNames ...string) {
@@ -509,7 +678,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 // correspond to an ipn.Pref.
 func preflessFlag(flagName string) bool {
 	switch flagName {
-	case "authkey", "force-reauth", "reset":
+	case "auth-key", "force-reauth", "reset", "qr", "json":
 		return true
 	}
 	return false
@@ -538,7 +707,12 @@ const accidentalUpPrefix = "Error: changing settings via 'tailscale up' requires
 // needed by checkForAccidentalSettingReverts and friends.
 type upCheckEnv struct {
 	goos          string
+	user          string
+	flagSet       *flag.FlagSet
+	upArgs        upArgsT
+	backendState  string
 	curExitNodeIP netaddr.IP
+	distro        distro.Distro
 }
 
 // checkForAccidentalSettingReverts (the "up checker") checks for
@@ -555,14 +729,14 @@ type upCheckEnv struct {
 //
 // mp is the mask of settings actually set, where mp.Prefs is the new
 // preferences to set, including any values set from implicit flags.
-func checkForAccidentalSettingReverts(flagSet *flag.FlagSet, curPrefs, newPrefs *ipn.Prefs, env upCheckEnv) error {
+func checkForAccidentalSettingReverts(newPrefs, curPrefs *ipn.Prefs, env upCheckEnv) error {
 	if curPrefs.ControlURL == "" {
 		// Don't validate things on initial "up" before a control URL has been set.
 		return nil
 	}
 
 	flagIsSet := map[string]bool{}
-	flagSet.Visit(func(f *flag.Flag) {
+	env.flagSet.Visit(func(f *flag.Flag) {
 		flagIsSet[f.Name] = true
 	})
 
@@ -586,7 +760,11 @@ func checkForAccidentalSettingReverts(flagSet *flag.FlagSet, curPrefs, newPrefs 
 		if reflect.DeepEqual(valCur, valNew) {
 			continue
 		}
-		if flagName == "login-server" && isLoginServerSynonym(valCur) && isLoginServerSynonym(valNew) {
+		if flagName == "login-server" && ipn.IsLoginServerSynonym(valCur) && ipn.IsLoginServerSynonym(valNew) {
+			continue
+		}
+		if flagName == "accept-routes" && valNew == false && env.goos == "linux" && env.distro == distro.Synology {
+			// Issue 3176. Old prefs had 'RouteAll: true' on disk, so ignore that.
 			continue
 		}
 		missing = append(missing, fmtFlagValueArg(flagName, valCur))
@@ -599,7 +777,7 @@ func checkForAccidentalSettingReverts(flagSet *flag.FlagSet, curPrefs, newPrefs 
 	// Compute the stringification of the explicitly provided args in flagSet
 	// to prepend to the command to run.
 	var explicit []string
-	flagSet.Visit(func(f *flag.Flag) {
+	env.flagSet.Visit(func(f *flag.Flag) {
 		type isBool interface {
 			IsBoolFlag() bool
 		}
@@ -633,10 +811,6 @@ func applyImplicitPrefs(prefs, oldPrefs *ipn.Prefs, curUser string) {
 	if prefs.OperatorUser == "" && oldPrefs.OperatorUser == curUser {
 		prefs.OperatorUser = oldPrefs.OperatorUser
 	}
-}
-
-func isLoginServerSynonym(val interface{}) bool {
-	return val == "https://login.tailscale.com" || val == "https://controlplane.tailscale.com"
 }
 
 func flagAppliesToOS(flag, goos string) bool {
@@ -677,6 +851,8 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]interfac
 		switch f.Name {
 		default:
 			panic(fmt.Sprintf("unhandled flag %q", f.Name))
+		case "ssh":
+			set(prefs.RunSSH)
 		case "login-server":
 			set(prefs.ControlURL)
 		case "accept-routes":

@@ -2,13 +2,15 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// The hello binary runs hello.ipn.dev.
+// The hello binary runs hello.ts.net.
 package main // import "tailscale.com/cmd/hello"
 
 import (
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"html/template"
 	"io/ioutil"
@@ -16,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"tailscale.com/client/tailscale"
 	"tailscale.com/client/tailscale/apitype"
@@ -69,11 +72,31 @@ func main() {
 	if *httpsAddr != "" {
 		log.Printf("running HTTPS server on %s", *httpsAddr)
 		go func() {
-			errc <- http.ListenAndServeTLS(*httpsAddr,
-				"/etc/hello/hello.ipn.dev.crt",
-				"/etc/hello/hello.ipn.dev.key",
-				nil,
-			)
+			hs := &http.Server{
+				Addr: *httpsAddr,
+				TLSConfig: &tls.Config{
+					GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+						switch hi.ServerName {
+						case "hello.ts.net":
+							return tailscale.GetCertificate(hi)
+						case "hello.ipn.dev":
+							c, err := tls.LoadX509KeyPair(
+								"/etc/hello/hello.ipn.dev.crt",
+								"/etc/hello/hello.ipn.dev.key",
+							)
+							if err != nil {
+								return nil, err
+							}
+							return &c, nil
+						}
+						return nil, errors.New("invalid SNI name")
+					},
+				},
+				IdleTimeout:       30 * time.Second,
+				ReadHeaderTimeout: 20 * time.Second,
+				MaxHeaderBytes:    10 << 10,
+			}
+			errc <- hs.ListenAndServeTLS("", "")
 		}()
 	}
 	log.Fatal(<-errc)
@@ -127,14 +150,19 @@ func tailscaleIP(who *apitype.WhoIsResponse) string {
 func root(w http.ResponseWriter, r *http.Request) {
 	if r.TLS == nil && *httpsAddr != "" {
 		host := r.Host
-		if strings.Contains(r.Host, "100.101.102.103") {
-			host = "hello.ipn.dev"
+		if strings.Contains(r.Host, "100.101.102.103") ||
+			strings.Contains(r.Host, "hello.ipn.dev") {
+			host = "hello.ts.net"
 		}
 		http.Redirect(w, r, "https://"+host, http.StatusFound)
 		return
 	}
 	if r.RequestURI != "/" {
 		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	if r.TLS != nil && *httpsAddr != "" && strings.Contains(r.Host, "hello.ipn.dev") {
+		http.Redirect(w, r, "https://hello.ts.net", http.StatusFound)
 		return
 	}
 	tmpl, err := getTmpl()
@@ -168,7 +196,7 @@ func root(w http.ResponseWriter, r *http.Request) {
 			LoginName:     who.UserProfile.LoginName,
 			ProfilePicURL: who.UserProfile.ProfilePicURL,
 			MachineName:   firstLabel(who.Node.ComputedName),
-			MachineOS:     who.Node.Hostinfo.OS,
+			MachineOS:     who.Node.Hostinfo.OS(),
 			IP:            tailscaleIP(who),
 		}
 	}

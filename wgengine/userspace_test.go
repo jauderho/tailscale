@@ -5,25 +5,26 @@
 package wgengine
 
 import (
-	"bytes"
 	"fmt"
 	"reflect"
 	"testing"
-	"time"
 
 	"go4.org/mem"
 	"inet.af/netaddr"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
+	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
 )
 
 func TestNoteReceiveActivity(t *testing.T) {
-	now := time.Unix(1, 0)
-	var logBuf bytes.Buffer
+	now := mono.Time(123456)
+	var logBuf tstest.MemLogger
 
 	confc := make(chan bool, 1)
 	gotConf := func() bool {
@@ -35,21 +36,19 @@ func TestNoteReceiveActivity(t *testing.T) {
 		}
 	}
 	e := &userspaceEngine{
-		timeNow:        func() time.Time { return now },
-		recvActivityAt: map[tailcfg.DiscoKey]time.Time{},
-		logf: func(format string, a ...interface{}) {
-			fmt.Fprintf(&logBuf, format, a...)
-		},
+		timeNow:               func() mono.Time { return now },
+		recvActivityAt:        map[key.NodePublic]mono.Time{},
+		logf:                  logBuf.Logf,
 		tundev:                new(tstun.Wrapper),
 		testMaybeReconfigHook: func() { confc <- true },
-		trimmedDisco:          map[tailcfg.DiscoKey]bool{},
+		trimmedNodes:          map[key.NodePublic]bool{},
 	}
 	ra := e.recvActivityAt
 
-	dk := tailcfg.DiscoKey(key.NewPrivate().Public())
+	nk := key.NewNode().Public()
 
 	// Activity on an untracked key should do nothing.
-	e.noteReceiveActivity(dk)
+	e.noteRecvActivity(nk)
 	if len(ra) != 0 {
 		t.Fatalf("unexpected growth in map: now has %d keys; want 0", len(ra))
 	}
@@ -58,12 +57,12 @@ func TestNoteReceiveActivity(t *testing.T) {
 	}
 
 	// Now track it, but don't mark it trimmed, so shouldn't update.
-	ra[dk] = time.Time{}
-	e.noteReceiveActivity(dk)
+	ra[nk] = 0
+	e.noteRecvActivity(nk)
 	if len(ra) != 1 {
 		t.Fatalf("unexpected growth in map: now has %d keys; want 1", len(ra))
 	}
-	if got := ra[dk]; got != now {
+	if got := ra[nk]; got != now {
 		t.Fatalf("time in map = %v; want %v", got, now)
 	}
 	if gotConf() {
@@ -71,12 +70,12 @@ func TestNoteReceiveActivity(t *testing.T) {
 	}
 
 	// Now mark it trimmed and expect an update.
-	e.trimmedDisco[dk] = true
-	e.noteReceiveActivity(dk)
+	e.trimmedNodes[nk] = true
+	e.noteRecvActivity(nk)
 	if len(ra) != 1 {
 		t.Fatalf("unexpected growth in map: now has %d keys; want 1", len(ra))
 	}
-	if got := ra[dk]; got != now {
+	if got := ra[nk]; got != now {
 		t.Fatalf("time in map = %v; want %v", got, now)
 	}
 	if !gotConf() {
@@ -89,43 +88,55 @@ func TestUserspaceEngineReconfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Close()
+	t.Cleanup(e.Close)
 	ue := e.(*userspaceEngine)
 
 	routerCfg := &router.Config{}
 
-	for _, discoHex := range []string{
+	for _, nodeHex := range []string{
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 	} {
+		nm := &netmap.NetworkMap{
+			Peers: []*tailcfg.Node{
+				{
+					Key: nkFromHex(nodeHex),
+				},
+			},
+		}
+		nk, err := key.ParseNodePublicUntyped(mem.S(nodeHex))
+		if err != nil {
+			t.Fatal(err)
+		}
 		cfg := &wgcfg.Config{
 			Peers: []wgcfg.Peer{
 				{
+					PublicKey: nk,
 					AllowedIPs: []netaddr.IPPrefix{
 						netaddr.IPPrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
 					},
-					Endpoints: wgcfg.Endpoints{DiscoKey: dkFromHex(discoHex)},
 				},
 			},
 		}
 
+		e.SetNetworkMap(nm)
 		err = e.Reconfig(cfg, routerCfg, &dns.Config{}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		wantRecvAt := map[tailcfg.DiscoKey]time.Time{
-			dkFromHex(discoHex): time.Time{},
+		wantRecvAt := map[key.NodePublic]mono.Time{
+			nkFromHex(nodeHex): 0,
 		}
 		if got := ue.recvActivityAt; !reflect.DeepEqual(got, wantRecvAt) {
 			t.Errorf("wrong recvActivityAt\n got: %v\nwant: %v\n", got, wantRecvAt)
 		}
 
-		wantTrimmedDisco := map[tailcfg.DiscoKey]bool{
-			dkFromHex(discoHex): true,
+		wantTrimmedNodes := map[key.NodePublic]bool{
+			nkFromHex(nodeHex): true,
 		}
-		if got := ue.trimmedDisco; !reflect.DeepEqual(got, wantTrimmedDisco) {
-			t.Errorf("wrong wantTrimmedDisco\n got: %v\nwant: %v\n", got, wantTrimmedDisco)
+		if got := ue.trimmedNodes; !reflect.DeepEqual(got, wantTrimmedNodes) {
+			t.Errorf("wrong wantTrimmedNodes\n got: %v\nwant: %v\n", got, wantTrimmedNodes)
 		}
 	}
 }
@@ -150,17 +161,20 @@ func TestUserspaceEnginePortReconfig(t *testing.T) {
 	if ue == nil {
 		t.Fatal("could not create a wgengine with a specific port")
 	}
-	defer ue.Close()
+	t.Cleanup(ue.Close)
 
 	startingPort := ue.magicConn.LocalPort()
-	discoKey := dkFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	nodeKey, err := key.ParseNodePublicUntyped(mem.S("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := &wgcfg.Config{
 		Peers: []wgcfg.Peer{
 			{
+				PublicKey: nodeKey,
 				AllowedIPs: []netaddr.IPPrefix{
 					netaddr.IPPrefixFrom(netaddr.IPv4(100, 100, 99, 1), 32),
 				},
-				Endpoints: wgcfg.Endpoints{DiscoKey: discoKey},
 			},
 		},
 	}
@@ -195,15 +209,15 @@ func TestUserspaceEnginePortReconfig(t *testing.T) {
 	}
 }
 
-func dkFromHex(hex string) tailcfg.DiscoKey {
+func nkFromHex(hex string) key.NodePublic {
 	if len(hex) != 64 {
 		panic(fmt.Sprintf("%q is len %d; want 64", hex, len(hex)))
 	}
-	k, err := key.NewPublicFromHexMem(mem.S(hex[:64]))
+	k, err := key.ParseNodePublicUntyped(mem.S(hex[:64]))
 	if err != nil {
 		panic(fmt.Sprintf("%q is not hex: %v", hex, err))
 	}
-	return tailcfg.DiscoKey(k)
+	return k
 }
 
 // an experiment to see if genLocalAddrFunc was worth it. As of Go
@@ -214,6 +228,8 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 	lanot := netaddr.MustParseIP("5.5.5.5")
 	var x bool
 	b.Run("map1", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
 		m := map[netaddr.IP]bool{
 			la1: true,
 		}
@@ -223,6 +239,8 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 		}
 	})
 	b.Run("map2", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
 		m := map[netaddr.IP]bool{
 			la1: true,
 			la2: true,
@@ -233,6 +251,8 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 		}
 	})
 	b.Run("or1", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
 		f := func(t netaddr.IP) bool {
 			return t == la1
 		}
@@ -242,6 +262,8 @@ func BenchmarkGenLocalAddrFunc(b *testing.B) {
 		}
 	})
 	b.Run("or2", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
 		f := func(t netaddr.IP) bool {
 			return t == la1 || t == la2
 		}

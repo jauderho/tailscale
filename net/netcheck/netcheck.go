@@ -16,16 +16,17 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
+	"runtime"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/tcnksm/go-httpstat"
 	"inet.af/netaddr"
 	"tailscale.com/derp/derphttp"
+	"tailscale.com/envknob"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/neterror"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/portmapper"
 	"tailscale.com/net/stun"
@@ -33,11 +34,12 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
+	"tailscale.com/util/clientmetric"
 )
 
 // Debugging and experimentation tweakables.
 var (
-	debugNetcheck, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_NETCHECK"))
+	debugNetcheck = envknob.Bool("TS_DEBUG_NETCHECK")
 )
 
 // The various default timeouts for things.
@@ -69,11 +71,20 @@ const (
 )
 
 type Report struct {
-	UDP                   bool     // UDP works
-	IPv6                  bool     // IPv6 works
-	IPv4                  bool     // IPv4 works
-	MappingVariesByDestIP opt.Bool // for IPv4
-	HairPinning           opt.Bool // for IPv4
+	UDP         bool // a UDP STUN round trip completed
+	IPv6        bool // an IPv6 STUN round trip completed
+	IPv4        bool // an IPv4 STUN round trip completed
+	IPv6CanSend bool // an IPv6 packet was able to be sent
+	IPv4CanSend bool // an IPv4 packet was able to be sent
+
+	// MappingVariesByDestIP is whether STUN results depend which
+	// STUN server you're talking to (on IPv4).
+	MappingVariesByDestIP opt.Bool
+
+	// HairPinning is whether the router supports communicating
+	// between two local devices through the NATted public IP address
+	// (on IPv4).
+	HairPinning opt.Bool
 
 	// UPnP is whether UPnP appears present on the LAN.
 	// Empty means not checked.
@@ -222,6 +233,12 @@ func (c *Client) MakeNextReportFull() {
 func (c *Client) ReceiveSTUNPacket(pkt []byte, src netaddr.IPPort) {
 	c.vlogf("received STUN packet from %s", src)
 
+	if src.IP().Is4() {
+		metricSTUNRecv4.Add(1)
+	} else if src.IP().Is6() {
+		metricSTUNRecv6.Add(1)
+	}
+
 	c.mu.Lock()
 	if c.handleHairSTUNLocked(pkt, src) {
 		c.mu.Unlock()
@@ -362,7 +379,7 @@ func makeProbePlan(dm *tailcfg.DERPMap, ifState *interfaces.State, last *Report)
 			tries = 2
 		} else if hadBoth {
 			// For dual stack machines, make the 3rd & slower nodes alternate
-			// beetween.
+			// between.
 			if ri%2 == 0 {
 				do4, do6 = true, false
 			} else {
@@ -695,7 +712,12 @@ func (rs *reportState) probePortMapServices() {
 
 	res, err := rs.c.PortMapper.Probe(context.Background())
 	if err != nil {
-		rs.c.logf("probePortMapServices: %v", err)
+		if !errors.Is(err, portmapper.ErrGatewayRange) {
+			// "skipping portmap; gateway range likely lacks support"
+			// is not very useful, and too spammy on cloud systems.
+			// If there are other errors, we want to log those.
+			rs.c.logf("probePortMapServices: %v", err)
+		}
 		return
 	}
 
@@ -722,7 +744,13 @@ func (c *Client) udpBindAddr() string {
 // GetReport gets a report.
 //
 // It may not be called concurrently with itself.
-func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, error) {
+func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (_ *Report, reterr error) {
+	defer func() {
+		if reterr != nil {
+			metricNumGetReportError.Add(1)
+		}
+	}()
+	metricNumGetReport.Add(1)
 	// Mask user context with ours that we guarantee to cancel so
 	// we can depend on it being closed in goroutines later.
 	// (User ctx might be context.Background, etc)
@@ -754,6 +782,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 		last = nil // causes makeProbePlan below to do a full (initial) plan
 		c.nextFull = false
 		c.lastFull = now
+		metricNumGetReportFull.Add(1)
 	}
 	rs.incremental = last != nil
 	c.mu.Unlock()
@@ -764,6 +793,13 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 		c.curState = nil
 	}()
 
+	if runtime.GOOS == "js" {
+		if err := c.runHTTPOnlyChecks(ctx, last, rs, dm); err != nil {
+			return nil, err
+		}
+		return c.finishAndStoreReport(rs, dm), nil
+	}
+
 	ifState, err := interfaces.GetState()
 	if err != nil {
 		c.logf("[v1] interfaces: %v", err)
@@ -771,7 +807,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 	}
 
 	// Create a UDP4 socket used for sending to our discovered IPv4 address.
-	rs.pc4Hair, err = netns.Listener().ListenPacket(ctx, "udp4", ":0")
+	rs.pc4Hair, err = netns.Listener(c.logf).ListenPacket(ctx, "udp4", ":0")
 	if err != nil {
 		c.logf("udp4: %v", err)
 		return nil, err
@@ -799,7 +835,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 	if f := c.GetSTUNConn4; f != nil {
 		rs.pc4 = f()
 	} else {
-		u4, err := netns.Listener().ListenPacket(ctx, "udp4", c.udpBindAddr())
+		u4, err := netns.Listener(c.logf).ListenPacket(ctx, "udp4", c.udpBindAddr())
 		if err != nil {
 			c.logf("udp4: %v", err)
 			return nil, err
@@ -812,7 +848,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 		if f := c.GetSTUNConn6; f != nil {
 			rs.pc6 = f()
 		} else {
-			u6, err := netns.Listener().ListenPacket(ctx, "udp6", c.udpBindAddr())
+			u6, err := netns.Listener(c.logf).ListenPacket(ctx, "udp6", c.udpBindAddr())
 			if err != nil {
 				c.logf("udp6: %v", err)
 			} else {
@@ -897,6 +933,10 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 		wg.Wait()
 	}
 
+	return c.finishAndStoreReport(rs, dm), nil
+}
+
+func (c *Client) finishAndStoreReport(rs *reportState, dm *tailcfg.DERPMap) *Report {
 	rs.mu.Lock()
 	report := rs.report.Clone()
 	rs.mu.Unlock()
@@ -904,10 +944,60 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap) (*Report, e
 	c.addReportHistoryAndSetPreferredDERP(report)
 	c.logConciseReport(report, dm)
 
-	return report, nil
+	return report
+}
+
+// runHTTPOnlyChecks is the netcheck done by environments that can
+// only do HTTP requests, such as ws/wasm.
+func (c *Client) runHTTPOnlyChecks(ctx context.Context, last *Report, rs *reportState, dm *tailcfg.DERPMap) error {
+	var regions []*tailcfg.DERPRegion
+	if rs.incremental && last != nil {
+		for rid := range last.RegionLatency {
+			if dr, ok := dm.Regions[rid]; ok {
+				regions = append(regions, dr)
+			}
+		}
+	}
+	if len(regions) == 0 {
+		for _, dr := range dm.Regions {
+			regions = append(regions, dr)
+		}
+	}
+	c.logf("running HTTP-only netcheck against %v regions", len(regions))
+
+	var wg sync.WaitGroup
+	for _, rg := range regions {
+		if len(rg.Nodes) == 0 {
+			continue
+		}
+		wg.Add(1)
+		rg := rg
+		go func() {
+			defer wg.Done()
+			node := rg.Nodes[0]
+			req, _ := http.NewRequestWithContext(ctx, "HEAD", "https://"+node.HostName+"/derp/probe", nil)
+			// One warm-up one to get HTTP connection set
+			// up and get a connection from the browser's
+			// pool.
+			if _, err := http.DefaultClient.Do(req); err != nil {
+				c.logf("probing %s: %v", node.HostName, err)
+				return
+			}
+			t0 := c.timeNow()
+			if _, err := http.DefaultClient.Do(req); err != nil {
+				c.logf("probing %s: %v", node.HostName, err)
+				return
+			}
+			d := c.timeNow().Sub(t0)
+			rs.addNodeLatency(node, netaddr.IPPort{}, d)
+		}()
+	}
+	wg.Wait()
+	return nil
 }
 
 func (c *Client) measureHTTPSLatency(ctx context.Context, reg *tailcfg.DERPRegion) (time.Duration, netaddr.IP, error) {
+	metricHTTPSend.Add(1)
 	var result httpstat.Result
 	ctx, cancel := context.WithTimeout(httpstat.WithHTTPStat(ctx, &result), overallProbeTimeout)
 	defer cancel()
@@ -1142,9 +1232,21 @@ func (rs *reportState) runProbe(ctx context.Context, dm *tailcfg.DERPMap, probe 
 
 	switch probe.proto {
 	case probeIPv4:
-		rs.pc4.WriteTo(req, addr)
+		metricSTUNSend4.Add(1)
+		n, err := rs.pc4.WriteTo(req, addr)
+		if n == len(req) && err == nil || neterror.TreatAsLostUDP(err) {
+			rs.mu.Lock()
+			rs.report.IPv4CanSend = true
+			rs.mu.Unlock()
+		}
 	case probeIPv6:
-		rs.pc6.WriteTo(req, addr)
+		metricSTUNSend6.Add(1)
+		n, err := rs.pc6.WriteTo(req, addr)
+		if n == len(req) && err == nil || neterror.TreatAsLostUDP(err) {
+			rs.mu.Lock()
+			rs.report.IPv6CanSend = true
+			rs.mu.Unlock()
+		}
 	default:
 		panic("bad probe proto " + fmt.Sprint(probe.proto))
 	}
@@ -1237,3 +1339,15 @@ func conciseOptBool(b opt.Bool, trueVal string) string {
 	}
 	return ""
 }
+
+var (
+	metricNumGetReport      = clientmetric.NewCounter("netcheck_report")
+	metricNumGetReportFull  = clientmetric.NewCounter("netcheck_report_full")
+	metricNumGetReportError = clientmetric.NewCounter("netcheck_report_error")
+
+	metricSTUNSend4 = clientmetric.NewCounter("netcheck_stun_send_ipv4")
+	metricSTUNSend6 = clientmetric.NewCounter("netcheck_stun_send_ipv6")
+	metricSTUNRecv4 = clientmetric.NewCounter("netcheck_stun_recv_ipv4")
+	metricSTUNRecv6 = clientmetric.NewCounter("netcheck_stun_recv_ipv6")
+	metricHTTPSend  = clientmetric.NewCounter("netcheck_https_measure")
+)

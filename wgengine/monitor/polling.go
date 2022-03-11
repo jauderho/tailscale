@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//  +build !freebsd,!windows,!darwin
+//go:build !windows && !darwin
+// +build !windows,!darwin
 
 package monitor
 
@@ -76,7 +77,7 @@ func (pm *pollingMon) Receive() (message, error) {
 	defer ticker.Stop()
 	base := pm.m.InterfaceState()
 	for {
-		if cur, err := pm.m.interfaceStateUncached(); err == nil && !cur.EqualFiltered(base, interfaces.FilterInteresting) {
+		if cur, err := pm.m.interfaceStateUncached(); err == nil && !cur.EqualFiltered(base, interfaces.UseInterestingInterfaces, interfaces.UseInterestingIPs) {
 			return unspecifiedMessage{}, nil
 		}
 		select {

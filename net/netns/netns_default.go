@@ -2,13 +2,22 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build (!linux && !windows && !darwin) || (darwin && ts_macext)
 // +build !linux,!windows,!darwin darwin,ts_macext
 
 package netns
 
-import "syscall"
+import (
+	"syscall"
 
-// control does nothing to c.
-func control(network, address string, c syscall.RawConn) error {
+	"tailscale.com/types/logger"
+)
+
+func control(logger.Logf) func(network, address string, c syscall.RawConn) error {
+	return controlC
+}
+
+// controlC does nothing to c.
+func controlC(network, address string, c syscall.RawConn) error {
 	return nil
 }

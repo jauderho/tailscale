@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -31,35 +32,36 @@ import (
 	"inet.af/netaddr"
 	"inet.af/peercred"
 	"tailscale.com/control/controlclient"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/localapi"
-	"tailscale.com/log/filelogger"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/netstat"
+	"tailscale.com/net/netutil"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/groupmember"
 	"tailscale.com/util/pidowner"
 	"tailscale.com/util/systemd"
+	"tailscale.com/util/winutil"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/monitor"
 )
 
 // Options is the configuration of the Tailscale node agent.
 type Options struct {
-	// SocketPath, on unix systems, is the unix socket path to listen
-	// on for frontend connections.
-	SocketPath string
-
-	// Port, on windows, is the localhost TCP port to listen on for
-	// frontend connections.
-	Port int
-
-	// StatePath is the path to the stored agent state.
-	StatePath string
+	// VarRoot is the the Tailscale daemon's private writable
+	// directory (usually "/var/lib/tailscale" on Linux) that
+	// contains the "tailscaled.state" file, the "certs" directory
+	// for TLS certs, and the "files" directory for incoming
+	// Taildrop files before they're moved to a user directory.
+	// If empty, Taildrop and TLS certs don't function.
+	VarRoot string
 
 	// AutostartStateKey, if non-empty, immediately starts the agent
 	// using the given StateKey. If empty, the agent stays idle and
@@ -82,14 +84,13 @@ type Options struct {
 	// connection count transitions from 1 to 0.
 	SurviveDisconnects bool
 
-	// DebugMux, if non-nil, specifies an HTTP ServeMux in which
-	// to register a debug handler.
-	DebugMux *http.ServeMux
+	// LoginFlags specifies the LoginFlags to pass to the client.
+	LoginFlags controlclient.LoginFlags
 }
 
-// server is an IPN backend and its set of 0 or more active connections
-// talking to an IPN backend.
-type server struct {
+// Server is an IPN backend and its set of 0 or more active localhost
+// TCP or unix socket connections talking to that backend.
+type Server struct {
 	b            *ipnlocal.LocalBackend
 	logf         logger.Logf
 	backendLogID string
@@ -98,7 +99,8 @@ type server struct {
 	// being run in "client mode" that requires an active GUI
 	// connection (such as on Windows by default).  Even if this
 	// is true, the ForceDaemon pref can override this.
-	resetOnZero bool
+	resetOnZero       bool
+	autostartStateKey ipn.StateKey
 
 	bsMu sync.Mutex // lock order: bsMu, then mu
 	bs   *ipn.BackendServer
@@ -110,6 +112,9 @@ type server struct {
 	clients        map[net.Conn]bool            // subset of allClients; only IPN protocol
 	disconnectSub  map[chan<- struct{}]struct{} // keys are subscribers of disconnects
 }
+
+// LocalBackend returns the server's LocalBackend.
+func (s *Server) LocalBackend() *ipnlocal.LocalBackend { return s.b }
 
 // connIdentity represents the owner of a localhost TCP or unix socket connection.
 type connIdentity struct {
@@ -132,7 +137,7 @@ type connIdentity struct {
 // (pid, userid, user). If it's not Windows (for now), it returns a nil error
 // and a ConnIdentity with NotWindows set true. It's only an error if we expected
 // to be able to map it and couldn't.
-func (s *server) getConnIdentity(c net.Conn) (ci connIdentity, err error) {
+func (s *Server) getConnIdentity(c net.Conn) (ci connIdentity, err error) {
 	ci = connIdentity{Conn: c}
 	if runtime.GOOS != "windows" { // for now; TODO: expand to other OSes
 		ci.NotWindows = true
@@ -169,7 +174,7 @@ func (s *server) getConnIdentity(c net.Conn) (ci connIdentity, err error) {
 		return ci, fmt.Errorf("failed to map connection's pid to a user%s: %w", hint, err)
 	}
 	ci.UserID = uid
-	u, err := s.lookupUserFromID(uid)
+	u, err := lookupUserFromID(s.logf, uid)
 	if err != nil {
 		return ci, fmt.Errorf("failed to look up user from userid: %w", err)
 	}
@@ -177,10 +182,17 @@ func (s *server) getConnIdentity(c net.Conn) (ci connIdentity, err error) {
 	return ci, nil
 }
 
-func (s *server) lookupUserFromID(uid string) (*user.User, error) {
+func lookupUserFromID(logf logger.Logf, uid string) (*user.User, error) {
 	u, err := user.LookupId(uid)
 	if err != nil && runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(0x534)) {
-		s.logf("[warning] issue 869: os/user.LookupId failed; ignoring")
+		// The below workaround is only applicable when uid represents a
+		// valid security principal. Omitting this check causes us to succeed
+		// even when uid represents a deleted user.
+		if !winutil.IsSIDValidPrincipal(uid) {
+			return nil, err
+		}
+
+		logf("[warning] issue 869: os/user.LookupId failed; ignoring")
 		// Work around https://github.com/tailscale/tailscale/issues/869 for
 		// now. We don't strictly need the username. It's just a nice-to-have.
 		// So make up a *user.User if their machine is broken in this way.
@@ -196,7 +208,7 @@ func (s *server) lookupUserFromID(uid string) (*user.User, error) {
 // blockWhileInUse blocks while until either a Read from conn fails
 // (i.e. it's closed) or until the server is able to accept ci as a
 // user.
-func (s *server) blockWhileInUse(conn io.Reader, ci connIdentity) {
+func (s *Server) blockWhileInUse(conn io.Reader, ci connIdentity) {
 	s.logf("blocking client while server in use; connIdentity=%v", ci)
 	connDone := make(chan struct{})
 	go func() {
@@ -238,12 +250,28 @@ func bufferHasHTTPRequest(br *bufio.Reader) bool {
 		mem.Contains(mem.B(peek), mem.S(" HTTP/"))
 }
 
-func (s *server) serveConn(ctx context.Context, c net.Conn, logf logger.Logf) {
+// bufferIsConnect reports whether br looks like it's likely an HTTP
+// CONNECT request.
+//
+// Invariant: br has already had at least 4 bytes Peek'ed.
+func bufferIsConnect(br *bufio.Reader) bool {
+	peek, _ := br.Peek(br.Buffered())
+	return mem.HasPrefix(mem.B(peek), mem.S("CONN"))
+}
+
+func (s *Server) serveConn(ctx context.Context, c net.Conn, logf logger.Logf) {
 	// First see if it's an HTTP request.
 	br := bufio.NewReader(c)
 	c.SetReadDeadline(time.Now().Add(time.Second))
 	br.Peek(4)
 	c.SetReadDeadline(time.Time{})
+
+	// Handle logtail CONNECT requests early. (See docs on handleProxyConnectConn)
+	if bufferIsConnect(br) {
+		s.handleProxyConnectConn(ctx, br, c, logf)
+		return
+	}
+
 	isHTTPReq := bufferHasHTTPRequest(br)
 
 	ci, err := s.addConn(c, isHTTPReq)
@@ -282,7 +310,7 @@ func (s *server) serveConn(ctx context.Context, c net.Conn, logf logger.Logf) {
 			ErrorLog:    logger.StdLogger(logf),
 			Handler:     s.localhostHandler(ci),
 		}
-		httpServer.Serve(&oneConnListener{&protoSwitchConn{s: s, br: br, Conn: c}})
+		httpServer.Serve(netutil.NewOneConnListener(&protoSwitchConn{s: s, br: br, Conn: c}, nil))
 		return
 	}
 
@@ -388,7 +416,7 @@ func (e inUseOtherUserError) Unwrap() error { return e.error }
 // The returned error, when non-nil, will be of type inUseOtherUserError.
 //
 // s.mu must be held.
-func (s *server) checkConnIdentityLocked(ci connIdentity) error {
+func (s *Server) checkConnIdentityLocked(ci connIdentity) error {
 	// If clients are already connected, verify they're the same user.
 	// This mostly matters on Windows at the moment.
 	if len(s.allClients) > 0 {
@@ -410,14 +438,17 @@ func (s *server) checkConnIdentityLocked(ci connIdentity) error {
 // the Tailscale local daemon API.
 //
 // s.mu must not be held.
-func (s *server) localAPIPermissions(ci connIdentity) (read, write bool) {
-	if runtime.GOOS == "windows" {
+func (s *Server) localAPIPermissions(ci connIdentity) (read, write bool) {
+	switch runtime.GOOS {
+	case "windows":
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.checkConnIdentityLocked(ci) == nil {
 			return true, true
 		}
 		return false, false
+	case "js":
+		return true, true
 	}
 	if ci.IsUnixSock {
 		return true, !isReadonlyConn(ci, s.b.OperatorUserID(), logger.Discard)
@@ -425,9 +456,52 @@ func (s *server) localAPIPermissions(ci connIdentity) (read, write bool) {
 	return false, false
 }
 
+// userIDFromString maps from either a numeric user id in string form
+// ("998") or username ("caddy") to its string userid ("998").
+// It returns the empty string on error.
+func userIDFromString(v string) string {
+	if v == "" || isAllDigit(v) {
+		return v
+	}
+	u, err := user.Lookup(v)
+	if err != nil {
+		return ""
+	}
+	return u.Uid
+}
+
+func isAllDigit(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if b := s[i]; b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// connCanFetchCerts reports whether ci is allowed to fetch HTTPS
+// certs from this server when it wouldn't otherwise be able to.
+//
+// That is, this reports whether ci should grant additional
+// capabilities over what the conn would otherwise be able to do.
+//
+// For now this only returns true on Unix machines when
+// TS_PERMIT_CERT_UID is set the to the userid of the peer
+// connection. It's intended to give your non-root webserver access
+// (www-data, caddy, nginx, etc) to certs.
+func (s *Server) connCanFetchCerts(ci connIdentity) bool {
+	if ci.IsUnixSock && ci.Creds != nil {
+		connUID, ok := ci.Creds.UserID()
+		if ok && connUID == userIDFromString(envknob.String("TS_PERMIT_CERT_UID")) {
+			return true
+		}
+	}
+	return false
+}
+
 // registerDisconnectSub adds ch as a subscribe to connection disconnect
 // events. If add is false, the subscriber is removed.
-func (s *server) registerDisconnectSub(ch chan<- struct{}, add bool) {
+func (s *Server) registerDisconnectSub(ch chan<- struct{}, add bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if add {
@@ -445,7 +519,7 @@ func (s *server) registerDisconnectSub(ch chan<- struct{}, add bool) {
 //
 // If the returned error is of type inUseOtherUserError then the
 // returned connIdentity is also valid.
-func (s *server) addConn(c net.Conn, isHTTP bool) (ci connIdentity, err error) {
+func (s *Server) addConn(c net.Conn, isHTTP bool) (ci connIdentity, err error) {
 	ci, err = s.getConnIdentity(c)
 	if err != nil {
 		return
@@ -489,7 +563,7 @@ func (s *server) addConn(c net.Conn, isHTTP bool) (ci connIdentity, err error) {
 	return ci, nil
 }
 
-func (s *server) removeAndCloseConn(c net.Conn) {
+func (s *Server) removeAndCloseConn(c net.Conn) {
 	s.mu.Lock()
 	delete(s.clients, c)
 	delete(s.allClients, c)
@@ -513,7 +587,7 @@ func (s *server) removeAndCloseConn(c net.Conn) {
 	c.Close()
 }
 
-func (s *server) stopAll() {
+func (s *Server) stopAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for c := range s.clients {
@@ -526,7 +600,7 @@ func (s *server) stopAll() {
 // setServerModeUserLocked is called when we're in server mode but our s.serverModeUser is nil.
 //
 // s.mu must be held
-func (s *server) setServerModeUserLocked() {
+func (s *Server) setServerModeUserLocked() {
 	var ci connIdentity
 	var ok bool
 	for _, ci = range s.allClients {
@@ -550,7 +624,7 @@ func (s *server) setServerModeUserLocked() {
 
 var jsonEscapedZero = []byte(`\u0000`)
 
-func (s *server) writeToClients(n ipn.Notify) {
+func (s *Server) writeToClients(n ipn.Notify) {
 	inServerMode := s.b.InServerMode()
 
 	s.mu.Lock()
@@ -583,60 +657,50 @@ func (s *server) writeToClients(n ipn.Notify) {
 
 // Run runs a Tailscale backend service.
 // The getEngine func is called repeatedly, once per connection, until it returns an engine successfully.
-func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (wgengine.Engine, error), opts Options) error {
+//
+// Deprecated: use New and Server.Run instead.
+func Run(ctx context.Context, logf logger.Logf, ln net.Listener, store ipn.StateStore, linkMon *monitor.Mon, dialer *tsdial.Dialer, logid string, getEngine func() (wgengine.Engine, error), opts Options) error {
 	getEngine = getEngineUntilItWorksWrapper(getEngine)
 	runDone := make(chan struct{})
 	defer close(runDone)
 
-	listen, _, err := safesocket.Listen(opts.SocketPath, uint16(opts.Port))
-	if err != nil {
-		return fmt.Errorf("safesocket.Listen: %v", err)
-	}
+	var serverMu sync.Mutex
+	var serverOrNil *Server
 
-	server := &server{
-		backendLogID: logid,
-		logf:         logf,
-		resetOnZero:  !opts.SurviveDisconnects,
-	}
-
-	// When the context is closed or when we return, whichever is first, close our listner
+	// When the context is closed or when we return, whichever is first, close our listener
 	// and all open connections.
 	go func() {
 		select {
 		case <-ctx.Done():
 		case <-runDone:
 		}
-		server.stopAll()
-		listen.Close()
+		serverMu.Lock()
+		if s := serverOrNil; s != nil {
+			s.stopAll()
+		}
+		serverMu.Unlock()
+		ln.Close()
 	}()
-	logf("Listening on %v", listen.Addr())
+	logf("Listening on %v", ln.Addr())
 
-	var store ipn.StateStore
-	if opts.StatePath != "" {
-		store, err = ipn.NewFileStore(opts.StatePath)
-		if err != nil {
-			return fmt.Errorf("ipn.NewFileStore(%q): %v", opts.StatePath, err)
+	var serverModeUser *user.User
+	if opts.AutostartStateKey == "" {
+		autoStartKey, err := store.ReadState(ipn.ServerModeStartKey)
+		if err != nil && err != ipn.ErrStateNotExist {
+			return fmt.Errorf("calling ReadState on state store: %w", err)
 		}
-		if opts.AutostartStateKey == "" {
-			autoStartKey, err := store.ReadState(ipn.ServerModeStartKey)
-			if err != nil && err != ipn.ErrStateNotExist {
-				return fmt.Errorf("calling ReadState on %s: %w", opts.StatePath, err)
+		key := string(autoStartKey)
+		if strings.HasPrefix(key, "user-") {
+			uid := strings.TrimPrefix(key, "user-")
+			u, err := lookupUserFromID(logf, uid)
+			if err != nil {
+				logf("ipnserver: found server mode auto-start key %q; failed to load user: %v", key, err)
+			} else {
+				logf("ipnserver: found server mode auto-start key %q (user %s)", key, u.Username)
+				serverModeUser = u
 			}
-			key := string(autoStartKey)
-			if strings.HasPrefix(key, "user-") {
-				uid := strings.TrimPrefix(key, "user-")
-				u, err := server.lookupUserFromID(uid)
-				if err != nil {
-					logf("ipnserver: found server mode auto-start key %q; failed to load user: %v", key, err)
-				} else {
-					logf("ipnserver: found server mode auto-start key %q (user %s)", key, u.Username)
-					server.serverModeUser = u
-				}
-				opts.AutostartStateKey = ipn.StateKey(key)
-			}
+			opts.AutostartStateKey = ipn.StateKey(key)
 		}
-	} else {
-		store = &ipn.MemoryStore{}
 	}
 
 	bo := backoff.NewBackoff("ipnserver", logf, 30*time.Second)
@@ -646,7 +710,7 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 	if err != nil {
 		logf("ipnserver: initial getEngine call: %v", err)
 		for i := 1; ctx.Err() == nil; i++ {
-			c, err := listen.Accept()
+			c, err := ln.Accept()
 			if err != nil {
 				logf("%d: Accept: %v", i, err)
 				bo.BackOff(ctx, err)
@@ -672,54 +736,131 @@ func Run(ctx context.Context, logf logger.Logf, logid string, getEngine func() (
 			return err
 		}
 	}
-
-	b, err := ipnlocal.NewLocalBackend(logf, logid, store, eng)
-	if err != nil {
-		return fmt.Errorf("NewLocalBackend: %v", err)
+	if unservedConn != nil {
+		ln = &listenerWithReadyConn{
+			Listener: ln,
+			c:        unservedConn,
+		}
 	}
-	defer b.Shutdown()
+
+	server, err := New(logf, logid, store, eng, dialer, serverModeUser, opts)
+	if err != nil {
+		return err
+	}
+	serverMu.Lock()
+	serverOrNil = server
+	serverMu.Unlock()
+	return server.Run(ctx, ln)
+}
+
+// New returns a new Server.
+//
+// To start it, use the Server.Run method.
+func New(logf logger.Logf, logid string, store ipn.StateStore, eng wgengine.Engine, dialer *tsdial.Dialer, serverModeUser *user.User, opts Options) (*Server, error) {
+	b, err := ipnlocal.NewLocalBackend(logf, logid, store, dialer, eng, opts.LoginFlags)
+	if err != nil {
+		return nil, fmt.Errorf("NewLocalBackend: %v", err)
+	}
+	b.SetVarRoot(opts.VarRoot)
 	b.SetDecompressor(func() (controlclient.Decompressor, error) {
 		return smallzstd.NewDecoder(nil)
 	})
 
-	if opts.DebugMux != nil {
-		opts.DebugMux.HandleFunc("/debug/ipn", func(w http.ResponseWriter, r *http.Request) {
-			serveHTMLStatus(w, b)
-		})
+	dg := distro.Get()
+	switch dg {
+	case distro.Synology, distro.TrueNAS:
+		// See if they have a "Taildrop" share.
+		// See https://github.com/tailscale/tailscale/issues/2179#issuecomment-982821319
+		path, err := findTaildropDir(dg)
+		if err != nil {
+			logf("%s Taildrop support: %v", dg, err)
+		} else {
+			logf("%s Taildrop: using %v", dg, path)
+			b.SetDirectFileRoot(path)
+			b.SetDirectFileDoFinalRename(true)
+		}
+
 	}
 
-	server.b = b
-	server.bs = ipn.NewBackendServer(logf, b, server.writeToClients)
+	if opts.AutostartStateKey == "" {
+		autoStartKey, err := store.ReadState(ipn.ServerModeStartKey)
+		if err != nil && err != ipn.ErrStateNotExist {
+			return nil, fmt.Errorf("calling ReadState on store: %w", err)
+		}
+		key := string(autoStartKey)
+		if strings.HasPrefix(key, "user-") {
+			uid := strings.TrimPrefix(key, "user-")
+			u, err := lookupUserFromID(logf, uid)
+			if err != nil {
+				logf("ipnserver: found server mode auto-start key %q; failed to load user: %v", key, err)
+			} else {
+				logf("ipnserver: found server mode auto-start key %q (user %s)", key, u.Username)
+				serverModeUser = u
+			}
+			opts.AutostartStateKey = ipn.StateKey(key)
+		}
+	}
 
-	if opts.AutostartStateKey != "" {
-		server.bs.GotCommand(context.TODO(), &ipn.Command{
+	server := &Server{
+		b:                 b,
+		backendLogID:      logid,
+		logf:              logf,
+		resetOnZero:       !opts.SurviveDisconnects,
+		serverModeUser:    serverModeUser,
+		autostartStateKey: opts.AutostartStateKey,
+	}
+	server.bs = ipn.NewBackendServer(logf, b, server.writeToClients)
+	return server, nil
+}
+
+// Run runs the server, accepting connections from ln forever.
+//
+// If the context is done, the listener is closed.
+func (s *Server) Run(ctx context.Context, ln net.Listener) error {
+	defer s.b.Shutdown()
+
+	runDone := make(chan struct{})
+	defer close(runDone)
+
+	// When the context is closed or when we return, whichever is first, close our listener
+	// and all open connections.
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-runDone:
+		}
+		s.stopAll()
+		ln.Close()
+	}()
+
+	if s.autostartStateKey != "" {
+		s.bs.GotCommand(ctx, &ipn.Command{
 			Version: version.Long,
 			Start: &ipn.StartArgs{
-				Opts: ipn.Options{StateKey: opts.AutostartStateKey},
+				Opts: ipn.Options{StateKey: s.autostartStateKey},
 			},
 		})
 	}
 
 	systemd.Ready()
-	for i := 1; ctx.Err() == nil; i++ {
-		var c net.Conn
-		var err error
-		if unservedConn != nil {
-			c = unservedConn
-			unservedConn = nil
-		} else {
-			c, err = listen.Accept()
+	bo := backoff.NewBackoff("ipnserver", s.logf, 30*time.Second)
+	var connNum int
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
+		c, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() == nil {
-				logf("ipnserver: Accept: %v", err)
-				bo.BackOff(ctx, err)
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
+			s.logf("ipnserver: Accept: %v", err)
+			bo.BackOff(ctx, err)
 			continue
 		}
-		go server.serveConn(ctx, c, logger.WithPrefix(logf, fmt.Sprintf("ipnserver: conn%d: ", i)))
+		connNum++
+		go s.serveConn(ctx, c, logger.WithPrefix(s.logf, fmt.Sprintf("ipnserver: conn%d: ", connNum)))
 	}
-	return ctx.Err()
 }
 
 // BabysitProc runs the current executable as a child process with the
@@ -732,14 +873,6 @@ func BabysitProc(ctx context.Context, args []string, logf logger.Logf) {
 	executable, err := os.Executable()
 	if err != nil {
 		panic("cannot determine executable: " + err.Error())
-	}
-
-	if runtime.GOOS == "windows" {
-		if len(args) != 2 && args[0] != "/subproc" {
-			panic(fmt.Sprintf("unexpected arguments %q", args))
-		}
-		logID := args[1]
-		logf = filelogger.New("tailscale-service", logID, logf)
 	}
 
 	var proc struct {
@@ -773,6 +906,14 @@ func BabysitProc(ctx context.Context, args []string, logf logger.Logf) {
 		startTime := time.Now()
 		log.Printf("exec: %#v %v", executable, args)
 		cmd := exec.Command(executable, args...)
+		if runtime.GOOS == "windows" {
+			extraEnv, err := loadExtraEnv()
+			if err != nil {
+				logf("errors loading extra env file; ignoring: %v", err)
+			} else {
+				cmd.Env = append(os.Environ(), extraEnv...)
+			}
+		}
 
 		// Create a pipe object to use as the subproc's stdin.
 		// When the writer goes away, the reader gets EOF.
@@ -881,35 +1022,12 @@ func getEngineUntilItWorksWrapper(getEngine func() (wgengine.Engine, error)) fun
 	}
 }
 
-type dummyAddr string
-type oneConnListener struct {
-	conn net.Conn
-}
-
-func (l *oneConnListener) Accept() (c net.Conn, err error) {
-	c = l.conn
-	if c == nil {
-		err = io.EOF
-		return
-	}
-	err = nil
-	l.conn = nil
-	return
-}
-
-func (l *oneConnListener) Close() error { return nil }
-
-func (l *oneConnListener) Addr() net.Addr { return dummyAddr("unused-address") }
-
-func (a dummyAddr) Network() string { return string(a) }
-func (a dummyAddr) String() string  { return string(a) }
-
 // protoSwitchConn is a net.Conn that's we want to speak HTTP to but
 // it's already had a few bytes read from it to determine that it's
 // HTTP. So we Read from its bufio.Reader. On Close, we we tell the
 // server it's closed, so the server can account the who's connected.
 type protoSwitchConn struct {
-	s *server
+	s *Server
 	net.Conn
 	br        *bufio.Reader
 	closeOnce sync.Once
@@ -921,9 +1039,10 @@ func (psc *protoSwitchConn) Close() error {
 	return nil
 }
 
-func (s *server) localhostHandler(ci connIdentity) http.Handler {
+func (s *Server) localhostHandler(ci connIdentity) http.Handler {
 	lah := localapi.NewHandler(s.b, s.logf, s.backendLogID)
 	lah.PermitRead, lah.PermitWrite = s.localAPIPermissions(ci)
+	lah.PermitCert = s.connCanFetchCerts(ci)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/localapi/") {
@@ -934,13 +1053,13 @@ func (s *server) localhostHandler(ci connIdentity) http.Handler {
 			io.WriteString(w, "<html><title>Tailscale</title><body><h1>Tailscale</h1>This is the local Tailscale daemon.")
 			return
 		}
-		serveHTMLStatus(w, s.b)
+		s.ServeHTMLStatus(w, r)
 	})
 }
 
-func serveHTMLStatus(w http.ResponseWriter, b *ipnlocal.LocalBackend) {
+func (s *Server) ServeHTMLStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	st := b.Status()
+	st := s.b.Status()
 	// TODO(bradfitz): add LogID and opts to st?
 	st.WriteHTML(w)
 }
@@ -974,4 +1093,115 @@ func marshalNotify(n ipn.Notify, logf logger.Logf) (b []byte, ok bool) {
 		logf("[unexpected] zero byte in BackendServer.send notify message: %q", b)
 	}
 	return b, true
+}
+
+// listenerWithReadyConn is a net.Listener wrapper that has
+// one net.Conn ready to be accepted already.
+type listenerWithReadyConn struct {
+	net.Listener
+
+	mu sync.Mutex
+	c  net.Conn // if non-nil, ready to be Accepted
+}
+
+func (ln *listenerWithReadyConn) Accept() (net.Conn, error) {
+	ln.mu.Lock()
+	c := ln.c
+	ln.c = nil
+	ln.mu.Unlock()
+	if c != nil {
+		return c, nil
+	}
+	return ln.Listener.Accept()
+}
+
+func findTaildropDir(dg distro.Distro) (string, error) {
+	const name = "Taildrop"
+	switch dg {
+	case distro.Synology:
+		return findSynologyTaildropDir(name)
+	case distro.TrueNAS:
+		return findTrueNASTaildropDir(name)
+	}
+	return "", fmt.Errorf("%s is an unsupported distro for Taildrop dir", dg)
+}
+
+// findSynologyTaildropDir looks for the first volume containing a
+// "Taildrop" directory.  We'd run "synoshare --get Taildrop" command
+// but on DSM7 at least, we lack permissions to run that.
+func findSynologyTaildropDir(name string) (dir string, err error) {
+	for i := 1; i <= 16; i++ {
+		dir = fmt.Sprintf("/volume%v/%s", i, name)
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir, nil
+		}
+	}
+	return "", fmt.Errorf("shared folder %q not found", name)
+}
+
+// findTrueNASTaildropDir returns the first matching directory of
+// /mnt/{name} or /mnt/*/{name}
+func findTrueNASTaildropDir(name string) (dir string, err error) {
+	// If we're running in a jail, a mount point could just be added at /mnt/Taildrop
+	dir = fmt.Sprintf("/mnt/%s", name)
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return dir, nil
+	}
+
+	// but if running on the host, it may be something like /mnt/Primary/Taildrop
+	fis, err := ioutil.ReadDir("/mnt")
+	if err != nil {
+		return "", fmt.Errorf("error reading /mnt: %w", err)
+	}
+	for _, fi := range fis {
+		dir = fmt.Sprintf("/mnt/%s/%s", fi.Name(), name)
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir, nil
+		}
+	}
+	return "", fmt.Errorf("shared folder %q not found", name)
+}
+
+func loadExtraEnv() (env []string, err error) {
+	if runtime.GOOS != "windows" {
+		return nil, nil
+	}
+	name := filepath.Join(os.Getenv("ProgramData"), "Tailscale", "tailscaled-env.txt")
+	contents, err := os.ReadFile(name)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(string(contents), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		k, v, ok := stringsCut(line, "=")
+		if !ok || k == "" {
+			continue
+		}
+		if strings.HasPrefix(v, `"`) {
+			var err error
+			v, err = strconv.Unquote(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid value in line %q: %v", line, err)
+			}
+			env = append(env, k+"="+v)
+		} else {
+			env = append(env, line)
+		}
+	}
+	return env, nil
+}
+
+// stringsCut is Go 1.18's strings.Cut.
+// TODO(bradfitz): delete this when we depend on Go 1.18.
+func stringsCut(s, sep string) (before, after string, found bool) {
+	if i := strings.Index(s, sep); i >= 0 {
+		return s[:i], s[i+len(sep):], true
+	}
+	return s, "", false
 }

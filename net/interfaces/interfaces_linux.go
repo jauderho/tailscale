@@ -11,12 +11,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 
+	"github.com/jsimonetti/rtnetlink"
+	"github.com/mdlayher/netlink"
 	"go4.org/mem"
+	"golang.org/x/sys/unix"
 	"inet.af/netaddr"
 	"tailscale.com/syncs"
 	"tailscale.com/util/lineread"
@@ -27,6 +31,11 @@ func init() {
 }
 
 var procNetRouteErr syncs.AtomicBool
+
+// errStopReading is a sentinel error value used internally by
+// lineread.File callers to stop reading. It doesn't escape to
+// callers/users.
+var errStopReading = errors.New("stop reading")
 
 /*
 Parse 10.0.0.1 out of:
@@ -47,11 +56,14 @@ func likelyHomeRouterIPLinux() (ret netaddr.IP, ok bool) {
 	}
 	lineNum := 0
 	var f []mem.RO
-	err := lineread.File("/proc/net/route", func(line []byte) error {
+	err := lineread.File(procNetRoutePath, func(line []byte) error {
 		lineNum++
 		if lineNum == 1 {
 			// Skip header line.
 			return nil
+		}
+		if lineNum > maxProcNetRouteRead {
+			return errStopReading
 		}
 		f = mem.AppendFields(f[:0], mem.B(line))
 		if len(f) < 4 {
@@ -62,9 +74,7 @@ func likelyHomeRouterIPLinux() (ret netaddr.IP, ok bool) {
 		if err != nil {
 			return nil // ignore error, skip line and keep going
 		}
-		const RTF_UP = 0x0001
-		const RTF_GATEWAY = 0x0002
-		if flags&(RTF_UP|RTF_GATEWAY) != RTF_UP|RTF_GATEWAY {
+		if flags&(unix.RTF_UP|unix.RTF_GATEWAY) != unix.RTF_UP|unix.RTF_GATEWAY {
 			return nil
 		}
 		ipu32, err := mem.ParseUint(gwHex, 16, 32)
@@ -72,11 +82,15 @@ func likelyHomeRouterIPLinux() (ret netaddr.IP, ok bool) {
 			return nil // ignore error, skip line and keep going
 		}
 		ip := netaddr.IPv4(byte(ipu32), byte(ipu32>>8), byte(ipu32>>16), byte(ipu32>>24))
-		if isPrivateIP(ip) {
+		if ip.IsPrivate() {
 			ret = ip
+			return errStopReading
 		}
 		return nil
 	})
+	if errors.Is(err, errStopReading) {
+		err = nil
+	}
 	if err != nil {
 		procNetRouteErr.Set(true)
 		if runtime.GOOS == "android" {
@@ -122,21 +136,83 @@ func likelyHomeRouterIPAndroid() (ret netaddr.IP, ok bool) {
 	return ret, !ret.IsZero()
 }
 
-// DefaultRouteInterface returns the name of the network interface that owns
-// the default route, not including any tailscale interfaces.
-func DefaultRouteInterface() (string, error) {
+func defaultRoute() (d DefaultRouteDetails, err error) {
 	v, err := defaultRouteInterfaceProcNet()
 	if err == nil {
-		return v, nil
+		d.InterfaceName = v
+		return d, nil
 	}
 	if runtime.GOOS == "android" {
-		return defaultRouteInterfaceAndroidIPRoute()
+		v, err = defaultRouteInterfaceAndroidIPRoute()
+		d.InterfaceName = v
+		return d, err
 	}
-	return v, err
+	// Issue 4038: the default route (such as on Unifi UDM Pro)
+	// might be in a non-default table, so it won't show up in
+	// /proc/net/route. Use netlink to find the default route.
+	//
+	// TODO(bradfitz): this allocates a fair bit. We should track
+	// this in wgengine/monitor instead and have
+	// interfaces.GetState take a link monitor or similar so the
+	// routing table can be cached and the monitor's existing
+	// subscription to route changes can update the cached state,
+	// rather than querying the whole thing every time like
+	// defaultRouteFromNetlink does.
+	//
+	// Then we should just always try to use the cached route
+	// table from netlink every time, and only use /proc/net/route
+	// as a fallback for weird environments where netlink might be
+	// banned but /proc/net/route is emulated (e.g. stuff like
+	// Cloud Run?).
+	return defaultRouteFromNetlink()
+}
+
+func defaultRouteFromNetlink() (d DefaultRouteDetails, err error) {
+	c, err := rtnetlink.Dial(&netlink.Config{Strict: true})
+	if err != nil {
+		return d, fmt.Errorf("defaultRouteFromNetlink: Dial: %w", err)
+	}
+	defer c.Close()
+	rms, err := c.Route.List()
+	if err != nil {
+		return d, fmt.Errorf("defaultRouteFromNetlink: List: %w", err)
+	}
+	for _, rm := range rms {
+		if rm.Attributes.Gateway == nil {
+			// A default route has a gateway. If it doesn't, skip it.
+			continue
+		}
+		if rm.Attributes.Dst != nil {
+			// A default route has a nil destination to mean anything
+			// so ignore any route for a specific destination.
+			// TODO(bradfitz): better heuristic?
+			// empirically this seems like enough.
+			continue
+		}
+		// TODO(bradfitz): care about address family, if
+		// callers ever start caring about v4-vs-v6 default
+		// route differences.
+		idx := int(rm.Attributes.OutIface)
+		if idx == 0 {
+			continue
+		}
+		if iface, err := net.InterfaceByIndex(idx); err == nil {
+			d.InterfaceName = iface.Name
+			d.InterfaceIndex = idx
+			return d, nil
+		}
+	}
+	return d, errNoDefaultRoute
 }
 
 var zeroRouteBytes = []byte("00000000")
 var procNetRoutePath = "/proc/net/route"
+
+// maxProcNetRouteRead is the max number of lines to read from
+// /proc/net/route looking for a default route.
+const maxProcNetRouteRead = 1000
+
+var errNoDefaultRoute = errors.New("no default route found")
 
 func defaultRouteInterfaceProcNetInternal(bufsize int) (string, error) {
 	f, err := os.Open(procNetRoutePath)
@@ -146,10 +222,12 @@ func defaultRouteInterfaceProcNetInternal(bufsize int) (string, error) {
 	defer f.Close()
 
 	br := bufio.NewReaderSize(f, bufsize)
+	lineNum := 0
 	for {
+		lineNum++
 		line, err := br.ReadSlice('\n')
-		if err == io.EOF {
-			return "", fmt.Errorf("no default routes found: %w", err)
+		if err == io.EOF || lineNum > maxProcNetRouteRead {
+			return "", errNoDefaultRoute
 		}
 		if err != nil {
 			return "", err

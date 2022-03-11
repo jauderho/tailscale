@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"go4.org/mem"
 	"golang.org/x/sys/unix"
 	"tailscale.com/syncs"
 )
@@ -39,11 +40,10 @@ func listPorts() (List, error) {
 	if sawProcNetPermissionErr.Get() {
 		return nil, nil
 	}
-	l := []Port{}
+	var ret []Port
 
+	var br *bufio.Reader
 	for _, fname := range sockfiles {
-		proto := strings.TrimSuffix(filepath.Base(fname), "6")
-
 		// Android 10+ doesn't allow access to this anymore.
 		// https://developer.android.com/about/versions/10/privacy/changes#proc-net-filesystem
 		// Ignore it rather than have the system log about our violation.
@@ -60,69 +60,119 @@ func listPorts() (List, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %s", fname, err)
 		}
-		defer f.Close()
-		r := bufio.NewReader(f)
-
-		ports, err := parsePorts(r, proto)
+		if br == nil {
+			br = bufio.NewReader(f)
+		} else {
+			br.Reset(f)
+		}
+		ports, err := parsePorts(br, filepath.Base(fname))
+		f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("parsing %q: %w", fname, err)
 		}
-
-		l = append(l, ports...)
+		ret = append(ret, ports...)
 	}
-	return l, nil
+	return ret, nil
 }
 
-func parsePorts(r *bufio.Reader, proto string) ([]Port, error) {
+// fileBase is one of "tcp", "tcp6", "udp", "udp6".
+func parsePorts(r *bufio.Reader, fileBase string) ([]Port, error) {
+	proto := strings.TrimSuffix(fileBase, "6")
 	var ret []Port
 
 	// skip header row
-	_, err := r.ReadString('\n')
+	_, err := r.ReadSlice('\n')
 	if err != nil {
 		return nil, err
 	}
 
+	fields := make([]mem.RO, 0, 20) // 17 current fields + some future slop
+
+	wantRemote := mem.S(v4Any)
+	if strings.HasSuffix(fileBase, "6") {
+		wantRemote = mem.S(v6Any)
+	}
+
+	// remoteIndex is the index within a line to the remote address field.
+	// -1 means not yet found.
+	remoteIndex := -1
+
+	// Add an upper bound on how many rows we'll attempt to read just
+	// to make sure this doesn't consume too much of their CPU.
+	// TODO(bradfitz,crawshaw): adaptively adjust polling interval as function
+	// of open sockets.
+	const maxRows = 1e6
+	rows := 0
+
+	// Scratch buffer for making inode strings.
+	inoBuf := make([]byte, 0, 50)
+
 	for err == nil {
-		line, err := r.ReadString('\n')
+		line, err := r.ReadSlice('\n')
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
+		rows++
+		if rows >= maxRows {
+			break
+		}
+		if len(line) == 0 {
+			continue
+		}
+
+		// On the first row of output, find the index of the 3rd field (index 2),
+		// the remote address. All the rows are aligned, at least until 4 billion open
+		// TCP connections, per the Linux get_tcp4_sock's "%4d: " on an int i.
+		if remoteIndex == -1 {
+			remoteIndex = fieldIndex(line, 2)
+			if remoteIndex == -1 {
+				break
+			}
+		}
+
+		if len(line) < remoteIndex || !mem.HasPrefix(mem.B(line).SliceFrom(remoteIndex), wantRemote) {
+			// Fast path for not being a listener port.
+			continue
+		}
 
 		// sl local rem ... inode
-		words := strings.Fields(line)
-		local := words[1]
-		rem := words[2]
-		inode := words[9]
+		fields = mem.AppendFields(fields[:0], mem.B(line))
+		local := fields[1]
+		rem := fields[2]
+		inode := fields[9]
+
+		if !rem.Equal(wantRemote) {
+			// not a "listener" port
+			continue
+		}
 
 		// If a port is bound to localhost, ignore it.
 		// TODO: localhost is bigger than 1 IP, we need to ignore
 		// more things.
-		if strings.HasPrefix(local, v4Localhost) || strings.HasPrefix(local, v6Localhost) {
-			continue
-		}
-		if rem != v4Any && rem != v6Any {
-			// not a "listener" port
+		if mem.HasPrefix(local, mem.S(v4Localhost)) || mem.HasPrefix(local, mem.S(v6Localhost)) {
 			continue
 		}
 
 		// Don't use strings.Split here, because it causes
 		// allocations significant enough to show up in profiles.
-		i := strings.IndexByte(local, ':')
+		i := mem.IndexByte(local, ':')
 		if i == -1 {
-			return nil, fmt.Errorf("%q unexpectedly didn't have a colon", local)
+			return nil, fmt.Errorf("%q unexpectedly didn't have a colon", local.StringCopy())
 		}
-		portv, err := strconv.ParseUint(local[i+1:], 16, 16)
+		portv, err := mem.ParseUint(local.SliceFrom(i+1), 16, 16)
 		if err != nil {
-			return nil, fmt.Errorf("%#v: %s", local[9:], err)
+			return nil, fmt.Errorf("%#v: %s", local.SliceFrom(9).StringCopy(), err)
 		}
-		inodev := fmt.Sprintf("socket:[%s]", inode)
+		inoBuf = append(inoBuf[:0], "socket:["...)
+		inoBuf = mem.Append(inoBuf, inode)
+		inoBuf = append(inoBuf, ']')
 		ret = append(ret, Port{
 			Proto: proto,
 			Port:  uint16(portv),
-			inode: inodev,
+			inode: string(inoBuf),
 		})
 	}
 
@@ -233,4 +283,27 @@ func foreachPID(fn func(pidStr string) error) error {
 			}
 		}
 	}
+}
+
+// fieldIndex returns the offset in line where the Nth field (0-based) begins, or -1
+// if there aren't that many fields. Fields are separated by 1 or more spaces.
+func fieldIndex(line []byte, n int) int {
+	skip := 0
+	for i := 0; i <= n; i++ {
+		// Skip spaces.
+		for skip < len(line) && line[skip] == ' ' {
+			skip++
+		}
+		if skip == len(line) {
+			return -1
+		}
+		if i == n {
+			break
+		}
+		// Skip non-space.
+		for skip < len(line) && line[skip] != ' ' {
+			skip++
+		}
+	}
+	return skip
 }

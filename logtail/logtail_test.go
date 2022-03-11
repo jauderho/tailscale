@@ -5,6 +5,7 @@
 package logtail
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"tailscale.com/tstest"
 )
 
 func TestFastShutdown(t *testing.T) {
@@ -117,12 +120,7 @@ func TestEncodeAndUploadMessages(t *testing.T) {
 		io.WriteString(l, tt.log)
 		body := <-ts.uploaded
 
-		data := make(map[string]interface{})
-		err := json.Unmarshal(body, &data)
-		if err != nil {
-			t.Error(err)
-		}
-
+		data := unmarshalOne(t, body)
 		got := data["text"]
 		if got != tt.want {
 			t.Errorf("%s: got %q; want %q", tt.name, got.(string), tt.want)
@@ -154,11 +152,7 @@ func TestEncodeSpecialCases(t *testing.T) {
 	// JSON log message already contains a logtail field.
 	io.WriteString(l, `{"logtail": "LOGTAIL", "text": "text"}`)
 	body := <-ts.uploaded
-	data := make(map[string]interface{})
-	err := json.Unmarshal(body, &data)
-	if err != nil {
-		t.Error(err)
-	}
+	data := unmarshalOne(t, body)
 	errorHasLogtail, ok := data["error_has_logtail"]
 	if ok {
 		if errorHasLogtail != "LOGTAIL" {
@@ -186,11 +180,7 @@ func TestEncodeSpecialCases(t *testing.T) {
 	l.skipClientTime = true
 	io.WriteString(l, "text")
 	body = <-ts.uploaded
-	data = make(map[string]interface{})
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		t.Error(err)
-	}
+	data = unmarshalOne(t, body)
 	_, ok = data["logtail"]
 	if ok {
 		t.Errorf("skipClientTime: unexpected logtail map present: %v", data)
@@ -204,11 +194,7 @@ func TestEncodeSpecialCases(t *testing.T) {
 	longStr := strings.Repeat("0", 512)
 	io.WriteString(l, longStr)
 	body = <-ts.uploaded
-	data = make(map[string]interface{})
-	err = json.Unmarshal(body, &data)
-	if err != nil {
-		t.Error(err)
-	}
+	data = unmarshalOne(t, body)
 	text, ok := data["text"]
 	if !ok {
 		t.Errorf("lowMem: no text %v", data)
@@ -219,7 +205,7 @@ func TestEncodeSpecialCases(t *testing.T) {
 
 	// -------------------------------------------------------------------------
 
-	err = l.Shutdown(context.Background())
+	err := l.Shutdown(context.Background())
 	if err != nil {
 		t.Error(err)
 	}
@@ -230,11 +216,11 @@ var sink []byte
 func TestLoggerEncodeTextAllocs(t *testing.T) {
 	lg := &Logger{timeNow: time.Now}
 	inBuf := []byte("some text to encode")
-	n := testing.AllocsPerRun(1000, func() {
-		sink = lg.encodeText(inBuf, false)
+	err := tstest.MinAllocsPerRun(t, 1, func() {
+		sink = lg.encodeText(inBuf, false, 0)
 	})
-	if int(n) != 1 {
-		t.Logf("allocs = %d; want 1", int(n))
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -289,6 +275,11 @@ func TestParseAndRemoveLogLevel(t *testing.T) {
 			0,
 			"[v3] no level 3",
 		},
+		{
+			"some ignored text then [v\x00JSON]5{\"foo\":1234}",
+			5,
+			`{"foo":1234}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -315,14 +306,95 @@ func TestPublicIDUnmarshalText(t *testing.T) {
 	if id.String() != hexStr {
 		t.Errorf("String = %q; want %q", id.String(), hexStr)
 	}
-
-	n := int(testing.AllocsPerRun(1000, func() {
+	err := tstest.MinAllocsPerRun(t, 0, func() {
 		var id PublicID
 		if err := id.UnmarshalText(x); err != nil {
 			t.Fatal(err)
 		}
-	}))
-	if n != 0 {
-		t.Errorf("allocs = %v; want 0", n)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func unmarshalOne(t *testing.T, body []byte) map[string]interface{} {
+	t.Helper()
+	var entries []map[string]interface{}
+	err := json.Unmarshal(body, &entries)
+	if err != nil {
+		t.Error(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one entry, got %d", len(entries))
+	}
+	return entries[0]
+}
+
+func TestEncodeTextTruncation(t *testing.T) {
+	lg := &Logger{timeNow: time.Now, lowMem: true}
+	in := bytes.Repeat([]byte("a"), 300)
+	b := lg.encodeText(in, true, 0)
+	got := string(b)
+	want := `{"text": "` + strings.Repeat("a", 255) + `…+45"}` + "\n"
+	if got != want {
+		t.Errorf("got:\n%qwant:\n%q\n", got, want)
+	}
+}
+
+type simpleMemBuf struct {
+	Buffer
+	buf bytes.Buffer
+}
+
+func (b *simpleMemBuf) Write(p []byte) (n int, err error) { return b.buf.Write(p) }
+
+func TestEncode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{
+			"normal",
+			`{"logtail": {"client_time": "1970-01-01T00:02:03.000000456Z"}, "text": "normal"}` + "\n",
+		},
+		{
+			"and a [v1] level one",
+			`{"logtail": {"client_time": "1970-01-01T00:02:03.000000456Z"}, "v":1,"text": "and a level one"}` + "\n",
+		},
+		{
+			"[v2] some verbose two",
+			`{"logtail": {"client_time": "1970-01-01T00:02:03.000000456Z"}, "v":2,"text": "some verbose two"}` + "\n",
+		},
+		{
+			"{}",
+			`{"logtail":{"client_time":"1970-01-01T00:02:03.000000456Z"}}` + "\n",
+		},
+		{
+			`{"foo":"bar"}`,
+			`{"foo":"bar","logtail":{"client_time":"1970-01-01T00:02:03.000000456Z"}}` + "\n",
+		},
+		{
+			"foo: [v\x00JSON]0{\"foo\":1}",
+			"{\"foo\":1,\"logtail\":{\"client_time\":\"1970-01-01T00:02:03.000000456Z\"}}\n",
+		},
+		{
+			"foo: [v\x00JSON]2{\"foo\":1}",
+			"{\"foo\":1,\"logtail\":{\"client_time\":\"1970-01-01T00:02:03.000000456Z\"},\"v\":2}\n",
+		},
+	}
+	for _, tt := range tests {
+		buf := new(simpleMemBuf)
+		lg := &Logger{
+			timeNow: func() time.Time { return time.Unix(123, 456).UTC() },
+			buffer:  buf,
+		}
+		io.WriteString(lg, tt.in)
+		got := buf.buf.String()
+		if got != tt.want {
+			t.Errorf("for %q,\n got: %#q\nwant: %#q\n", tt.in, got, tt.want)
+		}
+		if err := json.Compact(new(bytes.Buffer), buf.buf.Bytes()); err != nil {
+			t.Errorf("invalid output JSON for %q: %s", tt.in, got)
+		}
 	}
 }

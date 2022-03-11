@@ -11,6 +11,8 @@ package controlclient
 
 import (
 	"context"
+	"net/http"
+	"time"
 
 	"tailscale.com/tailcfg"
 )
@@ -20,6 +22,7 @@ type LoginFlags int
 const (
 	LoginDefault     = LoginFlags(0)
 	LoginInteractive = LoginFlags(1 << iota) // force user login and key refresh
+	LoginEphemeral                           // set RegisterRequest.Ephemeral
 )
 
 // Client represents a client connection to the control server.
@@ -44,6 +47,9 @@ type Client interface {
 	// Logout starts a synchronous logout process. It doesn't return
 	// until the logout operation has been completed.
 	Logout(context.Context) error
+	// SetExpirySooner sets the node's expiry time via the controlclient,
+	// as long as it's shorter than the current expiry time.
+	SetExpirySooner(context.Context, time.Time) error
 	// SetPaused pauses or unpauses the controlclient activity as much
 	// as possible, without losing its internal state, to minimize
 	// unnecessary network activity.
@@ -69,7 +75,7 @@ type Client interface {
 	SetNetInfo(*tailcfg.NetInfo)
 	// UpdateEndpoints changes the Endpoint structure that will be sent
 	// in subsequent node registration requests.
-	// TODO: localPort seems to be obsolete, remove it.
+	// The localPort field is unused except for integration tests in another repo.
 	// TODO: a server-side change would let us simply upload this
 	// in a separate http request. It has nothing to do with the rest of
 	// the state machine.
@@ -77,4 +83,13 @@ type Client interface {
 	// SetDNS sends the SetDNSRequest request to the control plane server,
 	// requesting a DNS record be created or updated.
 	SetDNS(context.Context, *tailcfg.SetDNSRequest) error
+	// DoNoiseRequest sends an HTTP request to the control plane
+	// over the Noise transport.
+	DoNoiseRequest(*http.Request) (*http.Response, error)
 }
+
+// UserVisibleError is an error that should be shown to users.
+type UserVisibleError string
+
+func (e UserVisibleError) Error() string            { return string(e) }
+func (e UserVisibleError) UserVisibleError() string { return string(e) }

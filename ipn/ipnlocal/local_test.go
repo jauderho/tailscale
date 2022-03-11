@@ -6,6 +6,7 @@ package ipnlocal
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"reflect"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"inet.af/netaddr"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -91,14 +93,14 @@ func TestNetworkMapCompare(t *testing.T) {
 		},
 		{
 			"Node names identical",
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{&tailcfg.Node{Name: "A"}}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{&tailcfg.Node{Name: "A"}}},
+			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "A"}}},
+			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "A"}}},
 			true,
 		},
 		{
 			"Node names differ",
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{&tailcfg.Node{Name: "A"}}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{&tailcfg.Node{Name: "B"}}},
+			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "A"}}},
+			&netmap.NetworkMap{Peers: []*tailcfg.Node{{Name: "B"}}},
 			false,
 		},
 		{
@@ -116,8 +118,8 @@ func TestNetworkMapCompare(t *testing.T) {
 		{
 			"Node Users differ",
 			// User field is not checked.
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{&tailcfg.Node{User: 0}}},
-			&netmap.NetworkMap{Peers: []*tailcfg.Node{&tailcfg.Node{User: 1}}},
+			&netmap.NetworkMap{Peers: []*tailcfg.Node{{User: 0}}},
+			&netmap.NetworkMap{Peers: []*tailcfg.Node{{User: 1}}},
 			true,
 		},
 	}
@@ -177,9 +179,31 @@ func TestShrinkDefaultRoute(t *testing.T) {
 		},
 	}
 
+	// Construct a fake local network environment to make this test hermetic.
+	// localInterfaceRoutes and hostIPs would normally come from calling interfaceRoutes,
+	// and localAddresses would normally come from calling interfaces.LocalAddresses.
+	var b netaddr.IPSetBuilder
+	for _, c := range []string{"127.0.0.0/8", "192.168.9.0/24", "fe80::/32"} {
+		p := netaddr.MustParseIPPrefix(c)
+		b.AddPrefix(p)
+	}
+	localInterfaceRoutes, err := b.IPSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostIPs := []netaddr.IP{
+		netaddr.MustParseIP("127.0.0.1"),
+		netaddr.MustParseIP("192.168.9.39"),
+		netaddr.MustParseIP("fe80::1"),
+		netaddr.MustParseIP("fe80::437d:feff:feca:49a7"),
+	}
+	localAddresses := []netaddr.IP{
+		netaddr.MustParseIP("192.168.9.39"),
+	}
+
 	for _, test := range tests {
 		def := netaddr.MustParseIPPrefix(test.route)
-		got, err := shrinkDefaultRoute(def)
+		got, err := shrinkDefaultRoute(def, localInterfaceRoutes, hostIPs)
 		if err != nil {
 			t.Fatalf("shrinkDefaultRoute(%q): %v", test.route, err)
 		}
@@ -193,11 +217,7 @@ func TestShrinkDefaultRoute(t *testing.T) {
 				t.Errorf("shrink(%q).Contains(%v) = true, want false", test.route, ip)
 			}
 		}
-		ips, _, err := interfaces.LocalAddresses()
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, ip := range ips {
+		for _, ip := range localAddresses {
 			want := test.localIPFn(ip)
 			if gotContains := got.Contains(ip); gotContains != want {
 				t.Errorf("shrink(%q).Contains(%v) = %v, want %v", test.route, ip, gotContains, want)
@@ -327,12 +347,12 @@ func TestPeerAPIBase(t *testing.T) {
 					netaddr.MustParseIPPrefix("100.64.1.2/32"),
 					netaddr.MustParseIPPrefix("fe70::2/128"),
 				},
-				Hostinfo: tailcfg.Hostinfo{
+				Hostinfo: (&tailcfg.Hostinfo{
 					Services: []tailcfg.Service{
 						{Proto: "peerapi4", Port: 444},
 						{Proto: "peerapi6", Port: 666},
 					},
-				},
+				}).View(),
 			},
 			want: "http://100.64.1.2:444",
 		},
@@ -348,12 +368,12 @@ func TestPeerAPIBase(t *testing.T) {
 					netaddr.MustParseIPPrefix("100.64.1.2/32"),
 					netaddr.MustParseIPPrefix("fe70::2/128"),
 				},
-				Hostinfo: tailcfg.Hostinfo{
+				Hostinfo: (&tailcfg.Hostinfo{
 					Services: []tailcfg.Service{
 						{Proto: "peerapi4", Port: 444},
 						{Proto: "peerapi6", Port: 666},
 					},
-				},
+				}).View(),
 			},
 			want: "http://[fe70::2]:666",
 		},
@@ -370,11 +390,11 @@ func TestPeerAPIBase(t *testing.T) {
 					netaddr.MustParseIPPrefix("100.64.1.2/32"),
 					netaddr.MustParseIPPrefix("fe70::2/128"),
 				},
-				Hostinfo: tailcfg.Hostinfo{
+				Hostinfo: (&tailcfg.Hostinfo{
 					Services: []tailcfg.Service{
 						{Proto: "peerapi4", Port: 444},
 					},
-				},
+				}).View(),
 			},
 			want: "http://100.64.1.2:444",
 		},
@@ -391,11 +411,11 @@ func TestPeerAPIBase(t *testing.T) {
 					netaddr.MustParseIPPrefix("100.64.1.2/32"),
 					netaddr.MustParseIPPrefix("fe70::2/128"),
 				},
-				Hostinfo: tailcfg.Hostinfo{
+				Hostinfo: (&tailcfg.Hostinfo{
 					Services: []tailcfg.Service{
 						{Proto: "peerapi6", Port: 666},
 					},
-				},
+				}).View(),
 			},
 			want: "http://[fe70::2]:666",
 		},
@@ -438,12 +458,13 @@ func TestLazyMachineKeyGeneration(t *testing.T) {
 	panicOnMachineKeyGeneration = true
 
 	var logf logger.Logf = logger.Discard
-	store := new(ipn.MemoryStore)
+	store := new(mem.Store)
 	eng, err := wgengine.NewFakeUserspaceEngine(logf, 0)
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
-	lb, err := NewLocalBackend(logf, "logid", store, eng)
+	t.Cleanup(eng.Close)
+	lb, err := NewLocalBackend(logf, "logid", store, nil, eng, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
@@ -492,4 +513,104 @@ func TestFileTargets(t *testing.T) {
 		t.Fatalf("unexpected %d peers", len(got))
 	}
 	// (other cases handled by TestPeerAPIBase above)
+}
+
+func TestInternalAndExternalInterfaces(t *testing.T) {
+	type interfacePrefix struct {
+		i   interfaces.Interface
+		pfx netaddr.IPPrefix
+	}
+
+	masked := func(ips ...interfacePrefix) (pfxs []netaddr.IPPrefix) {
+		for _, ip := range ips {
+			pfxs = append(pfxs, ip.pfx.Masked())
+		}
+		return pfxs
+	}
+	iList := func(ips ...interfacePrefix) (il interfaces.List) {
+		for _, ip := range ips {
+			il = append(il, ip.i)
+		}
+		return il
+	}
+	newInterface := func(name, pfx string, wsl2, loopback bool) interfacePrefix {
+		ippfx := netaddr.MustParseIPPrefix(pfx)
+		ip := interfaces.Interface{
+			Interface: &net.Interface{},
+			AltAddrs: []net.Addr{
+				ippfx.IPNet(),
+			},
+		}
+		if loopback {
+			ip.Flags = net.FlagLoopback
+		}
+		if wsl2 {
+			ip.HardwareAddr = []byte{0x00, 0x15, 0x5d, 0x00, 0x00, 0x00}
+		}
+		return interfacePrefix{i: ip, pfx: ippfx}
+	}
+	var (
+		en0      = newInterface("en0", "10.20.2.5/16", false, false)
+		en1      = newInterface("en1", "192.168.1.237/24", false, false)
+		wsl      = newInterface("wsl", "192.168.5.34/24", true, false)
+		loopback = newInterface("lo0", "127.0.0.1/8", false, true)
+	)
+
+	tests := []struct {
+		name    string
+		goos    string
+		il      interfaces.List
+		wantInt []netaddr.IPPrefix
+		wantExt []netaddr.IPPrefix
+	}{
+		{
+			name: "single-interface",
+			goos: "linux",
+			il: iList(
+				en0,
+				loopback,
+			),
+			wantInt: masked(loopback),
+			wantExt: masked(en0),
+		},
+		{
+			name: "multiple-interfaces",
+			goos: "linux",
+			il: iList(
+				en0,
+				en1,
+				wsl,
+				loopback,
+			),
+			wantInt: masked(loopback),
+			wantExt: masked(en0, en1, wsl),
+		},
+		{
+			name: "wsl2",
+			goos: "windows",
+			il: iList(
+				en0,
+				en1,
+				wsl,
+				loopback,
+			),
+			wantInt: masked(loopback, wsl),
+			wantExt: masked(en0, en1),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotInt, gotExt, err := internalAndExternalInterfacesFrom(tc.il, tc.goos)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotInt, tc.wantInt) {
+				t.Errorf("unexpected internal prefixes\ngot %v\nwant %v", gotInt, tc.wantInt)
+			}
+			if !reflect.DeepEqual(gotExt, tc.wantExt) {
+				t.Errorf("unexpected external prefixes\ngot %v\nwant %v", gotExt, tc.wantExt)
+			}
+		})
+	}
 }

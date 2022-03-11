@@ -29,14 +29,20 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnserver"
+	"tailscale.com/ipn/store"
 	"tailscale.com/logpolicy"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
+	"tailscale.com/safesocket"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/winutil"
 	"tailscale.com/version"
 	"tailscale.com/wf"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
 )
@@ -51,6 +57,11 @@ func isWindowsService() bool {
 	return v
 }
 
+// runWindowsService starts running Tailscale under the Windows
+// Service environment.
+//
+// At this point we're still the parent process that
+// Windows started.
 func runWindowsService(pol *logpolicy.Policy) error {
 	return svc.Run(serviceName, &ipnService{Policy: pol})
 }
@@ -63,24 +74,40 @@ type ipnService struct {
 func (service *ipnService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
 
+	svcAccepts := svc.AcceptStop
+	if winutil.GetPolicyInteger("FlushDNSOnSessionUnlock", 0) != 0 {
+		svcAccepts |= svc.AcceptSessionChange
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
 	go func() {
 		defer close(doneCh)
 		args := []string{"/subproc", service.Policy.PublicID.String()}
-		ipnserver.BabysitProc(ctx, args, log.Printf)
+		// Make a logger without a date prefix, as filelogger
+		// and logtail both already add their own. All we really want
+		// from the log package is the automatic newline.
+		// We start with log.Default().Writer(), which is the logtail
+		// writer that logpolicy already installed as the global
+		// output.
+		logger := log.New(log.Default().Writer(), "", 0)
+		ipnserver.BabysitProc(ctx, args, logger.Printf)
 	}()
 
-	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop}
+	changes <- svc.Status{State: svc.Running, Accepts: svcAccepts}
 
 	for ctx.Err() == nil {
 		select {
 		case <-doneCh:
 		case cmd := <-r:
+			log.Printf("Got Windows Service event: %v", cmdName(cmd.Cmd))
 			switch cmd.Cmd {
 			case svc.Stop:
 				cancel()
 			case svc.Interrogate:
+				changes <- cmd.CurrentStatus
+			case svc.SessionChange:
+				handleSessionChange(cmd)
 				changes <- cmd.CurrentStatus
 			}
 		}
@@ -88,6 +115,42 @@ func (service *ipnService) Execute(args []string, r <-chan svc.ChangeRequest, ch
 
 	changes <- svc.Status{State: svc.StopPending}
 	return false, windows.NO_ERROR
+}
+
+func cmdName(c svc.Cmd) string {
+	switch c {
+	case svc.Stop:
+		return "Stop"
+	case svc.Pause:
+		return "Pause"
+	case svc.Continue:
+		return "Continue"
+	case svc.Interrogate:
+		return "Interrogate"
+	case svc.Shutdown:
+		return "Shutdown"
+	case svc.ParamChange:
+		return "ParamChange"
+	case svc.NetBindAdd:
+		return "NetBindAdd"
+	case svc.NetBindRemove:
+		return "NetBindRemove"
+	case svc.NetBindEnable:
+		return "NetBindEnable"
+	case svc.NetBindDisable:
+		return "NetBindDisable"
+	case svc.DeviceEvent:
+		return "DeviceEvent"
+	case svc.HardwareProfileChange:
+		return "HardwareProfileChange"
+	case svc.PowerEvent:
+		return "PowerEvent"
+	case svc.SessionChange:
+		return "SessionChange"
+	case svc.PreShutdown:
+		return "PreShutdown"
+	}
+	return fmt.Sprintf("Unknown-Service-Cmd-%d", c)
 }
 
 func beWindowsSubprocess() bool {
@@ -99,6 +162,9 @@ func beWindowsSubprocess() bool {
 		return false
 	}
 	logid := os.Args[2]
+
+	// Remove the date/time prefix; the logtail + file logggers add it.
+	log.SetFlags(0)
 
 	log.Printf("Program starting: v%v: %#v", version.Long, os.Args)
 	log.Printf("subproc mode: logid=%v", logid)
@@ -163,12 +229,18 @@ func beFirewallKillswitch() bool {
 func startIPNServer(ctx context.Context, logid string) error {
 	var logf logger.Logf = log.Printf
 
+	linkMon, err := monitor.New(logf)
+	if err != nil {
+		return err
+	}
+	dialer := new(tsdial.Dialer)
+
 	getEngineRaw := func() (wgengine.Engine, error) {
 		dev, devName, err := tstun.New(logf, "Tailscale")
 		if err != nil {
 			return nil, fmt.Errorf("TUN: %w", err)
 		}
-		r, err := router.New(logf, dev)
+		r, err := router.New(logf, dev, nil)
 		if err != nil {
 			dev.Close()
 			return nil, fmt.Errorf("router: %w", err)
@@ -183,19 +255,26 @@ func startIPNServer(ctx context.Context, logid string) error {
 			return nil, fmt.Errorf("DNS: %w", err)
 		}
 		eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
-			Tun:        dev,
-			Router:     r,
-			DNS:        d,
-			ListenPort: 41641,
+			Tun:         dev,
+			Router:      r,
+			DNS:         d,
+			ListenPort:  41641,
+			LinkMonitor: linkMon,
+			Dialer:      dialer,
 		})
 		if err != nil {
 			r.Close()
 			dev.Close()
 			return nil, fmt.Errorf("engine: %w", err)
 		}
-		onlySubnets := true
-		if wrapNetstack {
-			mustStartNetstack(logf, eng, onlySubnets)
+		ns, err := newNetstack(logf, dialer, eng)
+		if err != nil {
+			return nil, fmt.Errorf("newNetstack: %w", err)
+		}
+		ns.ProcessLocalIPs = false
+		ns.ProcessSubnets = wrapNetstack
+		if err := ns.Start(); err != nil {
+			return nil, fmt.Errorf("failed to start netstack: %w", err)
 		}
 		return wgengine.NewWatchdog(eng), nil
 	}
@@ -233,17 +312,11 @@ func startIPNServer(ctx context.Context, logid string) error {
 		}
 	}()
 
-	opts := ipnserver.Options{
-		Port:               41112,
-		SurviveDisconnects: false,
-		StatePath:          args.statepath,
-	}
-
 	// getEngine is called by ipnserver to get the engine. It's
 	// not called concurrently and is not called again once it
 	// successfully returns an engine.
 	getEngine := func() (wgengine.Engine, error) {
-		if msg := os.Getenv("TS_DEBUG_WIN_FAIL"); msg != "" {
+		if msg := envknob.String("TS_DEBUG_WIN_FAIL"); msg != "" {
 			return nil, fmt.Errorf("pretending to be a service failure: %v", msg)
 		}
 		for {
@@ -263,11 +336,35 @@ func startIPNServer(ctx context.Context, logid string) error {
 			return nil, fmt.Errorf("%w\n\nlogid: %v", res.Err, logid)
 		}
 	}
-	err := ipnserver.Run(ctx, logf, logid, getEngine, opts)
+	store, err := store.New(logf, statePathOrDefault())
+	if err != nil {
+		return err
+	}
+
+	ln, _, err := safesocket.Listen(args.socketpath, safesocket.WindowsLocalPort)
+	if err != nil {
+		return fmt.Errorf("safesocket.Listen: %v", err)
+	}
+
+	err = ipnserver.Run(ctx, logf, ln, store, linkMon, dialer, logid, getEngine, ipnServerOpts())
 	if err != nil {
 		logf("ipnserver.Run: %v", err)
 	}
 	return err
+}
+
+func handleSessionChange(chgRequest svc.ChangeRequest) {
+	if chgRequest.Cmd != svc.SessionChange || chgRequest.EventType != windows.WTS_SESSION_UNLOCK {
+		return
+	}
+
+	log.Printf("Received WTS_SESSION_UNLOCK event, initiating DNS flush.")
+	go func() {
+		err := dns.Flush()
+		if err != nil {
+			log.Printf("Error flushing DNS on session unlock: %v", err)
+		}
+	}()
 }
 
 var (

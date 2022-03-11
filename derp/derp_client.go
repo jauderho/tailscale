@@ -6,36 +6,41 @@ package derp
 
 import (
 	"bufio"
-	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"golang.org/x/crypto/nacl/box"
+	"go4.org/mem"
+	"golang.org/x/time/rate"
+	"inet.af/netaddr"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
 
 // Client is a DERP client.
 type Client struct {
-	serverKey   key.Public // of the DERP server; not a machine or node key
-	privateKey  key.Private
-	publicKey   key.Public // of privateKey
+	serverKey   key.NodePublic // of the DERP server; not a machine or node key
+	privateKey  key.NodePrivate
+	publicKey   key.NodePublic // of privateKey
 	logf        logger.Logf
 	nc          Conn
 	br          *bufio.Reader
 	meshKey     string
 	canAckPings bool
+	isProber    bool
 
-	wmu sync.Mutex // hold while writing to bw
-	bw  *bufio.Writer
+	wmu  sync.Mutex // hold while writing to bw
+	bw   *bufio.Writer
+	rate *rate.Limiter // if non-nil, rate limiter to use
 
 	// Owned by Recv:
-	peeked  int   // bytes to discard on next Recv
-	readErr error // sticky read error
+	peeked  int          // bytes to discard on next Recv
+	readErr atomic.Value // of error; sticky (set by Recv)
 }
 
 // ClientOpt is an option passed to NewClient.
@@ -50,8 +55,9 @@ func (f clientOptFunc) update(o *clientOpt) { f(o) }
 // clientOpt are the options passed to newClient.
 type clientOpt struct {
 	MeshKey     string
-	ServerPub   key.Public
+	ServerPub   key.NodePublic
 	CanAckPings bool
+	IsProber    bool
 }
 
 // MeshKey returns a ClientOpt to pass to the DERP server during connect to get
@@ -60,9 +66,13 @@ type clientOpt struct {
 // An empty key means to not use a mesh key.
 func MeshKey(key string) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.MeshKey = key }) }
 
+// IsProber returns a ClientOpt to pass to the DERP server during connect to
+// declare that this client is a a prober.
+func IsProber(v bool) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.IsProber = v }) }
+
 // ServerPublicKey returns a ClientOpt to declare that the server's DERP public key is known.
 // If key is the zero value, the returned ClientOpt is a no-op.
-func ServerPublicKey(key key.Public) ClientOpt {
+func ServerPublicKey(key key.NodePublic) ClientOpt {
 	return clientOptFunc(func(o *clientOpt) { o.ServerPub = key })
 }
 
@@ -72,7 +82,7 @@ func CanAckPings(v bool) ClientOpt {
 	return clientOptFunc(func(o *clientOpt) { o.CanAckPings = v })
 }
 
-func NewClient(privateKey key.Private, nc Conn, brw *bufio.ReadWriter, logf logger.Logf, opts ...ClientOpt) (*Client, error) {
+func NewClient(privateKey key.NodePrivate, nc Conn, brw *bufio.ReadWriter, logf logger.Logf, opts ...ClientOpt) (*Client, error) {
 	var opt clientOpt
 	for _, o := range opts {
 		if o == nil {
@@ -83,7 +93,7 @@ func NewClient(privateKey key.Private, nc Conn, brw *bufio.ReadWriter, logf logg
 	return newClient(privateKey, nc, brw, logf, opt)
 }
 
-func newClient(privateKey key.Private, nc Conn, brw *bufio.ReadWriter, logf logger.Logf, opt clientOpt) (*Client, error) {
+func newClient(privateKey key.NodePrivate, nc Conn, brw *bufio.ReadWriter, logf logger.Logf, opt clientOpt) (*Client, error) {
 	c := &Client{
 		privateKey:  privateKey,
 		publicKey:   privateKey.Public(),
@@ -93,6 +103,7 @@ func newClient(privateKey key.Private, nc Conn, brw *bufio.ReadWriter, logf logg
 		bw:          brw.Writer,
 		meshKey:     opt.MeshKey,
 		canAckPings: opt.CanAckPings,
+		isProber:    opt.IsProber,
 	}
 	if opt.ServerPub.IsZero() {
 		if err := c.recvServerKey(); err != nil {
@@ -120,7 +131,7 @@ func (c *Client) recvServerKey() error {
 	if flen < uint32(len(buf)) || t != frameServerKey || string(buf[:len(magic)]) != magic {
 		return errors.New("invalid server greeting")
 	}
-	copy(c.serverKey[:], buf[len(magic):])
+	c.serverKey = key.NodePublicFromRaw32(mem.B(buf[len(magic):]))
 	return nil
 }
 
@@ -133,13 +144,9 @@ func (c *Client) parseServerInfo(b []byte) (*serverInfo, error) {
 	if fl > maxLength {
 		return nil, fmt.Errorf("long serverInfo frame")
 	}
-	// TODO: add a read-nonce-and-box helper
-	var nonce [nonceLen]byte
-	copy(nonce[:], b)
-	msgbox := b[nonceLen:]
-	msg, ok := box.Open(nil, msgbox, &nonce, c.serverKey.B32(), c.privateKey.B32())
+	msg, ok := c.privateKey.OpenFrom(c.serverKey, b)
 	if !ok {
-		return nil, fmt.Errorf("failed to open naclbox from server key %x", c.serverKey[:])
+		return nil, fmt.Errorf("failed to open naclbox from server key %s", c.serverKey)
 	}
 	info := new(serverInfo)
 	if err := json.Unmarshal(msg, info); err != nil {
@@ -160,39 +167,38 @@ type clientInfo struct {
 	// CanAckPings is whether the client declares it's able to ack
 	// pings.
 	CanAckPings bool
+
+	// IsProber is whether this client is a prober.
+	IsProber bool `json:",omitempty"`
 }
 
 func (c *Client) sendClientKey() error {
-	var nonce [nonceLen]byte
-	if _, err := crand.Read(nonce[:]); err != nil {
-		return err
-	}
 	msg, err := json.Marshal(clientInfo{
 		Version:     ProtocolVersion,
 		MeshKey:     c.meshKey,
 		CanAckPings: c.canAckPings,
+		IsProber:    c.isProber,
 	})
 	if err != nil {
 		return err
 	}
-	msgbox := box.Seal(nil, msg, &nonce, c.serverKey.B32(), c.privateKey.B32())
+	msgbox := c.privateKey.SealTo(c.serverKey, msg)
 
-	buf := make([]byte, 0, nonceLen+keyLen+len(msgbox))
-	buf = append(buf, c.publicKey[:]...)
-	buf = append(buf, nonce[:]...)
+	buf := make([]byte, 0, keyLen+len(msgbox))
+	buf = c.publicKey.AppendTo(buf)
 	buf = append(buf, msgbox...)
 	return writeFrame(c.bw, frameClientInfo, buf)
 }
 
 // ServerPublicKey returns the server's public key.
-func (c *Client) ServerPublicKey() key.Public { return c.serverKey }
+func (c *Client) ServerPublicKey() key.NodePublic { return c.serverKey }
 
 // Send sends a packet to the Tailscale node identified by dstKey.
 //
 // It is an error if the packet is larger than 64KB.
-func (c *Client) Send(dstKey key.Public, pkt []byte) error { return c.send(dstKey, pkt) }
+func (c *Client) Send(dstKey key.NodePublic, pkt []byte) error { return c.send(dstKey, pkt) }
 
-func (c *Client) send(dstKey key.Public, pkt []byte) (ret error) {
+func (c *Client) send(dstKey key.NodePublic, pkt []byte) (ret error) {
 	defer func() {
 		if ret != nil {
 			ret = fmt.Errorf("derp.Send: %w", ret)
@@ -205,11 +211,16 @@ func (c *Client) send(dstKey key.Public, pkt []byte) (ret error) {
 
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-
-	if err := writeFrameHeader(c.bw, frameSendPacket, uint32(len(dstKey)+len(pkt))); err != nil {
+	if c.rate != nil {
+		pktLen := frameHeaderLen + key.NodePublicRawLen + len(pkt)
+		if !c.rate.AllowN(time.Now(), pktLen) {
+			return nil // drop
+		}
+	}
+	if err := writeFrameHeader(c.bw, frameSendPacket, uint32(key.NodePublicRawLen+len(pkt))); err != nil {
 		return err
 	}
-	if _, err := c.bw.Write(dstKey[:]); err != nil {
+	if _, err := c.bw.Write(dstKey.AppendTo(nil)); err != nil {
 		return err
 	}
 	if _, err := c.bw.Write(pkt); err != nil {
@@ -218,7 +229,7 @@ func (c *Client) send(dstKey key.Public, pkt []byte) (ret error) {
 	return c.bw.Flush()
 }
 
-func (c *Client) ForwardPacket(srcKey, dstKey key.Public, pkt []byte) (err error) {
+func (c *Client) ForwardPacket(srcKey, dstKey key.NodePublic, pkt []byte) (err error) {
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("derp.ForwardPacket: %w", err)
@@ -238,10 +249,10 @@ func (c *Client) ForwardPacket(srcKey, dstKey key.Public, pkt []byte) (err error
 	if err := writeFrameHeader(c.bw, frameForwardPacket, uint32(keyLen*2+len(pkt))); err != nil {
 		return err
 	}
-	if _, err := c.bw.Write(srcKey[:]); err != nil {
+	if _, err := c.bw.Write(srcKey.AppendTo(nil)); err != nil {
 		return err
 	}
-	if _, err := c.bw.Write(dstKey[:]); err != nil {
+	if _, err := c.bw.Write(dstKey.AppendTo(nil)); err != nil {
 		return err
 	}
 	if _, err := c.bw.Write(pkt); err != nil {
@@ -252,10 +263,18 @@ func (c *Client) ForwardPacket(srcKey, dstKey key.Public, pkt []byte) (err error
 
 func (c *Client) writeTimeoutFired() { c.nc.Close() }
 
+func (c *Client) SendPing(data [8]byte) error {
+	return c.sendPingOrPong(framePing, data)
+}
+
 func (c *Client) SendPong(data [8]byte) error {
+	return c.sendPingOrPong(framePong, data)
+}
+
+func (c *Client) sendPingOrPong(typ frameType, data [8]byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	if err := writeFrameHeader(c.bw, framePong, 8); err != nil {
+	if err := writeFrameHeader(c.bw, typ, 8); err != nil {
 		return err
 	}
 	if _, err := c.bw.Write(data[:]); err != nil {
@@ -303,10 +322,10 @@ func (c *Client) WatchConnectionChanges() error {
 
 // ClosePeer asks the server to close target's TCP connection.
 // It's a fatal error if the client wasn't created using MeshKey.
-func (c *Client) ClosePeer(target key.Public) error {
+func (c *Client) ClosePeer(target key.NodePublic) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	return writeFrame(c.bw, frameClosePeer, target[:])
+	return writeFrame(c.bw, frameClosePeer, target.AppendTo(nil))
 }
 
 // ReceivedMessage represents a type returned by Client.Recv. Unless
@@ -319,7 +338,7 @@ type ReceivedMessage interface {
 
 // ReceivedPacket is a ReceivedMessage representing an incoming packet.
 type ReceivedPacket struct {
-	Source key.Public
+	Source key.NodePublic
 	// Data is the received packet bytes. It aliases the memory
 	// passed to Client.Recv.
 	Data []byte
@@ -330,18 +349,33 @@ func (ReceivedPacket) msg() {}
 // PeerGoneMessage is a ReceivedMessage that indicates that the client
 // identified by the underlying public key had previously sent you a
 // packet but has now disconnected from the server.
-type PeerGoneMessage key.Public
+type PeerGoneMessage key.NodePublic
 
 func (PeerGoneMessage) msg() {}
 
 // PeerPresentMessage is a ReceivedMessage that indicates that the client
 // is connected to the server. (Only used by trusted mesh clients)
-type PeerPresentMessage key.Public
+type PeerPresentMessage key.NodePublic
 
 func (PeerPresentMessage) msg() {}
 
 // ServerInfoMessage is sent by the server upon first connect.
-type ServerInfoMessage struct{}
+type ServerInfoMessage struct {
+	// TokenBucketBytesPerSecond is how many bytes per second the
+	// server says it will accept, including all framing bytes.
+	//
+	// Zero means unspecified. There might be a limit, but the
+	// client need not try to respect it.
+	TokenBucketBytesPerSecond int
+
+	// TokenBucketBytesBurst is how many bytes the server will
+	// allow to burst, temporarily violating
+	// TokenBucketBytesPerSecond.
+	//
+	// Zero means unspecified. There might be a limit, but the
+	// client need not try to respect it.
+	TokenBucketBytesBurst int
+}
 
 func (ServerInfoMessage) msg() {}
 
@@ -351,12 +385,52 @@ type PingMessage [8]byte
 
 func (PingMessage) msg() {}
 
+// PongMessage is a reply to a PingMessage from a client or server
+// with the payload sent previously in a PingMessage.
+type PongMessage [8]byte
+
+func (PongMessage) msg() {}
+
 // KeepAliveMessage is a one-way empty message from server to client, just to
 // keep the connection alive. It's like a PingMessage, but doesn't solicit
 // a reply from the client.
 type KeepAliveMessage struct{}
 
 func (KeepAliveMessage) msg() {}
+
+// HealthMessage is a one-way message from server to client, declaring the
+// connection health state.
+type HealthMessage struct {
+	// Problem, if non-empty, is a description of why the connection
+	// is unhealthy.
+	//
+	// The empty string means the connection is healthy again.
+	//
+	// The default condition is healthy, so the server doesn't
+	// broadcast a HealthMessage until a problem exists.
+	Problem string
+}
+
+func (HealthMessage) msg() {}
+
+// ServerRestartingMessage is a one-way message from server to client,
+// advertising that the server is restarting.
+type ServerRestartingMessage struct {
+	// ReconnectIn is an advisory duration that the client should wait
+	// before attempting to reconnect. It might be zero.
+	// It exists for the server to smear out the reconnects.
+	ReconnectIn time.Duration
+
+	// TryFor is an advisory duration for how long the client
+	// should attempt to reconnect before giving up and proceeding
+	// with its normal connection failure logic. The interval
+	// between retries is undefined for now.
+	// A server should not send a TryFor duration more than a few
+	// seconds.
+	TryFor time.Duration
+}
+
+func (ServerRestartingMessage) msg() {}
 
 // Recv reads a message from the DERP server.
 //
@@ -369,13 +443,14 @@ func (c *Client) Recv() (m ReceivedMessage, err error) {
 }
 
 func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err error) {
-	if c.readErr != nil {
-		return nil, c.readErr
+	readErr, _ := c.readErr.Load().(error)
+	if readErr != nil {
+		return nil, readErr
 	}
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("derp.Recv: %w", err)
-			c.readErr = err
+			c.readErr.Store(err)
 		}
 	}()
 
@@ -429,12 +504,16 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			// needing to wait an RTT to discover the version at startup.
 			// We'd prefer to give the connection to the client (magicsock)
 			// to start writing as soon as possible.
-			_, err := c.parseServerInfo(b)
+			si, err := c.parseServerInfo(b)
 			if err != nil {
 				return nil, fmt.Errorf("invalid server info frame: %v", err)
 			}
-			// TODO: add the results of parseServerInfo to ServerInfoMessage if we ever need it.
-			return ServerInfoMessage{}, nil
+			sm := ServerInfoMessage{
+				TokenBucketBytesPerSecond: si.TokenBucketBytesPerSecond,
+				TokenBucketBytesBurst:     si.TokenBucketBytesBurst,
+			}
+			c.setSendRateLimiter(sm)
+			return sm, nil
 		case frameKeepAlive:
 			// A one-way keep-alive message that doesn't require an acknowledgement.
 			// This predated framePing/framePong.
@@ -444,8 +523,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 				c.logf("[unexpected] dropping short peerGone frame from DERP server")
 				continue
 			}
-			var pg PeerGoneMessage
-			copy(pg[:], b[:keyLen])
+			pg := PeerGoneMessage(key.NodePublicFromRaw32(mem.B(b[:keyLen])))
 			return pg, nil
 
 		case framePeerPresent:
@@ -453,8 +531,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 				c.logf("[unexpected] dropping short peerPresent frame from DERP server")
 				continue
 			}
-			var pg PeerPresentMessage
-			copy(pg[:], b[:keyLen])
+			pg := PeerPresentMessage(key.NodePublicFromRaw32(mem.B(b[:keyLen])))
 			return pg, nil
 
 		case frameRecvPacket:
@@ -463,7 +540,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 				c.logf("[unexpected] dropping short packet from DERP server")
 				continue
 			}
-			copy(rp.Source[:], b[:keyLen])
+			rp.Source = key.NodePublicFromRaw32(mem.B(b[:keyLen]))
 			rp.Data = b[keyLen:n]
 			return rp, nil
 
@@ -475,6 +552,60 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			}
 			copy(pm[:], b[:])
 			return pm, nil
+
+		case framePong:
+			var pm PongMessage
+			if n < 8 {
+				c.logf("[unexpected] dropping short ping frame")
+				continue
+			}
+			copy(pm[:], b[:])
+			return pm, nil
+
+		case frameHealth:
+			return HealthMessage{Problem: string(b[:])}, nil
+
+		case frameRestarting:
+			var m ServerRestartingMessage
+			if n < 8 {
+				c.logf("[unexpected] dropping short server restarting frame")
+				continue
+			}
+			m.ReconnectIn = time.Duration(binary.BigEndian.Uint32(b[0:4])) * time.Millisecond
+			m.TryFor = time.Duration(binary.BigEndian.Uint32(b[4:8])) * time.Millisecond
+			return m, nil
 		}
 	}
+}
+
+func (c *Client) setSendRateLimiter(sm ServerInfoMessage) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+
+	if sm.TokenBucketBytesPerSecond == 0 {
+		c.rate = nil
+	} else {
+		c.rate = rate.NewLimiter(
+			rate.Limit(sm.TokenBucketBytesPerSecond),
+			sm.TokenBucketBytesBurst)
+	}
+}
+
+// LocalAddr returns the TCP connection's local address.
+//
+// If the client is broken in some previously detectable way, it
+// returns an error.
+func (c *Client) LocalAddr() (netaddr.IPPort, error) {
+	readErr, _ := c.readErr.Load().(error)
+	if readErr != nil {
+		return netaddr.IPPort{}, readErr
+	}
+	if c.nc == nil {
+		return netaddr.IPPort{}, errors.New("nil conn")
+	}
+	a := c.nc.LocalAddr()
+	if a == nil {
+		return netaddr.IPPort{}, errors.New("nil addr")
+	}
+	return netaddr.ParseIPPort(a.String())
 }

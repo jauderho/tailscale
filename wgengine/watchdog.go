@@ -6,17 +6,18 @@ package wgengine
 
 import (
 	"log"
-	"os"
 	"runtime/pprof"
-	"strconv"
 	"strings"
 	"time"
 
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
@@ -30,7 +31,7 @@ import (
 //
 // If they do not, the watchdog crashes the process.
 func NewWatchdog(e Engine) Engine {
-	if v, _ := strconv.ParseBool(os.Getenv("TS_DEBUG_DISABLE_WATCHDOG")); v {
+	if envknob.Bool("TS_DEBUG_DISABLE_WATCHDOG") {
 		return e
 	}
 	return &watchdogEngine{
@@ -112,7 +113,7 @@ func (e *watchdogEngine) AddNetworkMapCallback(callback NetworkMapCallback) func
 	e.watchdog("AddNetworkMapCallback", func() { fn = e.wrap.AddNetworkMapCallback(callback) })
 	return func() { e.watchdog("RemoveNetworkMapCallback", fn) }
 }
-func (e *watchdogEngine) DiscoPublicKey() (k tailcfg.DiscoKey) {
+func (e *watchdogEngine) DiscoPublicKey() (k key.DiscoPublic) {
 	e.watchdog("DiscoPublicKey", func() { k = e.wrap.DiscoPublicKey() })
 	return k
 }
@@ -138,6 +139,17 @@ func (e *watchdogEngine) GetInternals() (tw *tstun.Wrapper, c *magicsock.Conn, o
 	}
 	return
 }
+func (e *watchdogEngine) GetResolver() (r *resolver.Resolver, ok bool) {
+	if re, ok := e.wrap.(ResolvingEngine); ok {
+		return re.GetResolver()
+	}
+	return nil, false
+}
+func (e *watchdogEngine) PeerForIP(ip netaddr.IP) (ret PeerForIP, ok bool) {
+	e.watchdog("PeerForIP", func() { ret, ok = e.wrap.PeerForIP(ip) })
+	return ret, ok
+}
+
 func (e *watchdogEngine) Wait() {
 	e.wrap.Wait()
 }

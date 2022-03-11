@@ -19,17 +19,19 @@ import (
 	"strings"
 	"testing"
 
+	"inet.af/netaddr"
+	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
+	"tailscale.com/types/logger"
+	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/filter"
 )
 
 type peerAPITestEnv struct {
 	ph     *peerAPIHandler
 	rr     *httptest.ResponseRecorder
-	logBuf bytes.Buffer
-}
-
-func (e *peerAPITestEnv) logf(format string, a ...interface{}) {
-	fmt.Fprintf(&e.logBuf, format, a...)
+	logBuf tstest.MemLogger
 }
 
 type check func(*testing.T, *peerAPITestEnv)
@@ -177,7 +179,7 @@ func TestHandlePeerAPI(t *testing.T) {
 			req:        httptest.NewRequest("PUT", "/v0/put/foo", nil),
 			checks: checks(
 				httpStatus(http.StatusInternalServerError),
-				bodyContains("no rootdir"),
+				bodyContains("Taildrop disabled; no storage directory"),
 			),
 		},
 		{
@@ -403,7 +405,7 @@ func TestHandlePeerAPI(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var e peerAPITestEnv
 			lb := &LocalBackend{
-				logf:           e.logf,
+				logf:           e.logBuf.Logf,
 				capFileSharing: tt.capSharing,
 			}
 			e.ph = &peerAPIHandler{
@@ -570,4 +572,56 @@ func TestDeletedMarkers(t *testing.T) {
 		rc.Close()
 	}
 
+}
+
+func TestPeerAPIReplyToDNSQueries(t *testing.T) {
+	var h peerAPIHandler
+
+	h.isSelf = true
+	if !h.replyToDNSQueries() {
+		t.Errorf("for isSelf = false; want true")
+	}
+	h.isSelf = false
+	h.remoteAddr = netaddr.MustParseIPPort("100.150.151.152:12345")
+
+	eng, _ := wgengine.NewFakeUserspaceEngine(logger.Discard, 0)
+	h.ps = &peerAPIServer{
+		b: &LocalBackend{
+			e: eng,
+		},
+	}
+	if h.ps.b.OfferingExitNode() {
+		t.Fatal("unexpectedly offering exit node")
+	}
+	h.ps.b.prefs = &ipn.Prefs{
+		AdvertiseRoutes: []netaddr.IPPrefix{
+			netaddr.MustParseIPPrefix("0.0.0.0/0"),
+			netaddr.MustParseIPPrefix("::/0"),
+		},
+	}
+	if !h.ps.b.OfferingExitNode() {
+		t.Fatal("unexpectedly not offering exit node")
+	}
+
+	if h.replyToDNSQueries() {
+		t.Errorf("unexpectedly doing DNS without filter")
+	}
+
+	h.ps.b.setFilter(filter.NewAllowNone(logger.Discard, new(netaddr.IPSet)))
+	if h.replyToDNSQueries() {
+		t.Errorf("unexpectedly doing DNS without filter")
+	}
+
+	f := filter.NewAllowAllForTest(logger.Discard)
+
+	h.ps.b.setFilter(f)
+	if !h.replyToDNSQueries() {
+		t.Errorf("unexpectedly deny; wanted to be a DNS server")
+	}
+
+	// Also test IPv6.
+	h.remoteAddr = netaddr.MustParseIPPort("[fe70::1]:12345")
+	if !h.replyToDNSQueries() {
+		t.Errorf("unexpectedly IPv6 deny; wanted to be a DNS server")
+	}
 }

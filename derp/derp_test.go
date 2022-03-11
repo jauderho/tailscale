@@ -8,7 +8,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	crand "crypto/rand"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -23,18 +22,12 @@ import (
 	"testing"
 	"time"
 
+	"go4.org/mem"
+	"golang.org/x/time/rate"
 	"tailscale.com/net/nettest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
-
-func newPrivateKey(tb testing.TB) (k key.Private) {
-	tb.Helper()
-	if _, err := crand.Read(k[:]); err != nil {
-		tb.Fatal(err)
-	}
-	return
-}
 
 func TestClientInfoUnmarshal(t *testing.T) {
 	for i, in := range []string{
@@ -53,15 +46,15 @@ func TestClientInfoUnmarshal(t *testing.T) {
 }
 
 func TestSendRecv(t *testing.T) {
-	serverPrivateKey := newPrivateKey(t)
+	serverPrivateKey := key.NewNode()
 	s := NewServer(serverPrivateKey, t.Logf)
 	defer s.Close()
 
 	const numClients = 3
-	var clientPrivateKeys []key.Private
-	var clientKeys []key.Public
+	var clientPrivateKeys []key.NodePrivate
+	var clientKeys []key.NodePublic
 	for i := 0; i < numClients; i++ {
-		priv := newPrivateKey(t)
+		priv := key.NewNode()
 		clientPrivateKeys = append(clientPrivateKeys, priv)
 		clientKeys = append(clientKeys, priv.Public())
 	}
@@ -224,7 +217,7 @@ func TestSendRecv(t *testing.T) {
 }
 
 func TestSendFreeze(t *testing.T) {
-	serverPrivateKey := newPrivateKey(t)
+	serverPrivateKey := key.NewNode()
 	s := NewServer(serverPrivateKey, t.Logf)
 	defer s.Close()
 	s.WriteTimeout = 100 * time.Millisecond
@@ -237,7 +230,7 @@ func TestSendFreeze(t *testing.T) {
 	// Then cathy stops processing messsages.
 	// That should not interfere with alice talking to bob.
 
-	newClient := func(name string, k key.Private) (c *Client, clientConn nettest.Conn) {
+	newClient := func(name string, k key.NodePrivate) (c *Client, clientConn nettest.Conn) {
 		t.Helper()
 		c1, c2 := nettest.NewConn(name, 1024)
 		go s.Accept(c1, bufio.NewReadWriter(bufio.NewReader(c1), bufio.NewWriter(c1)), name)
@@ -251,13 +244,13 @@ func TestSendFreeze(t *testing.T) {
 		return c, c2
 	}
 
-	aliceKey := newPrivateKey(t)
+	aliceKey := key.NewNode()
 	aliceClient, aliceConn := newClient("alice", aliceKey)
 
-	bobKey := newPrivateKey(t)
+	bobKey := key.NewNode()
 	bobClient, bobConn := newClient("bob", bobKey)
 
-	cathyKey := newPrivateKey(t)
+	cathyKey := key.NewNode()
 	cathyClient, cathyConn := newClient("cathy", cathyKey)
 
 	var (
@@ -402,8 +395,11 @@ func TestSendFreeze(t *testing.T) {
 	t.Logf("TEST COMPLETE, cancelling sender")
 	cancel()
 	t.Logf("closing connections")
-	aliceConn.Close()
+	// Close bob before alice.
+	// Starting with alice can cause a PeerGoneMessage to reach
+	// bob before bob is closed, causing a test flake (issue 2668).
 	bobConn.Close()
+	aliceConn.Close()
 	cathyConn.Close()
 
 	for i := 0; i < cap(errCh); i++ {
@@ -423,7 +419,7 @@ type testServer struct {
 	logf logger.Logf
 
 	mu      sync.Mutex
-	pubName map[key.Public]string
+	pubName map[key.NodePublic]string
 	clients map[*testClient]bool
 }
 
@@ -433,14 +429,14 @@ func (ts *testServer) addTestClient(c *testClient) {
 	ts.clients[c] = true
 }
 
-func (ts *testServer) addKeyName(k key.Public, name string) {
+func (ts *testServer) addKeyName(k key.NodePublic, name string) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	ts.pubName[k] = name
 	ts.logf("test adding named key %q for %x", name, k)
 }
 
-func (ts *testServer) keyName(k key.Public) string {
+func (ts *testServer) keyName(k key.NodePublic) string {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	if name, ok := ts.pubName[k]; ok {
@@ -461,7 +457,7 @@ func (ts *testServer) close(t *testing.T) error {
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
 	logf := logger.WithPrefix(t.Logf, "derp-server: ")
-	s := NewServer(newPrivateKey(t), logf)
+	s := NewServer(key.NewNode(), logf)
 	s.SetMeshKey("mesh-key")
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -487,7 +483,7 @@ func newTestServer(t *testing.T) *testServer {
 		ln:      ln,
 		logf:    logf,
 		clients: map[*testClient]bool{},
-		pubName: map[key.Public]string{},
+		pubName: map[key.NodePublic]string{},
 	}
 }
 
@@ -495,20 +491,20 @@ type testClient struct {
 	name   string
 	c      *Client
 	nc     net.Conn
-	pub    key.Public
+	pub    key.NodePublic
 	ts     *testServer
 	closed bool
 }
 
-func newTestClient(t *testing.T, ts *testServer, name string, newClient func(net.Conn, key.Private, logger.Logf) (*Client, error)) *testClient {
+func newTestClient(t *testing.T, ts *testServer, name string, newClient func(net.Conn, key.NodePrivate, logger.Logf) (*Client, error)) *testClient {
 	t.Helper()
 	nc, err := net.Dial("tcp", ts.ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := newPrivateKey(t)
-	ts.addKeyName(key.Public(), name)
-	c, err := newClient(nc, key, logger.WithPrefix(t.Logf, "client-"+name+": "))
+	k := key.NewNode()
+	ts.addKeyName(k.Public(), name)
+	c, err := newClient(nc, k, logger.WithPrefix(t.Logf, "client-"+name+": "))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,14 +513,14 @@ func newTestClient(t *testing.T, ts *testServer, name string, newClient func(net
 		nc:   nc,
 		c:    c,
 		ts:   ts,
-		pub:  key.Public(),
+		pub:  k.Public(),
 	}
 	ts.addTestClient(tc)
 	return tc
 }
 
 func newRegularClient(t *testing.T, ts *testServer, name string) *testClient {
-	return newTestClient(t, ts, name, func(nc net.Conn, priv key.Private, logf logger.Logf) (*Client, error) {
+	return newTestClient(t, ts, name, func(nc net.Conn, priv key.NodePrivate, logf logger.Logf) (*Client, error) {
 		brw := bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc))
 		c, err := NewClient(priv, nc, brw, logf)
 		if err != nil {
@@ -537,7 +533,7 @@ func newRegularClient(t *testing.T, ts *testServer, name string) *testClient {
 }
 
 func newTestWatcher(t *testing.T, ts *testServer, name string) *testClient {
-	return newTestClient(t, ts, name, func(nc net.Conn, priv key.Private, logf logger.Logf) (*Client, error) {
+	return newTestClient(t, ts, name, func(nc net.Conn, priv key.NodePrivate, logf logger.Logf) (*Client, error) {
 		brw := bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc))
 		c, err := NewClient(priv, nc, brw, logf, MeshKey("mesh-key"))
 		if err != nil {
@@ -551,9 +547,9 @@ func newTestWatcher(t *testing.T, ts *testServer, name string) *testClient {
 	})
 }
 
-func (tc *testClient) wantPresent(t *testing.T, peers ...key.Public) {
+func (tc *testClient) wantPresent(t *testing.T, peers ...key.NodePublic) {
 	t.Helper()
-	want := map[key.Public]bool{}
+	want := map[key.NodePublic]bool{}
 	for _, k := range peers {
 		want[k] = true
 	}
@@ -565,7 +561,7 @@ func (tc *testClient) wantPresent(t *testing.T, peers ...key.Public) {
 		}
 		switch m := m.(type) {
 		case PeerPresentMessage:
-			got := key.Public(m)
+			got := key.NodePublic(m)
 			if !want[got] {
 				t.Fatalf("got peer present for %v; want present for %v", tc.ts.keyName(got), logger.ArgWriter(func(bw *bufio.Writer) {
 					for _, pub := range peers {
@@ -583,7 +579,7 @@ func (tc *testClient) wantPresent(t *testing.T, peers ...key.Public) {
 	}
 }
 
-func (tc *testClient) wantGone(t *testing.T, peer key.Public) {
+func (tc *testClient) wantGone(t *testing.T, peer key.NodePublic) {
 	t.Helper()
 	m, err := tc.c.recvTimeout(time.Second)
 	if err != nil {
@@ -591,7 +587,7 @@ func (tc *testClient) wantGone(t *testing.T, peer key.Public) {
 	}
 	switch m := m.(type) {
 	case PeerGoneMessage:
-		got := key.Public(m)
+		got := key.NodePublic(m)
 		if peer != got {
 			t.Errorf("got gone message for %v; want gone for %v", tc.ts.keyName(got), tc.ts.keyName(peer))
 		}
@@ -650,21 +646,24 @@ func TestWatch(t *testing.T) {
 
 type testFwd int
 
-func (testFwd) ForwardPacket(key.Public, key.Public, []byte) error { panic("not called in tests") }
+func (testFwd) ForwardPacket(key.NodePublic, key.NodePublic, []byte) error {
+	panic("not called in tests")
+}
 
-func pubAll(b byte) (ret key.Public) {
-	for i := range ret {
-		ret[i] = b
+func pubAll(b byte) (ret key.NodePublic) {
+	var bs [32]byte
+	for i := range bs {
+		bs[i] = b
 	}
-	return
+	return key.NodePublicFromRaw32(mem.B(bs[:]))
 }
 
 func TestForwarderRegistration(t *testing.T) {
 	s := &Server{
-		clients:     make(map[key.Public]*sclient),
-		clientsMesh: map[key.Public]PacketForwarder{},
+		clients:     make(map[key.NodePublic]clientSet),
+		clientsMesh: map[key.NodePublic]PacketForwarder{},
 	}
-	want := func(want map[key.Public]PacketForwarder) {
+	want := func(want map[key.NodePublic]PacketForwarder) {
 		t.Helper()
 		if got := s.clientsMesh; !reflect.DeepEqual(got, want) {
 			t.Fatalf("mismatch\n got: %v\nwant: %v\n", got, want)
@@ -683,35 +682,36 @@ func TestForwarderRegistration(t *testing.T) {
 
 	s.AddPacketForwarder(u1, testFwd(1))
 	s.AddPacketForwarder(u2, testFwd(2))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: testFwd(1),
 		u2: testFwd(2),
 	})
 
 	// Verify a remove of non-registered forwarder is no-op.
 	s.RemovePacketForwarder(u2, testFwd(999))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: testFwd(1),
 		u2: testFwd(2),
 	})
 
 	// Verify a remove of non-registered user is no-op.
 	s.RemovePacketForwarder(u3, testFwd(1))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: testFwd(1),
 		u2: testFwd(2),
 	})
 
 	// Actual removal.
 	s.RemovePacketForwarder(u2, testFwd(2))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: testFwd(1),
 	})
 
 	// Adding a dup for a user.
 	wantCounter(&s.multiForwarderCreated, 0)
 	s.AddPacketForwarder(u1, testFwd(100))
-	want(map[key.Public]PacketForwarder{
+	s.AddPacketForwarder(u1, testFwd(100)) // dup to trigger dup path
+	want(map[key.NodePublic]PacketForwarder{
 		u1: multiForwarder{
 			testFwd(1):   1,
 			testFwd(100): 2,
@@ -721,7 +721,7 @@ func TestForwarderRegistration(t *testing.T) {
 
 	// Removing a forwarder in a multi set that doesn't exist; does nothing.
 	s.RemovePacketForwarder(u1, testFwd(55))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: multiForwarder{
 			testFwd(1):   1,
 			testFwd(100): 2,
@@ -732,7 +732,7 @@ func TestForwarderRegistration(t *testing.T) {
 	// from being a multiForwarder.
 	wantCounter(&s.multiForwarderDeleted, 0)
 	s.RemovePacketForwarder(u1, testFwd(1))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: testFwd(100),
 	})
 	wantCounter(&s.multiForwarderDeleted, 1)
@@ -743,39 +743,39 @@ func TestForwarderRegistration(t *testing.T) {
 		key:  u1,
 		logf: logger.Discard,
 	}
-	s.clients[u1] = u1c
+	s.clients[u1] = singleClient{u1c}
 	s.RemovePacketForwarder(u1, testFwd(100))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: nil,
 	})
 
 	// But once that client disconnects, it should go away.
 	s.unregisterClient(u1c)
-	want(map[key.Public]PacketForwarder{})
+	want(map[key.NodePublic]PacketForwarder{})
 
 	// But if it already has a forwarder, it's not removed.
 	s.AddPacketForwarder(u1, testFwd(2))
 	s.unregisterClient(u1c)
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: testFwd(2),
 	})
 
 	// Now pretend u1 was already connected locally (so clientsMesh[u1] is nil), and then we heard
 	// that they're also connected to a peer of ours. That sholdn't transition the forwarder
 	// from nil to the new one, not a multiForwarder.
-	s.clients[u1] = u1c
+	s.clients[u1] = singleClient{u1c}
 	s.clientsMesh[u1] = nil
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: nil,
 	})
 	s.AddPacketForwarder(u1, testFwd(3))
-	want(map[key.Public]PacketForwarder{
+	want(map[key.NodePublic]PacketForwarder{
 		u1: testFwd(3),
 	})
 }
 
 func TestMetaCert(t *testing.T) {
-	priv := newPrivateKey(t)
+	priv := key.NewNode()
 	pub := priv.Public()
 	s := NewServer(priv, t.Logf)
 
@@ -787,7 +787,7 @@ func TestMetaCert(t *testing.T) {
 	if fmt.Sprint(cert.SerialNumber) != fmt.Sprint(ProtocolVersion) {
 		t.Errorf("serial = %v; want %v", cert.SerialNumber, ProtocolVersion)
 	}
-	if g, w := cert.Subject.CommonName, fmt.Sprintf("derpkey%x", pub[:]); g != w {
+	if g, w := cert.Subject.CommonName, fmt.Sprintf("derpkey%s", pub.UntypedHexString()); g != w {
 		t.Errorf("CommonName = %q; want %q", g, w)
 	}
 }
@@ -812,6 +812,41 @@ func TestClientRecv(t *testing.T) {
 			},
 			want: PingMessage{1, 2, 3, 4, 5, 6, 7, 8},
 		},
+		{
+			name: "pong",
+			input: []byte{
+				byte(framePong), 0, 0, 0, 8,
+				1, 2, 3, 4, 5, 6, 7, 8,
+			},
+			want: PongMessage{1, 2, 3, 4, 5, 6, 7, 8},
+		},
+		{
+			name: "health_bad",
+			input: []byte{
+				byte(frameHealth), 0, 0, 0, 3,
+				byte('B'), byte('A'), byte('D'),
+			},
+			want: HealthMessage{Problem: "BAD"},
+		},
+		{
+			name: "health_ok",
+			input: []byte{
+				byte(frameHealth), 0, 0, 0, 0,
+			},
+			want: HealthMessage{},
+		},
+		{
+			name: "server_restarting",
+			input: []byte{
+				byte(frameRestarting), 0, 0, 0, 8,
+				0, 0, 0, 1,
+				0, 0, 0, 2,
+			},
+			want: ServerRestartingMessage{
+				ReconnectIn: 1 * time.Millisecond,
+				TryFor:      2 * time.Millisecond,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -831,6 +866,23 @@ func TestClientRecv(t *testing.T) {
 	}
 }
 
+func TestClientSendPing(t *testing.T) {
+	var buf bytes.Buffer
+	c := &Client{
+		bw: bufio.NewWriter(&buf),
+	}
+	if err := c.SendPing([8]byte{1, 2, 3, 4, 5, 6, 7, 8}); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{
+		byte(framePing), 0, 0, 0, 8,
+		1, 2, 3, 4, 5, 6, 7, 8,
+	}
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Errorf("unexpected output\nwrote: % 02x\n want: % 02x", buf.Bytes(), want)
+	}
+}
+
 func TestClientSendPong(t *testing.T) {
 	var buf bytes.Buffer
 	c := &Client{
@@ -846,7 +898,259 @@ func TestClientSendPong(t *testing.T) {
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Errorf("unexpected output\nwrote: % 02x\n want: % 02x", buf.Bytes(), want)
 	}
+}
 
+func TestServerDupClients(t *testing.T) {
+	serverPriv := key.NewNode()
+	var s *Server
+
+	clientPriv := key.NewNode()
+	clientPub := clientPriv.Public()
+
+	var c1, c2, c3 *sclient
+	var clientName map[*sclient]string
+
+	// run starts a new test case and resets clients back to their zero values.
+	run := func(name string, dupPolicy dupPolicy, f func(t *testing.T)) {
+		s = NewServer(serverPriv, t.Logf)
+		s.dupPolicy = dupPolicy
+		c1 = &sclient{key: clientPub, logf: logger.WithPrefix(t.Logf, "c1: ")}
+		c2 = &sclient{key: clientPub, logf: logger.WithPrefix(t.Logf, "c2: ")}
+		c3 = &sclient{key: clientPub, logf: logger.WithPrefix(t.Logf, "c3: ")}
+		clientName = map[*sclient]string{
+			c1: "c1",
+			c2: "c2",
+			c3: "c3",
+		}
+		t.Run(name, f)
+	}
+	runBothWays := func(name string, f func(t *testing.T)) {
+		run(name+"_disablefighters", disableFighters, f)
+		run(name+"_lastwriteractive", lastWriterIsActive, f)
+	}
+	wantSingleClient := func(t *testing.T, want *sclient) {
+		t.Helper()
+		switch s := s.clients[want.key].(type) {
+		case singleClient:
+			if s.c != want {
+				t.Error("wrong single client")
+				return
+			}
+			if want.isDup.Get() {
+				t.Errorf("unexpected isDup on singleClient")
+			}
+			if want.isDisabled.Get() {
+				t.Errorf("unexpected isDisabled on singleClient")
+			}
+		case nil:
+			t.Error("no clients for key")
+		case *dupClientSet:
+			t.Error("unexpected multiple clients for key")
+		}
+	}
+	wantNoClient := func(t *testing.T) {
+		t.Helper()
+		switch s := s.clients[clientPub].(type) {
+		case nil:
+			// Good.
+			return
+		default:
+			t.Errorf("got %T; want empty", s)
+		}
+	}
+	wantDupSet := func(t *testing.T) *dupClientSet {
+		t.Helper()
+		switch s := s.clients[clientPub].(type) {
+		case *dupClientSet:
+			return s
+		default:
+			t.Fatalf("wanted dup set; got %T", s)
+			return nil
+		}
+	}
+	wantActive := func(t *testing.T, want *sclient) {
+		t.Helper()
+		set, ok := s.clients[clientPub]
+		if !ok {
+			t.Error("no set for key")
+			return
+		}
+		got := set.ActiveClient()
+		if got != want {
+			t.Errorf("active client = %q; want %q", clientName[got], clientName[want])
+		}
+	}
+	checkDup := func(t *testing.T, c *sclient, want bool) {
+		t.Helper()
+		if got := c.isDup.Get(); got != want {
+			t.Errorf("client %q isDup = %v; want %v", clientName[c], got, want)
+		}
+	}
+	checkDisabled := func(t *testing.T, c *sclient, want bool) {
+		t.Helper()
+		if got := c.isDisabled.Get(); got != want {
+			t.Errorf("client %q isDisabled = %v; want %v", clientName[c], got, want)
+		}
+	}
+	wantDupConns := func(t *testing.T, want int) {
+		t.Helper()
+		if got := s.dupClientConns.Value(); got != int64(want) {
+			t.Errorf("dupClientConns = %v; want %v", got, want)
+		}
+	}
+	wantDupKeys := func(t *testing.T, want int) {
+		t.Helper()
+		if got := s.dupClientKeys.Value(); got != int64(want) {
+			t.Errorf("dupClientKeys = %v; want %v", got, want)
+		}
+	}
+
+	// Common case: a single client comes and goes, with no dups.
+	runBothWays("one_comes_and_goes", func(t *testing.T) {
+		wantNoClient(t)
+		s.registerClient(c1)
+		wantSingleClient(t, c1)
+		s.unregisterClient(c1)
+		wantNoClient(t)
+	})
+
+	// A still somewhat common case: a single client was
+	// connected and then their wifi dies or laptop closes
+	// or they switch networks and connect from a
+	// different network. They have two connections but
+	// it's not very bad. Only their new one is
+	// active. The last one, being dead, doesn't send and
+	// thus the new one doesn't get disabled.
+	runBothWays("small_overlap_replacement", func(t *testing.T) {
+		wantNoClient(t)
+		s.registerClient(c1)
+		wantSingleClient(t, c1)
+		wantActive(t, c1)
+		wantDupKeys(t, 0)
+		wantDupKeys(t, 0)
+
+		s.registerClient(c2) // wifi dies; c2 replacement connects
+		wantDupSet(t)
+		wantDupConns(t, 2)
+		wantDupKeys(t, 1)
+		checkDup(t, c1, true)
+		checkDup(t, c2, true)
+		checkDisabled(t, c1, false)
+		checkDisabled(t, c2, false)
+		wantActive(t, c2) // sends go to the replacement
+
+		s.unregisterClient(c1) // c1 finally times out
+		wantSingleClient(t, c2)
+		checkDup(t, c2, false) // c2 is longer a dup
+		wantActive(t, c2)
+		wantDupConns(t, 0)
+		wantDupKeys(t, 0)
+	})
+
+	// Key cloning situation with concurrent clients, both trying
+	// to write.
+	run("concurrent_dups_get_disabled", disableFighters, func(t *testing.T) {
+		wantNoClient(t)
+		s.registerClient(c1)
+		wantSingleClient(t, c1)
+		wantActive(t, c1)
+		s.registerClient(c2)
+		wantDupSet(t)
+		wantDupKeys(t, 1)
+		wantDupConns(t, 2)
+		wantActive(t, c2)
+		checkDup(t, c1, true)
+		checkDup(t, c2, true)
+		checkDisabled(t, c1, false)
+		checkDisabled(t, c2, false)
+
+		s.noteClientActivity(c2)
+		checkDisabled(t, c1, false)
+		checkDisabled(t, c2, false)
+		s.noteClientActivity(c1)
+		checkDisabled(t, c1, true)
+		checkDisabled(t, c2, true)
+		wantActive(t, nil)
+
+		s.registerClient(c3)
+		wantActive(t, c3)
+		checkDisabled(t, c3, false)
+		wantDupKeys(t, 1)
+		wantDupConns(t, 3)
+
+		s.unregisterClient(c3)
+		wantActive(t, nil)
+		wantDupKeys(t, 1)
+		wantDupConns(t, 2)
+
+		s.unregisterClient(c2)
+		wantSingleClient(t, c1)
+		wantDupKeys(t, 0)
+		wantDupConns(t, 0)
+	})
+
+	// Key cloning with an A->B->C->A series instead.
+	run("concurrent_dups_three_parties", disableFighters, func(t *testing.T) {
+		wantNoClient(t)
+		s.registerClient(c1)
+		s.registerClient(c2)
+		s.registerClient(c3)
+		s.noteClientActivity(c1)
+		checkDisabled(t, c1, true)
+		checkDisabled(t, c2, true)
+		checkDisabled(t, c3, true)
+		wantActive(t, nil)
+	})
+
+	run("activity_promotes_primary_when_nil", disableFighters, func(t *testing.T) {
+		wantNoClient(t)
+
+		// Last registered client is the active one...
+		s.registerClient(c1)
+		wantActive(t, c1)
+		s.registerClient(c2)
+		wantActive(t, c2)
+		s.registerClient(c3)
+		s.noteClientActivity(c2)
+		wantActive(t, c3)
+
+		// But if the last one goes away, the one with the
+		// most recent activity wins.
+		s.unregisterClient(c3)
+		wantActive(t, c2)
+	})
+
+	run("concurrent_dups_three_parties_last_writer", lastWriterIsActive, func(t *testing.T) {
+		wantNoClient(t)
+
+		s.registerClient(c1)
+		wantActive(t, c1)
+		s.registerClient(c2)
+		wantActive(t, c2)
+
+		s.noteClientActivity(c1)
+		checkDisabled(t, c1, false)
+		checkDisabled(t, c2, false)
+		wantActive(t, c1)
+
+		s.noteClientActivity(c2)
+		checkDisabled(t, c1, false)
+		checkDisabled(t, c2, false)
+		wantActive(t, c2)
+
+		s.unregisterClient(c2)
+		checkDisabled(t, c1, false)
+		wantActive(t, c1)
+	})
+}
+
+func TestLimiter(t *testing.T) {
+	rl := rate.NewLimiter(rate.Every(time.Minute), 100)
+	for i := 0; i < 200; i++ {
+		r := rl.Reserve()
+		d := r.Delay()
+		t.Logf("i=%d, allow=%v, d=%v", i, r.OK(), d)
+	}
 }
 
 func BenchmarkSendRecv(b *testing.B) {
@@ -856,12 +1160,12 @@ func BenchmarkSendRecv(b *testing.B) {
 }
 
 func benchmarkSendRecvSize(b *testing.B, packetSize int) {
-	serverPrivateKey := newPrivateKey(b)
+	serverPrivateKey := key.NewNode()
 	s := NewServer(serverPrivateKey, logger.Discard)
 	defer s.Close()
 
-	key := newPrivateKey(b)
-	clientKey := key.Public()
+	k := key.NewNode()
+	clientKey := k.Public()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -885,7 +1189,7 @@ func benchmarkSendRecvSize(b *testing.B, packetSize int) {
 	go s.Accept(connIn, brwServer, "test-client")
 
 	brw := bufio.NewReadWriter(bufio.NewReader(connOut), bufio.NewWriter(connOut))
-	client, err := NewClient(key, connOut, brw, logger.Discard)
+	client, err := NewClient(k, connOut, brw, logger.Discard)
 	if err != nil {
 		b.Fatalf("client: %v", err)
 	}
@@ -957,5 +1261,109 @@ func TestParseSSOutput(t *testing.T) {
 	seen := parseSSOutput(string(contents))
 	if len(seen) == 0 {
 		t.Errorf("parseSSOutput expected non-empty map")
+	}
+}
+
+type countWriter struct {
+	mu     sync.Mutex
+	writes int
+	bytes  int64
+}
+
+func (w *countWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writes++
+	w.bytes += int64(len(p))
+	return len(p), nil
+}
+
+func (w *countWriter) Stats() (writes int, bytes int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writes, w.bytes
+}
+
+func (w *countWriter) ResetStats() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writes, w.bytes = 0, 0
+}
+
+func TestClientSendRateLimiting(t *testing.T) {
+	cw := new(countWriter)
+	c := &Client{
+		bw: bufio.NewWriter(cw),
+	}
+	c.setSendRateLimiter(ServerInfoMessage{})
+
+	pkt := make([]byte, 1000)
+	if err := c.send(key.NodePublic{}, pkt); err != nil {
+		t.Fatal(err)
+	}
+	writes1, bytes1 := cw.Stats()
+	if writes1 != 1 {
+		t.Errorf("writes = %v, want 1", writes1)
+	}
+
+	// Flood should all succeed.
+	cw.ResetStats()
+	for i := 0; i < 1000; i++ {
+		if err := c.send(key.NodePublic{}, pkt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writes1K, bytes1K := cw.Stats()
+	if writes1K != 1000 {
+		t.Logf("writes = %v; want 1000", writes1K)
+	}
+	if got, want := bytes1K, bytes1*1000; got != want {
+		t.Logf("bytes = %v; want %v", got, want)
+	}
+
+	// Set a rate limiter
+	cw.ResetStats()
+	c.setSendRateLimiter(ServerInfoMessage{
+		TokenBucketBytesPerSecond: 1,
+		TokenBucketBytesBurst:     int(bytes1 * 2),
+	})
+	for i := 0; i < 1000; i++ {
+		if err := c.send(key.NodePublic{}, pkt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writesLimited, bytesLimited := cw.Stats()
+	if writesLimited == 0 || writesLimited == writes1K {
+		t.Errorf("limited conn's write count = %v; want non-zero, less than 1k", writesLimited)
+	}
+	if bytesLimited < bytes1*2 || bytesLimited >= bytes1K {
+		t.Errorf("limited conn's bytes count = %v; want >=%v, <%v", bytesLimited, bytes1K*2, bytes1K)
+	}
+}
+
+func TestServerRepliesToPing(t *testing.T) {
+	ts := newTestServer(t)
+	defer ts.close(t)
+
+	tc := newRegularClient(t, ts, "alice")
+
+	data := [8]byte{1, 2, 3, 4, 5, 6, 7, 42}
+
+	if err := tc.c.SendPing(data); err != nil {
+		t.Fatal(err)
+	}
+
+	for {
+		m, err := tc.c.recvTimeout(time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m := m.(type) {
+		case PongMessage:
+			if ([8]byte(m)) != data {
+				t.Fatalf("got pong %2x; want %2x", [8]byte(m), data)
+			}
+			return
+		}
 	}
 }

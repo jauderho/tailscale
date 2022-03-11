@@ -7,6 +7,7 @@ package controlclient
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -14,11 +15,11 @@ import (
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/empty"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/structs"
-	"tailscale.com/types/wgkey"
 )
 
 type LoginGoal struct {
@@ -266,9 +267,9 @@ func (c *Auto) authRoutine() {
 		goal := c.loginGoal
 		ctx := c.authCtx
 		if goal != nil {
-			c.logf("authRoutine: %s; wantLoggedIn=%v", c.state, goal.wantLoggedIn)
+			c.logf("[v1] authRoutine: %s; wantLoggedIn=%v", c.state, goal.wantLoggedIn)
 		} else {
-			c.logf("authRoutine: %s; goal=nil paused=%v", c.state, c.paused)
+			c.logf("[v1] authRoutine: %s; goal=nil paused=%v", c.state, c.paused)
 		}
 		c.mu.Unlock()
 
@@ -281,7 +282,6 @@ func (c *Auto) authRoutine() {
 
 		report := func(err error, msg string) {
 			c.logf("[v1] %s: %v", msg, err)
-			err = fmt.Errorf("%s: %v", msg, err)
 			// don't send status updates for context errors,
 			// since context cancelation is always on purpose.
 			if ctx.Err() == nil {
@@ -340,11 +340,9 @@ func (c *Auto) authRoutine() {
 				continue
 			}
 			if url != "" {
-				if goal.url != "" {
-					err = fmt.Errorf("[unexpected] server required a new URL?")
-					report(err, "WaitLoginURL")
-				}
-
+				// goal.url ought to be empty here.
+				// However, not all control servers get this right,
+				// and logging about it here just generates noise.
 				c.mu.Lock()
 				c.loginGoal = &LoginGoal{
 					wantLoggedIn: true,
@@ -417,7 +415,7 @@ func (c *Auto) mapRoutine() {
 			}
 			continue
 		}
-		c.logf("mapRoutine: %s", c.state)
+		c.logf("[v1] mapRoutine: %s", c.state)
 		loggedIn := c.loggedIn
 		ctx := c.mapCtx
 		c.mu.Unlock()
@@ -431,7 +429,7 @@ func (c *Auto) mapRoutine() {
 
 		report := func(err error, msg string) {
 			c.logf("[v1] %s: %v", msg, err)
-			err = fmt.Errorf("%s: %v", msg, err)
+			err = fmt.Errorf("%s: %w", msg, err)
 			// don't send status updates for context errors,
 			// since context cancelation is always on purpose.
 			if ctx.Err() == nil {
@@ -448,9 +446,9 @@ func (c *Auto) mapRoutine() {
 
 			select {
 			case <-ctx.Done():
-				c.logf("mapRoutine: context done.")
+				c.logf("[v1] mapRoutine: context done.")
 			case <-c.newMapCh:
-				c.logf("mapRoutine: new map needed while idle.")
+				c.logf("[v1] mapRoutine: new map needed while idle.")
 			}
 		} else {
 			// Be sure this is false when we're not inside
@@ -599,9 +597,7 @@ func (c *Auto) sendStatus(who string, err error, url string, nm *netmap.NetworkM
 		NetMap:         nm,
 		Hostinfo:       hi,
 		State:          state,
-	}
-	if err != nil {
-		new.Err = err.Error()
+		Err:            err,
 	}
 	if statusFunc != nil {
 		statusFunc(new)
@@ -662,6 +658,10 @@ func (c *Auto) Logout(ctx context.Context) error {
 	}
 }
 
+func (c *Auto) SetExpirySooner(ctx context.Context, expiry time.Time) error {
+	return c.direct.SetExpirySooner(ctx, expiry)
+}
+
 // UpdateEndpoints sets the client's discovered endpoints and sends
 // them to the control server if they've changed.
 //
@@ -682,6 +682,7 @@ func (c *Auto) Shutdown() {
 	c.mu.Lock()
 	inSendStatus := c.inSendStatus
 	closed := c.closed
+	direct := c.direct
 	if !closed {
 		c.closed = true
 		c.statusFunc = nil
@@ -696,13 +697,16 @@ func (c *Auto) Shutdown() {
 		<-c.authDone
 		c.cancelMapUnsafely()
 		<-c.mapDone
+		if direct != nil {
+			direct.Close()
+		}
 		c.logf("Client.Shutdown done.")
 	}
 }
 
 // NodePublicKey returns the node public key currently in use. This is
 // used exclusively in tests.
-func (c *Auto) TestOnlyNodePublicKey() wgkey.Key {
+func (c *Auto) TestOnlyNodePublicKey() key.NodePublic {
 	priv := c.direct.GetPersist()
 	return priv.PrivateNodeKey.Public()
 }
@@ -721,4 +725,8 @@ func (c *Auto) TestOnlyTimeNow() time.Time {
 // requesting a DNS record be created or updated.
 func (c *Auto) SetDNS(ctx context.Context, req *tailcfg.SetDNSRequest) error {
 	return c.direct.SetDNS(ctx, req)
+}
+
+func (c *Auto) DoNoiseRequest(req *http.Request) (*http.Response, error) {
+	return c.direct.DoNoiseRequest(req)
 }

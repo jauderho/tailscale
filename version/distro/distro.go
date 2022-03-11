@@ -8,6 +8,7 @@ package distro
 import (
 	"os"
 	"runtime"
+	"sync/atomic"
 )
 
 type Distro string
@@ -19,14 +20,28 @@ const (
 	OpenWrt  = Distro("openwrt")
 	NixOS    = Distro("nixos")
 	QNAP     = Distro("qnap")
+	Pfsense  = Distro("pfsense")
+	OPNsense = Distro("opnsense")
+	TrueNAS  = Distro("truenas")
+	Gokrazy  = Distro("gokrazy")
 )
+
+var distroAtomic atomic.Value // of Distro
 
 // Get returns the current distro, or the empty string if unknown.
 func Get() Distro {
-	if runtime.GOOS == "linux" {
-		return linuxDistro()
+	d, ok := distroAtomic.Load().(Distro)
+	if ok {
+		return d
 	}
-	return ""
+	switch runtime.GOOS {
+	case "linux":
+		d = linuxDistro()
+	case "freebsd":
+		d = freebsdDistro()
+	}
+	distroAtomic.Store(d) // even if empty
+	return d
 }
 
 func have(file string) bool {
@@ -43,6 +58,9 @@ func linuxDistro() Distro {
 	switch {
 	case haveDir("/usr/syno"):
 		return Synology
+	case have("/usr/local/bin/freenas-debug"):
+		// TrueNAS Scale runs on debian
+		return TrueNAS
 	case have("/etc/debian_version"):
 		return Debian
 	case have("/etc/arch-release"):
@@ -53,6 +71,21 @@ func linuxDistro() Distro {
 		return NixOS
 	case have("/etc/config/uLinux.conf"):
 		return QNAP
+	case haveDir("/gokrazy"):
+		return Gokrazy
+	}
+	return ""
+}
+
+func freebsdDistro() Distro {
+	switch {
+	case have("/etc/pfSense-rc"):
+		return Pfsense
+	case have("/usr/local/sbin/opnsense-shell"):
+		return OPNsense
+	case have("/usr/local/bin/freenas-debug"):
+		// TrueNAS Core runs on FreeBSD
+		return TrueNAS
 	}
 	return ""
 }

@@ -5,16 +5,16 @@
 package dns
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 	"inet.af/netaddr"
+	"tailscale.com/health"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/cmpver"
 )
@@ -28,24 +28,75 @@ func (kv kv) String() string {
 }
 
 func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurator, err error) {
+	env := newOSConfigEnv{
+		fs:                directFS{},
+		dbusPing:          dbusPing,
+		nmIsUsingResolved: nmIsUsingResolved,
+		nmVersionBetween:  nmVersionBetween,
+		resolvconfStyle:   resolvconfStyle,
+	}
+	mode, err := dnsMode(logf, env)
+	if err != nil {
+		return nil, err
+	}
+	switch mode {
+	case "direct":
+		return newDirectManagerOnFS(logf, env.fs), nil
+	case "systemd-resolved":
+		return newResolvedManager(logf, interfaceName)
+	case "network-manager":
+		return newNMManager(interfaceName)
+	case "debian-resolvconf":
+		return newDebianResolvconfManager(logf)
+	case "openresolv":
+		return newOpenresolvManager()
+	default:
+		logf("[unexpected] detected unknown DNS mode %q, using direct manager as last resort", mode)
+		return newDirectManagerOnFS(logf, env.fs), nil
+	}
+}
+
+// newOSConfigEnv are the funcs newOSConfigurator needs, pulled out for testing.
+type newOSConfigEnv struct {
+	fs                        wholeFileFS
+	dbusPing                  func(string, string) error
+	nmIsUsingResolved         func() error
+	nmVersionBetween          func(v1, v2 string) (safe bool, err error)
+	resolvconfStyle           func() string
+	isResolvconfDebianVersion func() bool
+}
+
+func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
 	var debug []kv
 	dbg := func(k, v string) {
 		debug = append(debug, kv{k, v})
 	}
 	defer func() {
-		if ret != nil {
-			dbg("ret", fmt.Sprintf("%T", ret))
+		if ret != "" {
+			dbg("ret", ret)
 		}
 		logf("dns: %v", debug)
 	}()
 
-	bs, err := ioutil.ReadFile("/etc/resolv.conf")
+	// Before we read /etc/resolv.conf (which might be in a broken
+	// or symlink-dangling state), try to ping the D-Bus service
+	// for systemd-resolved. If it's active on the machine, this
+	// will make it start up and write the /etc/resolv.conf file
+	// before it replies to the ping. (see how systemd's
+	// src/resolve/resolved.c calls manager_write_resolv_conf
+	// before the sd_event_loop starts)
+	resolvedUp := env.dbusPing("org.freedesktop.resolve1", "/org/freedesktop/resolve1") == nil
+	if resolvedUp {
+		dbg("resolved-ping", "yes")
+	}
+
+	bs, err := env.fs.ReadFile(resolvConf)
 	if os.IsNotExist(err) {
 		dbg("rc", "missing")
-		return newDirectManager(), nil
+		return "direct", nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("reading /etc/resolv.conf: %w", err)
+		return "", fmt.Errorf("reading /etc/resolv.conf: %w", err)
 	}
 
 	switch resolvOwner(bs) {
@@ -56,22 +107,23 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 		// header, but doesn't actually point to resolved. We mustn't
 		// try to program resolved in that case.
 		// https://github.com/tailscale/tailscale/issues/2136
-		if err := resolvedIsActuallyResolver(); err != nil {
+		if err := resolvedIsActuallyResolver(bs); err != nil {
+			logf("dns: resolvedIsActuallyResolver error: %v", err)
 			dbg("resolved", "not-in-use")
-			return newDirectManager(), nil
+			return "direct", nil
 		}
-		if err := dbusPing("org.freedesktop.resolve1", "/org/freedesktop/resolve1"); err != nil {
+		if !resolvedUp {
 			dbg("resolved", "no")
-			return newDirectManager(), nil
+			return "direct", nil
 		}
-		if err := dbusPing("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/DnsManager"); err != nil {
+		if err := env.dbusPing("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/DnsManager"); err != nil {
 			dbg("nm", "no")
-			return newResolvedManager(logf, interfaceName)
+			return "systemd-resolved", nil
 		}
 		dbg("nm", "yes")
-		if err := nmIsUsingResolved(); err != nil {
+		if err := env.nmIsUsingResolved(); err != nil {
 			dbg("nm-resolved", "no")
-			return newResolvedManager(logf, interfaceName)
+			return "systemd-resolved", nil
 		}
 		dbg("nm-resolved", "yes")
 
@@ -109,44 +161,93 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 		// that comes with it (see
 		// https://github.com/tailscale/tailscale/issues/1699,
 		// https://github.com/tailscale/tailscale/pull/1945)
-		safe, err := nmVersionBetween("1.26.0", "1.26.5")
+		safe, err := env.nmVersionBetween("1.26.0", "1.26.5")
 		if err != nil {
 			// Failed to figure out NM's version, can't make a correct
 			// decision.
-			return nil, fmt.Errorf("checking NetworkManager version: %v", err)
+			return "", fmt.Errorf("checking NetworkManager version: %v", err)
 		}
 		if safe {
 			dbg("nm-safe", "yes")
-			return newNMManager(interfaceName)
+			return "network-manager", nil
 		}
 		dbg("nm-safe", "no")
-		return newResolvedManager(logf, interfaceName)
+		return "systemd-resolved", nil
 	case "resolvconf":
 		dbg("rc", "resolvconf")
-		if _, err := exec.LookPath("resolvconf"); err != nil {
+		style := env.resolvconfStyle()
+		switch style {
+		case "":
 			dbg("resolvconf", "no")
-			return newDirectManager(), nil
+			return "direct", nil
+		case "debian":
+			dbg("resolvconf", "debian")
+			return "debian-resolvconf", nil
+		case "openresolv":
+			dbg("resolvconf", "openresolv")
+			return "openresolv", nil
+		default:
+			// Shouldn't happen, that means we updated flavors of
+			// resolvconf without updating here.
+			dbg("resolvconf", style)
+			logf("[unexpected] got unknown flavor of resolvconf %q, falling back to direct manager", env.resolvconfStyle())
+			return "direct", nil
 		}
-		dbg("resolvconf", "yes")
-		return newResolvconfManager(logf)
 	case "NetworkManager":
-		// You'd think we would use newNMManager somewhere in
-		// here. However, as explained in
-		// https://github.com/tailscale/tailscale/issues/1699 , using
-		// NetworkManager for DNS configuration carries with it the
-		// cost of losing IPv6 configuration on the Tailscale network
-		// interface. So, when we can avoid it, we bypass
-		// NetworkManager by replacing resolv.conf directly.
-		//
-		// If you ever try to put NMManager back here, keep in mind
-		// that versions >=1.26.6 will ignore DNS configuration
-		// anyway, so you still need a fallback path that uses
-		// directManager.
 		dbg("rc", "nm")
-		return newDirectManager(), nil
+		// Sometimes, NetworkManager owns the configuration but points
+		// it at systemd-resolved.
+		if err := resolvedIsActuallyResolver(bs); err != nil {
+			logf("dns: resolvedIsActuallyResolver error: %v", err)
+			dbg("resolved", "not-in-use")
+			// You'd think we would use newNMManager here. However, as
+			// explained in
+			// https://github.com/tailscale/tailscale/issues/1699 ,
+			// using NetworkManager for DNS configuration carries with
+			// it the cost of losing IPv6 configuration on the
+			// Tailscale network interface. So, when we can avoid it,
+			// we bypass NetworkManager by replacing resolv.conf
+			// directly.
+			//
+			// If you ever try to put NMManager back here, keep in mind
+			// that versions >=1.26.6 will ignore DNS configuration
+			// anyway, so you still need a fallback path that uses
+			// directManager.
+			return "direct", nil
+		}
+		dbg("nm-resolved", "yes")
+
+		if !resolvedUp {
+			dbg("resolved", "no")
+			return "direct", nil
+		}
+
+		// See large comment above for reasons we'd use NM rather than
+		// resolved. systemd-resolved is actually in charge of DNS
+		// configuration, but in some cases we might need to configure
+		// it via NetworkManager. All the logic below is probing for
+		// that case: is NetworkManager running? If so, is it one of
+		// the versions that requires direct interaction with it?
+		if err := env.dbusPing("org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager/DnsManager"); err != nil {
+			dbg("nm", "no")
+			return "systemd-resolved", nil
+		}
+		safe, err := env.nmVersionBetween("1.26.0", "1.26.5")
+		if err != nil {
+			// Failed to figure out NM's version, can't make a correct
+			// decision.
+			return "", fmt.Errorf("checking NetworkManager version: %v", err)
+		}
+		if safe {
+			dbg("nm-safe", "yes")
+			return "network-manager", nil
+		}
+		health.SetDNSManagerHealth(errors.New("systemd-resolved and NetworkManager are wired together incorrectly; MagicDNS will probably not work. For more info, see https://tailscale.com/s/resolved-nm"))
+		dbg("nm-safe", "no")
+		return "systemd-resolved", nil
 	default:
 		dbg("rc", "unknown")
-		return newDirectManager(), nil
+		return "direct", nil
 	}
 }
 
@@ -194,26 +295,42 @@ func nmIsUsingResolved() error {
 	return nil
 }
 
-func resolvedIsActuallyResolver() error {
-	cfg, err := newDirectManager().readResolvConf()
+// resolvedIsActuallyResolver reports whether the given resolv.conf
+// bytes describe a configuration where systemd-resolved (127.0.0.53)
+// is the only configured nameserver.
+//
+// Returns an error if the configuration is something other than
+// exclusively systemd-resolved, or nil if the config is only
+// systemd-resolved.
+func resolvedIsActuallyResolver(bs []byte) error {
+	cfg, err := readResolv(bytes.NewBuffer(bs))
 	if err != nil {
 		return err
 	}
-	if len(cfg.Nameservers) != 1 || cfg.Nameservers[0] != netaddr.IPv4(127, 0, 0, 53) {
-		return errors.New("resolv.conf doesn't point to systemd-resolved")
+	// We've encountered at least one system where the line
+	// "nameserver 127.0.0.53" appears twice, so we look exhaustively
+	// through all of them and allow any number of repeated mentions
+	// of the systemd-resolved stub IP.
+	if len(cfg.Nameservers) == 0 {
+		return errors.New("resolv.conf has no nameservers")
+	}
+	for _, ns := range cfg.Nameservers {
+		if ns != netaddr.IPv4(127, 0, 0, 53) {
+			return fmt.Errorf("resolv.conf doesn't point to systemd-resolved; points to %v", cfg.Nameservers)
+		}
 	}
 	return nil
 }
 
 func dbusPing(name, objectPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
 	conn, err := dbus.SystemBus()
 	if err != nil {
 		// DBus probably not running.
 		return err
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
 
 	obj := conn.Object(name, dbus.ObjectPath(objectPath))
 	call := obj.CallWithContext(ctx, "org.freedesktop.DBus.Peer.Ping", 0)

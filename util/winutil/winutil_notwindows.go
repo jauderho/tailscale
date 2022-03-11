@@ -2,15 +2,19 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !windows
 // +build !windows
 
 package winutil
 
-const RegBase = ``
+const regBase = ``
 
-// GetRegString looks up a registry path in our local machine path, or returns
-// the given default if it can't.
-//
-// This function will only work on GOOS=windows. Trying to run it on any other
-// OS will always return the default value.
-func GetRegString(name, defval string) string { return defval }
+func getPolicyString(name, defval string) string { return defval }
+
+func getPolicyInteger(name string, defval uint64) uint64 { return defval }
+
+func getRegString(name, defval string) string { return defval }
+
+func getRegInteger(name string, defval uint64) uint64 { return defval }
+
+func isSIDValidPrincipal(uid string) bool { return false }

@@ -6,15 +6,14 @@ package controlclient
 
 import (
 	"log"
-	"os"
 	"sort"
-	"strconv"
 
 	"inet.af/netaddr"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -28,10 +27,10 @@ import (
 // one MapRequest).
 type mapSession struct {
 	// Immutable fields.
-	privateNodeKey         wgkey.Private
+	privateNodeKey         key.NodePrivate
 	logf                   logger.Logf
 	vlogf                  logger.Logf
-	machinePubKey          tailcfg.MachineKey
+	machinePubKey          key.MachinePublic
 	keepSharerAndUserSplit bool // see Options.KeepSharerAndUserSplit
 
 	// Fields storing state over the the coards of multiple MapResponses.
@@ -40,16 +39,18 @@ type mapSession struct {
 	lastDERPMap            *tailcfg.DERPMap
 	lastUserProfile        map[tailcfg.UserID]tailcfg.UserProfile
 	lastParsedPacketFilter []filter.Match
+	lastSSHPolicy          *tailcfg.SSHPolicy
 	collectServices        bool
 	previousPeers          []*tailcfg.Node // for delta-purposes
 	lastDomain             string
+	lastHealth             []string
 
 	// netMapBuilding is non-nil during a netmapForResponse call,
 	// containing the value to be returned, once fully populated.
 	netMapBuilding *netmap.NetworkMap
 }
 
-func newMapSession(privateNodeKey wgkey.Private) *mapSession {
+func newMapSession(privateNodeKey key.NodePrivate) *mapSession {
 	ms := &mapSession{
 		privateNodeKey:  privateNodeKey,
 		logf:            logger.Discard,
@@ -97,6 +98,9 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 	if c := resp.DNSConfig; c != nil {
 		ms.lastDNSConfig = c
 	}
+	if p := resp.SSHPolicy; p != nil {
+		ms.lastSSHPolicy = p
+	}
 
 	if v, ok := resp.CollectServices.Get(); ok {
 		ms.collectServices = v
@@ -104,9 +108,12 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 	if resp.Domain != "" {
 		ms.lastDomain = resp.Domain
 	}
+	if resp.Health != nil {
+		ms.lastHealth = resp.Health
+	}
 
 	nm := &netmap.NetworkMap{
-		NodeKey:         tailcfg.NodeKey(ms.privateNodeKey.Public()),
+		NodeKey:         ms.privateNodeKey.Public(),
 		PrivateKey:      ms.privateNodeKey,
 		MachineKey:      ms.machinePubKey,
 		Peers:           resp.Peers,
@@ -114,9 +121,11 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 		Domain:          ms.lastDomain,
 		DNS:             *ms.lastDNSConfig,
 		PacketFilter:    ms.lastParsedPacketFilter,
+		SSHPolicy:       ms.lastSSHPolicy,
 		CollectServices: ms.collectServices,
 		DERPMap:         ms.lastDERPMap,
 		Debug:           resp.Debug,
+		ControlHealth:   ms.lastHealth,
 	}
 	ms.netMapBuilding = nm
 
@@ -129,7 +138,9 @@ func (ms *mapSession) netmapForResponse(resp *tailcfg.MapResponse) *netmap.Netwo
 		nm.Name = node.Name
 		nm.Addresses = filterSelfAddresses(node.Addresses)
 		nm.User = node.User
-		nm.Hostinfo = node.Hostinfo
+		if node.Hostinfo.Valid() {
+			nm.Hostinfo = *node.Hostinfo.AsStruct()
+		}
 		if node.MachineAuthorized {
 			nm.MachineStatus = tailcfg.MachineAuthorized
 		} else {
@@ -284,7 +295,7 @@ func cloneNodes(v1 []*tailcfg.Node) []*tailcfg.Node {
 	return v2
 }
 
-var debugSelfIPv6Only, _ = strconv.ParseBool(os.Getenv("TS_DEBUG_SELF_V6_ONLY"))
+var debugSelfIPv6Only = envknob.Bool("TS_DEBUG_SELF_V6_ONLY")
 
 func filterSelfAddresses(in []netaddr.IPPrefix) (ret []netaddr.IPPrefix) {
 	switch {

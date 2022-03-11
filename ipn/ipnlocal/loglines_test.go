@@ -11,6 +11,7 @@ import (
 
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/logtail"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
@@ -47,13 +48,14 @@ func TestLocalLogLines(t *testing.T) {
 	idA := logid(0xaa)
 
 	// set up a LocalBackend, super bare bones. No functional data.
-	store := &ipn.MemoryStore{}
+	store := new(mem.Store)
 	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(e.Close)
 
-	lb, err := NewLocalBackend(logf, idA.String(), store, e)
+	lb, err := NewLocalBackend(logf, idA.String(), store, nil, e, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +91,7 @@ func TestLocalLogLines(t *testing.T) {
 			TxBytes:       10,
 			RxBytes:       10,
 			LastHandshake: time.Now(),
-			NodeKey:       tailcfg.NodeKey(key.NewPrivate()),
+			NodeKey:       key.NewNode().Public(),
 		}},
 	})
 	lb.mu.Unlock()
@@ -104,7 +106,7 @@ func TestLocalLogLines(t *testing.T) {
 			TxBytes:       11,
 			RxBytes:       12,
 			LastHandshake: time.Now(),
-			NodeKey:       tailcfg.NodeKey(key.NewPrivate()),
+			NodeKey:       key.NewNode().Public(),
 		}},
 	})
 	lb.mu.Unlock()

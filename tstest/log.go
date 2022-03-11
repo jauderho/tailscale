@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"go4.org/mem"
 	"tailscale.com/types/logger"
 )
 
@@ -121,4 +122,26 @@ func (lt *LogLineTracker) Close() {
 	lt.mu.Lock()
 	defer lt.mu.Unlock()
 	lt.closed = true
+}
+
+// MemLogger is a bytes.Buffer with a Logf method for tests that want
+// to log to a buffer.
+type MemLogger struct {
+	sync.Mutex
+	bytes.Buffer
+}
+
+func (ml *MemLogger) Logf(format string, args ...interface{}) {
+	ml.Lock()
+	defer ml.Unlock()
+	fmt.Fprintf(&ml.Buffer, format, args...)
+	if !mem.HasSuffix(mem.B(ml.Buffer.Bytes()), mem.S("\n")) {
+		ml.Buffer.WriteByte('\n')
+	}
+}
+
+func (ml *MemLogger) String() string {
+	ml.Lock()
+	defer ml.Unlock()
+	return ml.Buffer.String()
 }

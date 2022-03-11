@@ -28,7 +28,8 @@ func DefaultTailscaledSocket() string {
 	if runtime.GOOS == "darwin" {
 		return "/var/run/tailscaled.socket"
 	}
-	if distro.Get() == distro.Synology {
+	switch distro.Get() {
+	case distro.Synology:
 		// TODO(maisem): be smarter about this. We can parse /etc/VERSION.
 		const dsm6Sock = "/var/packages/Tailscale/etc/tailscaled.sock"
 		const dsm7Sock = "/var/packages/Tailscale/var/tailscaled.sock"
@@ -38,6 +39,8 @@ func DefaultTailscaledSocket() string {
 		if fi, err := os.Stat(dsm7Sock); err == nil && !fi.IsDir() {
 			return dsm7Sock
 		}
+	case distro.Gokrazy:
+		return "/perm/tailscaled/tailscaled.sock"
 	}
 	if fi, err := os.Stat("/var/run"); err == nil && fi.IsDir() {
 		return "/var/run/tailscale/tailscaled.sock"
@@ -55,7 +58,18 @@ func DefaultTailscaledStateFile() string {
 		return f()
 	}
 	if runtime.GOOS == "windows" {
-		return filepath.Join(os.Getenv("LocalAppData"), "Tailscale", "server-state.conf")
+		return filepath.Join(os.Getenv("ProgramData"), "Tailscale", "server-state.conf")
 	}
 	return ""
+}
+
+// MkStateDir ensures that dirPath, the daemon's configurtaion directory
+// containing machine keys etc, both exists and has the correct permissions.
+// We want it to only be accessible to the user the daemon is running under.
+func MkStateDir(dirPath string) error {
+	if err := os.MkdirAll(dirPath, 0700); err != nil {
+		return err
+	}
+
+	return ensureStateDirPerms(dirPath)
 }

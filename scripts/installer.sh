@@ -23,32 +23,95 @@ main() {
 	OS=""
 	VERSION=""
 	PACKAGETYPE=""
+	APT_KEY_TYPE="" # Only for apt-based distros
+	APT_SYSTEMCTL_START=false # Only needs to be true for Kali
+	TRACK="${TRACK:-stable}"
+
+	case "$TRACK" in
+		stable|unstable)
+			;;
+		*)
+			echo "unsupported track $TRACK"
+			exit 1
+			;;
+	esac
 
 	if [ -f /etc/os-release ]; then
 		# /etc/os-release populates a number of shell variables. We care about the following:
 		#  - ID: the short name of the OS (e.g. "debian", "freebsd")
 		#  - VERSION_ID: the numeric release version for the OS, if any (e.g. "18.04")
 		#  - VERSION_CODENAME: the codename of the OS release, if any (e.g. "buster")
+		#  - UBUNTU_CODENAME: if it exists, as in linuxmint, use instead of VERSION_CODENAME
 		. /etc/os-release
 		case "$ID" in
-			ubuntu)
-				OS="$ID"
-				VERSION="$VERSION_CODENAME"
+			ubuntu|pop|neon|zorin|elementary|linuxmint)
+				OS="ubuntu"
+				if [ "${UBUNTU_CODENAME:-}" != "" ]; then
+				    VERSION="$UBUNTU_CODENAME"
+				else
+				    VERSION="$VERSION_CODENAME"
+				fi
 				PACKAGETYPE="apt"
+				# Third-party keyrings became the preferred method of
+				# installation in Ubuntu 20.04.
+				if expr "$VERSION_ID" : "2.*" >/dev/null; then
+					APT_KEY_TYPE="keyring"
+				else
+					APT_KEY_TYPE="legacy"
+				fi
 				;;
 			debian)
 				OS="$ID"
 				VERSION="$VERSION_CODENAME"
 				PACKAGETYPE="apt"
+				# Third-party keyrings became the preferred method of
+				# installation in Debian 11 (Bullseye).
+				if [ "$VERSION_ID" -lt 11 ]; then
+					APT_KEY_TYPE="legacy"
+				else
+					APT_KEY_TYPE="keyring"
+				fi
 				;;
 			raspbian)
 				OS="$ID"
 				VERSION="$VERSION_CODENAME"
 				PACKAGETYPE="apt"
+				# Third-party keyrings became the preferred method of
+				# installation in Raspbian 11 (Bullseye).
+				if [ "$VERSION_ID" -lt 11 ]; then
+					APT_KEY_TYPE="legacy"
+				else
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			kali)
+				OS="debian"
+				PACKAGETYPE="apt"
+				YEAR="$(echo "$VERSION_ID" | cut -f1 -d.)"
+				APT_SYSTEMCTL_START=true
+				# Third-party keyrings became the preferred method of
+				# installation in Debian 11 (Bullseye), which Kali switched
+				# to in roughly 2021.x releases
+				if [ "$YEAR" -lt 2021 ]; then
+					# Kali VERSION_ID is "kali-rolling", which isn't distinguishing
+					VERSION="buster"
+					APT_KEY_TYPE="legacy"
+				else
+					VERSION="bullseye"
+					APT_KEY_TYPE="keyring"
+				fi
 				;;
 			centos)
 				OS="$ID"
 				VERSION="$VERSION_ID"
+				PACKAGETYPE="dnf"
+				if [ "$VERSION" = "7" ]; then
+					PACKAGETYPE="yum"
+				fi
+				;;
+			ol)
+				OS="oracle"
+				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
 				PACKAGETYPE="dnf"
 				if [ "$VERSION" = "7" ]; then
 					PACKAGETYPE="yum"
@@ -61,6 +124,11 @@ main() {
 				;;
 			fedora)
 				OS="$ID"
+				VERSION=""
+				PACKAGETYPE="dnf"
+				;;
+			rocky)
+				OS="fedora"
 				VERSION=""
 				PACKAGETYPE="dnf"
 				;;
@@ -79,7 +147,7 @@ main() {
 				VERSION="tumbleweed"
 				PACKAGETYPE="zypper"
 				;;
- 			arch)
+			arch)
 				OS="$ID"
 				VERSION="" # rolling release
 				PACKAGETYPE="pacman"
@@ -162,7 +230,9 @@ main() {
 			   [ "$VERSION" != "eoan" ] && \
 			   [ "$VERSION" != "focal" ] && \
 			   [ "$VERSION" != "groovy" ] && \
-			   [ "$VERSION" != "hirsute" ]
+			   [ "$VERSION" != "hirsute" ] && \
+			   [ "$VERSION" != "impish" ] && \
+			   [ "$VERSION" != "jammy" ]
 			then
 				OS_UNSUPPORTED=1
 			fi
@@ -171,18 +241,28 @@ main() {
 			if [ "$VERSION" != "stretch" ] && \
 			   [ "$VERSION" != "buster" ] && \
 			   [ "$VERSION" != "bullseye" ] && \
+			   [ "$VERSION" != "bookworm" ] && \
 			   [ "$VERSION" != "sid" ]
 			then
 				OS_UNSUPPORTED=1
 			fi
 		;;
 		raspbian)
-			if [ "$VERSION" != "buster" ]
+			if [ "$VERSION" != "buster" ] && \
+			   [ "$VERSION" != "bullseye" ]
 			then
 				OS_UNSUPPORTED=1
 			fi
 		;;
 		centos)
+			if [ "$VERSION" != "7" ] && \
+			   [ "$VERSION" != "8" ] && \
+			   [ "$VERSION" != "9" ]
+			then
+				OS_UNSUPPORTED=1
+			fi
+		;;
+		oracle)
 			if [ "$VERSION" != "7" ] && \
 			   [ "$VERSION" != "8" ]
 			then
@@ -204,10 +284,14 @@ main() {
 		opensuse)
 			if [ "$VERSION" != "leap/15.1" ] && \
 			   [ "$VERSION" != "leap/15.2" ] && \
+			   [ "$VERSION" != "leap/15.3" ] && \
 			   [ "$VERSION" != "tumbleweed" ]
 			then
 				OS_UNSUPPORTED=1
 			fi
+			;;
+		fedora)
+			# All versions supported, no version checking required.
 			;;
 		arch)
 			# Rolling release, no version checking needed.
@@ -251,7 +335,7 @@ main() {
 			other-linux)
 				echo "Couldn't determine what kind of Linux is running."
 				echo "You could try the static binaries at:"
-				echo "https://pkgs.tailscale.com/stable/#static"
+				echo "https://pkgs.tailscale.com/$TRACK/#static"
 				;;
 			"")
 				echo "Couldn't determine what operating system you're running."
@@ -322,33 +406,50 @@ main() {
 				echo "Please install either curl or wget to proceed."
 				exit 1
 			fi
+			export DEBIAN_FRONTEND=noninteractive
+			if ! type gpg >/dev/null; then
+				$SUDO apt-get update
+				$SUDO apt-get install -y gnupg
+			fi
 
-			# TODO: use newfangled per-repo signature scheme
 			set -x
-			$CURL "https://pkgs.tailscale.com/stable/$OS/$VERSION.gpg" | $SUDO apt-key add -
-			$CURL "https://pkgs.tailscale.com/stable/$OS/$VERSION.list" | $SUDO tee /etc/apt/sources.list.d/tailscale.list
+			$SUDO mkdir -p --mode=0755 /usr/share/keyrings
+			case "$APT_KEY_TYPE" in
+				legacy)
+					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.asc" | $SUDO apt-key add -
+					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.list" | $SUDO tee /etc/apt/sources.list.d/tailscale.list
+				;;
+				keyring)
+					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.noarmor.gpg" | $SUDO tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+					$CURL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION.tailscale-keyring.list" | $SUDO tee /etc/apt/sources.list.d/tailscale.list
+				;;
+			esac
 			$SUDO apt-get update
-			$SUDO apt-get install tailscale
+			$SUDO apt-get install -y tailscale
+			if [ "$APT_SYSTEMCTL_START" = "true" ]; then
+				$SUDO systemctl enable --now tailscaled
+				$SUDO systemctl start tailscaled
+			fi
 			set +x
 		;;
 		yum)
 			set -x
 			$SUDO yum install yum-utils
-			$SUDO yum-config-manager --add-repo "https://pkgs.tailscale.com/stable/$OS/$VERSION/tailscale.repo"
-			$SUDO yum install tailscale
+			$SUDO yum-config-manager -y --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			$SUDO yum install tailscale -y
 			$SUDO systemctl enable --now tailscaled
 			set +x
 		;;
 		dnf)
 			set -x
-			$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/stable/$OS/$VERSION/tailscale.repo"
-			$SUDO dnf install tailscale
+			$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			$SUDO dnf install -y tailscale
 			$SUDO systemctl enable --now tailscaled
 			set +x
 		;;
 		zypper)
 			set -x
-			$SUDO zypper ar -g -r "https://pkgs.tailscale.com/stable/$OS/$VERSION/tailscale.repo"
+			$SUDO zypper ar -g -r "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
 			$SUDO zypper ref
 			$SUDO zypper in tailscale
 			$SUDO systemctl enable --now tailscaled
@@ -368,7 +469,7 @@ main() {
 			;;
 		xbps)
 			set -x
-			$SUDO xbps-install tailscale
+			$SUDO xbps-install tailscale -y 
 			set +x
 			;;
 		emerge)

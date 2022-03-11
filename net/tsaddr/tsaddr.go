@@ -36,12 +36,24 @@ var (
 	tsUlaRange   oncePrefix
 	ula4To6Range oncePrefix
 	ulaEph6Range oncePrefix
+	serviceIPv6  oncePrefix
 )
 
-// TailscaleServiceIP returns the listen address of services
+// TailscaleServiceIP returns the IPv4 listen address of services
 // provided by Tailscale itself such as the MagicDNS proxy.
+//
+// For IPv6, use TailscaleServiceIPv6.
 func TailscaleServiceIP() netaddr.IP {
 	return netaddr.IPv4(100, 100, 100, 100) // "100.100.100.100" for those grepping
+}
+
+// TailscaleServiceIPv6 returns the IPv6 listen address of the services
+// provided by Tailscale itself such as the MagicDNS proxy.
+//
+// For IPv4, use TailscaleServiceIP.
+func TailscaleServiceIPv6() netaddr.IP {
+	serviceIPv6.Do(func() { mustPrefix(&serviceIPv6.v, "fd7a:115c:a1e0::53/128") })
+	return serviceIPv6.v.IP()
 }
 
 // IsTailscaleIP reports whether ip is an IP address in a range that
@@ -105,11 +117,6 @@ func Tailscale4To6(ipv4 netaddr.IP) netaddr.IP {
 	return netaddr.IPFrom16(ret)
 }
 
-func IsULA(ip netaddr.IP) bool {
-	ulaRange.Do(func() { mustPrefix(&ulaRange.v, "fc00::/7") })
-	return ulaRange.v.Contains(ip)
-}
-
 func mustPrefix(v *netaddr.IPPrefix, prefix string) {
 	var err error
 	*v, err = netaddr.ParseIPPrefix(prefix)
@@ -169,3 +176,65 @@ func NewContainsIPFunc(addrs []netaddr.IPPrefix) func(ip netaddr.IP) bool {
 	}
 	return func(ip netaddr.IP) bool { return m[ip] }
 }
+
+// PrefixesContainsFunc reports whether f is true for any IPPrefix in
+// ipp.
+func PrefixesContainsFunc(ipp []netaddr.IPPrefix, f func(netaddr.IPPrefix) bool) bool {
+	for _, v := range ipp {
+		if f(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// PrefixesContainsIP reports whether any prefix in ipp contains ip.
+func PrefixesContainsIP(ipp []netaddr.IPPrefix, ip netaddr.IP) bool {
+	for _, r := range ipp {
+		if r.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// IPsContainsFunc reports whether f is true for any IP in ips.
+func IPsContainsFunc(ips []netaddr.IP, f func(netaddr.IP) bool) bool {
+	for _, v := range ips {
+		if f(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// PrefixIs4 reports whether p is an IPv4 prefix.
+func PrefixIs4(p netaddr.IPPrefix) bool { return p.IP().Is4() }
+
+// PrefixIs6 reports whether p is an IPv6 prefix.
+func PrefixIs6(p netaddr.IPPrefix) bool { return p.IP().Is6() }
+
+// ContainsExitRoutes reports whether rr contains both the IPv4 and
+// IPv6 /0 route.
+func ContainsExitRoutes(rr []netaddr.IPPrefix) bool {
+	var v4, v6 bool
+	for _, r := range rr {
+		if r == allIPv4 {
+			v4 = true
+		} else if r == allIPv6 {
+			v6 = true
+		}
+	}
+	return v4 && v6
+}
+
+var (
+	allIPv4 = netaddr.MustParseIPPrefix("0.0.0.0/0")
+	allIPv6 = netaddr.MustParseIPPrefix("::/0")
+)
+
+// AllIPv4 returns 0.0.0.0/0.
+func AllIPv4() netaddr.IPPrefix { return allIPv4 }
+
+// AllIPv6 returns ::/0.
+func AllIPv6() netaddr.IPPrefix { return allIPv6 }

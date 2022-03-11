@@ -6,9 +6,7 @@ package wgengine
 
 import (
 	"fmt"
-	"os"
 	"runtime"
-	"strconv"
 	"time"
 
 	"tailscale.com/ipn/ipnstate"
@@ -21,17 +19,6 @@ import (
 )
 
 const tcpTimeoutBeforeDebug = 5 * time.Second
-
-// debugConnectFailures reports whether the local node should track
-// outgoing TCP connections and log which ones fail and why.
-func debugConnectFailures() bool {
-	s := os.Getenv("TS_DEBUG_CONNECT_FAILURES")
-	if s == "" {
-		return true
-	}
-	v, _ := strconv.ParseBool(s)
-	return v
-}
 
 type pendingOpenFlow struct {
 	timer *time.Timer // until giving up on the flow
@@ -117,7 +104,7 @@ func (e *userspaceEngine) trackOpenPostFilterOut(pp *packet.Parsed, t *tstun.Wra
 	// like:
 	//    open-conn-track: timeout opening (100.115.73.60:52501 => 17.125.252.5:443); no associated peer node
 	if runtime.GOOS == "ios" && flow.Dst.Port() == 443 && !tsaddr.IsTailscaleIP(flow.Dst.IP()) {
-		if _, err := e.peerForIP(flow.Dst.IP()); err != nil {
+		if _, ok := e.PeerForIP(flow.Dst.IP()); !ok {
 			return
 		}
 	}
@@ -157,15 +144,12 @@ func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
 	}
 
 	// Diagnose why it might've timed out.
-	n, err := e.peerForIP(flow.Dst.IP())
-	if err != nil {
-		e.logf("open-conn-track: timeout opening %v; peerForIP: %v", flow, err)
-		return
-	}
-	if n == nil {
+	pip, ok := e.PeerForIP(flow.Dst.IP())
+	if !ok {
 		e.logf("open-conn-track: timeout opening %v; no associated peer node", flow)
 		return
 	}
+	n := pip.Node
 	if n.DiscoKey.IsZero() {
 		e.logf("open-conn-track: timeout opening %v; peer node %v running pre-0.100", flow, n.Key.ShortString())
 		return
@@ -231,7 +215,7 @@ func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
 	e.logf("open-conn-track: timeout opening %v to node %v; online=%v, lastRecv=%v",
 		flow, n.Key.ShortString(),
 		online,
-		durFmt(e.magicConn.LastRecvActivityOfDisco(n.DiscoKey)))
+		e.magicConn.LastRecvActivityOfNodeKey(n.Key))
 }
 
 func durFmt(t time.Time) string {

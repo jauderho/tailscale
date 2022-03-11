@@ -11,19 +11,17 @@ import (
 	"strings"
 
 	"inet.af/netaddr"
-	"tailscale.com/control/controlclient"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
-	"tailscale.com/types/wgkey"
 	"tailscale.com/wgengine/wgcfg"
 )
 
 func nodeDebugName(n *tailcfg.Node) string {
 	name := n.Name
 	if name == "" {
-		name = n.Hostinfo.Hostname
+		name = n.Hostinfo.Hostname()
 	}
 	if i := strings.Index(name, "."); i != -1 {
 		name = name[:i]
@@ -55,7 +53,7 @@ func cidrIsSubnet(node *tailcfg.Node, cidr netaddr.IPPrefix) bool {
 func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, exitNode tailcfg.StableNodeID) (*wgcfg.Config, error) {
 	cfg := &wgcfg.Config{
 		Name:       "tailscale",
-		PrivateKey: wgkey.Private(nm.PrivateKey),
+		PrivateKey: nm.PrivateKey,
 		Addresses:  nm.Addresses,
 		Peers:      make([]wgcfg.Peer, 0, len(nm.Peers)),
 	}
@@ -66,31 +64,21 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 	skippedSubnets := new(bytes.Buffer)
 
 	for _, peer := range nm.Peers {
-		if controlclient.Debug.OnlyDisco && peer.DiscoKey.IsZero() {
+		if peer.DiscoKey.IsZero() && peer.DERP == "" {
+			// Peer predates both DERP and active discovery, we cannot
+			// communicate with it.
+			logf("[v1] wgcfg: skipped peer %s, doesn't offer DERP or disco", peer.Key.ShortString())
 			continue
 		}
 		cfg.Peers = append(cfg.Peers, wgcfg.Peer{
-			PublicKey: wgkey.Key(peer.Key),
+			PublicKey: peer.Key,
+			DiscoKey:  peer.DiscoKey,
 		})
 		cpeer := &cfg.Peers[len(cfg.Peers)-1]
 		if peer.KeepAlive {
 			cpeer.PersistentKeepalive = 25 // seconds
 		}
 
-		cpeer.Endpoints = wgcfg.Endpoints{PublicKey: wgkey.Key(peer.Key), DiscoKey: peer.DiscoKey}
-		if peer.DiscoKey.IsZero() {
-			// Legacy connection. Add IP+port endpoints.
-			var ipps []netaddr.IPPort
-			if err := appendEndpoint(cpeer, &ipps, peer.DERP); err != nil {
-				return nil, err
-			}
-			for _, ep := range peer.Endpoints {
-				if err := appendEndpoint(cpeer, &ipps, ep); err != nil {
-					return nil, err
-				}
-			}
-			cpeer.Endpoints.IPPorts = wgcfg.NewIPPortSet(ipps...)
-		}
 		didExitNodeWarn := false
 		for _, allowedIP := range peer.AllowedIPs {
 			if allowedIP.Bits() == 0 && peer.StableID != exitNode {
@@ -134,16 +122,4 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 	}
 
 	return cfg, nil
-}
-
-func appendEndpoint(peer *wgcfg.Peer, ipps *[]netaddr.IPPort, epStr string) error {
-	if epStr == "" {
-		return nil
-	}
-	ipp, err := netaddr.ParseIPPort(epStr)
-	if err != nil {
-		return fmt.Errorf("malformed endpoint %q for peer %v", epStr, peer.PublicKey.ShortString())
-	}
-	*ipps = append(*ipps, ipp)
-	return nil
 }

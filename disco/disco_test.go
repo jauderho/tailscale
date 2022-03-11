@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"go4.org/mem"
 	"inet.af/netaddr"
+	"tailscale.com/types/key"
 )
 
 func TestMarshalAndParse(t *testing.T) {
@@ -25,6 +27,14 @@ func TestMarshalAndParse(t *testing.T) {
 				TxID: [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
 			},
 			want: "01 00 01 02 03 04 05 06 07 08 09 0a 0b 0c",
+		},
+		{
+			name: "ping_with_nodekey_src",
+			m: &Ping{
+				TxID:    [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+				NodeKey: key.NodePublicFromRaw32(mem.B([]byte{1: 1, 2: 2, 30: 30, 31: 31})),
+			},
+			want: "01 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 00 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f",
 		},
 		{
 			name: "pong",

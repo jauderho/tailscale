@@ -13,10 +13,15 @@ import (
 	"strings"
 	"testing"
 
+	qt "github.com/frankban/quicktest"
+	"github.com/google/go-cmp/cmp"
 	"inet.af/netaddr"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tstest"
+	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
+	"tailscale.com/version/distro"
 )
 
 // geese is a collection of gooses. It need not be complete.
@@ -54,6 +59,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 		curExitNodeIP netaddr.IP
 		curUser       string // os.Getenv("USER") on the client side
 		goos          string // empty means "linux"
+		distro        distro.Distro
 
 		want string
 	}{
@@ -310,6 +316,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				ControlURL:       ipn.DefaultControlURL,
 				AllowSingleHosts: true,
 				CorpDNS:          true,
+				RouteAll:         true,
 
 				// And assume this no-op accidental pre-1.8 value:
 				NoSNAT: true,
@@ -326,7 +333,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 
 				NetfilterMode: preftype.NetfilterNoDivert, // we never had this bug, but pretend it got set non-zero on Windows somehow
 			},
-			goos: "windows",
+			goos: "openbsd",
 			want: "", // not an error
 		},
 		{
@@ -373,7 +380,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 
 				Hostname: "foo",
 			},
-			want: accidentalUpPrefix + " --authkey=secretrand --force-reauth=false --reset --hostname=foo",
+			want: accidentalUpPrefix + " --auth-key=secretrand --force-reauth=false --reset --hostname=foo",
 		},
 		{
 			name:  "error_exit_node_omit_with_ip_pref",
@@ -403,6 +410,21 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			want: accidentalUpPrefix + " --hostname=foo --exit-node=100.64.5.7",
 		},
 		{
+			name:          "error_exit_node_and_allow_lan_omit_with_id_pref", // Isue 3480
+			flags:         []string{"--hostname=foo"},
+			curExitNodeIP: netaddr.MustParseIP("100.2.3.4"),
+			curPrefs: &ipn.Prefs{
+				ControlURL:       ipn.DefaultControlURL,
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+
+				ExitNodeAllowLANAccess: true,
+				ExitNodeID:             "some_stable_id",
+			},
+			want: accidentalUpPrefix + " --hostname=foo --exit-node-allow-lan-access --exit-node=100.2.3.4",
+		},
+		{
 			name:  "ignore_login_server_synonym",
 			flags: []string{"--login-server=https://controlplane.tailscale.com"},
 			curPrefs: &ipn.Prefs{
@@ -424,6 +446,38 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			},
 			want: accidentalUpPrefix + " --netfilter-mode=off --accept-dns=false",
 		},
+		{
+			// Issue 3176: on Synology, don't require --accept-routes=false because user
+			// migth've had old an install, and we don't support --accept-routes anyway.
+			name:  "synology_permit_omit_accept_routes",
+			flags: []string{"--hostname=foo"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				CorpDNS:          true,
+				AllowSingleHosts: true,
+				RouteAll:         true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			goos:   "linux",
+			distro: distro.Synology,
+			want:   "",
+		},
+		{
+			// Same test case as "synology_permit_omit_accept_routes" above, but
+			// on non-Synology distro.
+			name:  "not_synology_dont_permit_omit_accept_routes",
+			flags: []string{"--hostname=foo"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				CorpDNS:          true,
+				AllowSingleHosts: true,
+				RouteAll:         true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			goos:   "linux",
+			distro: "", // not Synology
+			want:   accidentalUpPrefix + " --hostname=foo --accept-routes",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -433,16 +487,19 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			}
 			var upArgs upArgsT
 			flagSet := newUpFlagSet(goos, &upArgs)
-			flagSet.Parse(tt.flags)
+			flags := CleanUpArgs(tt.flags)
+			flagSet.Parse(flags)
 			newPrefs, err := prefsFromUpArgs(upArgs, t.Logf, new(ipnstate.Status), goos)
 			if err != nil {
 				t.Fatal(err)
 			}
 			applyImplicitPrefs(newPrefs, tt.curPrefs, tt.curUser)
 			var got string
-			if err := checkForAccidentalSettingReverts(flagSet, tt.curPrefs, newPrefs, upCheckEnv{
+			if err := checkForAccidentalSettingReverts(newPrefs, tt.curPrefs, upCheckEnv{
 				goos:          goos,
+				flagSet:       flagSet,
 				curExitNodeIP: tt.curExitNodeIP,
+				distro:        tt.distro,
 			}); err != nil {
 				got = err.Error()
 			}
@@ -491,6 +548,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 				WantRunning:      true,
 				CorpDNS:          true,
 				AllowSingleHosts: true,
+				RouteAll:         true,
 				NetfilterMode:    preftype.NetfilterOn,
 			},
 		},
@@ -528,7 +586,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			args: upArgsT{
 				exitNodeIP: "foo",
 			},
-			wantErr: `invalid IP address "foo" for --exit-node: ParseIP("foo"): unable to parse IP`,
+			wantErr: `invalid value "foo" for --exit-node; must be IP or unique node name`,
 		},
 		{
 			name: "error_exit_node_allow_lan_without_exit_node",
@@ -573,7 +631,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			st: &ipnstate.Status{
 				TailscaleIPs: []netaddr.IP{netaddr.MustParseIP("100.105.106.107")},
 			},
-			wantErr: `cannot use 100.105.106.107 as the exit node as it is a local IP address to this machine, did you mean --advertise-exit-node?`,
+			wantErr: `cannot use 100.105.106.107 as an exit node as it is a local IP address to this machine; did you mean --advertise-exit-node?`,
 		},
 		{
 			name: "warn_linux_netfilter_nodivert",
@@ -604,10 +662,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var warnBuf bytes.Buffer
-			warnf := func(format string, a ...interface{}) {
-				fmt.Fprintf(&warnBuf, format, a...)
-			}
+			var warnBuf tstest.MemLogger
 			goos := tt.goos
 			if goos == "" {
 				goos = "linux"
@@ -616,7 +671,7 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			if st == nil {
 				st = new(ipnstate.Status)
 			}
-			got, err := prefsFromUpArgs(tt.args, warnf, st, goos)
+			got, err := prefsFromUpArgs(tt.args, warnBuf.Logf, st, goos)
 			gotErr := fmt.Sprint(err)
 			if tt.wantErr != "" {
 				if tt.wantErr != gotErr {
@@ -686,5 +741,183 @@ func TestFlagAppliesToOS(t *testing.T) {
 				t.Errorf("flagAppliesToOS(%q, %q) = false but found in %s set", f.Name, goos, goos)
 			}
 		})
+	}
+}
+
+func TestUpdatePrefs(t *testing.T) {
+	tests := []struct {
+		name     string
+		flags    []string // argv to be parsed into env.flagSet and env.upArgs
+		curPrefs *ipn.Prefs
+		env      upCheckEnv // empty goos means "linux"
+
+		wantSimpleUp   bool
+		wantJustEditMP *ipn.MaskedPrefs
+		wantErrSubtr   string
+	}{
+		{
+			name:  "bare_up_means_up",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				ControlURL:  ipn.DefaultControlURL,
+				WantRunning: false,
+				Hostname:    "foo",
+			},
+		},
+		{
+			name:  "just_up",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				ControlURL: ipn.DefaultControlURL,
+				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+			},
+			env: upCheckEnv{
+				backendState: "Stopped",
+			},
+			wantSimpleUp: true,
+		},
+		{
+			name:  "just_edit",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				ControlURL: ipn.DefaultControlURL,
+				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+			},
+			env:            upCheckEnv{backendState: "Running"},
+			wantSimpleUp:   true,
+			wantJustEditMP: &ipn.MaskedPrefs{WantRunningSet: true},
+		},
+		{
+			name:  "just_edit_reset",
+			flags: []string{"--reset"},
+			curPrefs: &ipn.Prefs{
+				ControlURL: ipn.DefaultControlURL,
+				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+			},
+			env: upCheckEnv{backendState: "Running"},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				AdvertiseRoutesSet:        true,
+				AdvertiseTagsSet:          true,
+				AllowSingleHostsSet:       true,
+				ControlURLSet:             true,
+				CorpDNSSet:                true,
+				ExitNodeAllowLANAccessSet: true,
+				ExitNodeIDSet:             true,
+				ExitNodeIPSet:             true,
+				HostnameSet:               true,
+				NetfilterModeSet:          true,
+				NoSNATSet:                 true,
+				OperatorUserSet:           true,
+				RouteAllSet:               true,
+				RunSSHSet:                 true,
+				ShieldsUpSet:              true,
+				WantRunningSet:            true,
+			},
+		},
+		{
+			name:  "control_synonym",
+			flags: []string{},
+			curPrefs: &ipn.Prefs{
+				ControlURL: "https://login.tailscale.com",
+				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+			},
+			env:            upCheckEnv{backendState: "Running"},
+			wantSimpleUp:   true,
+			wantJustEditMP: &ipn.MaskedPrefs{WantRunningSet: true},
+		},
+		{
+			name:  "change_login_server",
+			flags: []string{"--login-server=https://localhost:1000"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			env:            upCheckEnv{backendState: "Running"},
+			wantSimpleUp:   true,
+			wantJustEditMP: &ipn.MaskedPrefs{WantRunningSet: true},
+			wantErrSubtr:   "can't change --login-server without --force-reauth",
+		},
+		{
+			name:  "change_tags",
+			flags: []string{"--advertise-tags=tag:foo"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			env: upCheckEnv{backendState: "Running"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.env.goos == "" {
+				tt.env.goos = "linux"
+			}
+			tt.env.flagSet = newUpFlagSet(tt.env.goos, &tt.env.upArgs)
+			flags := CleanUpArgs(tt.flags)
+			tt.env.flagSet.Parse(flags)
+
+			newPrefs, err := prefsFromUpArgs(tt.env.upArgs, t.Logf, new(ipnstate.Status), tt.env.goos)
+			if err != nil {
+				t.Fatal(err)
+			}
+			simpleUp, justEditMP, err := updatePrefs(newPrefs, tt.curPrefs, tt.env)
+			if err != nil {
+				if tt.wantErrSubtr != "" {
+					if !strings.Contains(err.Error(), tt.wantErrSubtr) {
+						t.Fatalf("want error %q, got: %v", tt.wantErrSubtr, err)
+					}
+					return
+				}
+				t.Fatal(err)
+			}
+			if simpleUp != tt.wantSimpleUp {
+				t.Fatalf("simpleUp=%v, want %v", simpleUp, tt.wantSimpleUp)
+			}
+			var oldEditPrefs ipn.Prefs
+			if justEditMP != nil {
+				oldEditPrefs = justEditMP.Prefs
+				justEditMP.Prefs = ipn.Prefs{} // uninteresting
+			}
+			if !reflect.DeepEqual(justEditMP, tt.wantJustEditMP) {
+				t.Logf("justEditMP != wantJustEditMP; following diff omits the Prefs field, which was %+v", oldEditPrefs)
+				t.Fatalf("justEditMP: %v\n\n: ", cmp.Diff(justEditMP, tt.wantJustEditMP, cmpIP))
+			}
+		})
+	}
+}
+
+var cmpIP = cmp.Comparer(func(a, b netaddr.IP) bool {
+	return a == b
+})
+
+func TestCleanUpArgs(t *testing.T) {
+	c := qt.New(t)
+	tests := []struct {
+		in   []string
+		want []string
+	}{
+		{in: []string{"something"}, want: []string{"something"}},
+		{in: []string{}, want: []string{}},
+		{in: []string{"--authkey=0"}, want: []string{"--auth-key=0"}},
+		{in: []string{"a", "--authkey=1", "b"}, want: []string{"a", "--auth-key=1", "b"}},
+		{in: []string{"a", "--auth-key=2", "b"}, want: []string{"a", "--auth-key=2", "b"}},
+		{in: []string{"a", "-authkey=3", "b"}, want: []string{"a", "--auth-key=3", "b"}},
+		{in: []string{"a", "-auth-key=4", "b"}, want: []string{"a", "-auth-key=4", "b"}},
+		{in: []string{"a", "--authkey", "5", "b"}, want: []string{"a", "--auth-key", "5", "b"}},
+		{in: []string{"a", "-authkey", "6", "b"}, want: []string{"a", "--auth-key", "6", "b"}},
+		{in: []string{"a", "authkey", "7", "b"}, want: []string{"a", "authkey", "7", "b"}},
+		{in: []string{"--authkeyexpiry", "8"}, want: []string{"--authkeyexpiry", "8"}},
+		{in: []string{"--auth-key-expiry", "9"}, want: []string{"--auth-key-expiry", "9"}},
+	}
+
+	for _, tt := range tests {
+		got := CleanUpArgs(tt.in)
+		c.Assert(got, qt.DeepEquals, tt.want)
 	}
 }

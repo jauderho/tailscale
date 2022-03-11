@@ -31,7 +31,7 @@ require (
 	github.com/mdlayher/genetlink v1.2.0
 	github.com/mdlayher/netlink v1.6.0
 	github.com/mdlayher/sdnotify v0.0.0-20210228150836-ea3ec207d697
-	github.com/miekg/dns v1.1.43
+	github.com/miekg/dns v1.1.46
 	github.com/mitchellh/go-ps v1.0.0
 	github.com/pborman/getopt v1.1.0
 	github.com/peterbourgon/ff/v3 v3.1.2

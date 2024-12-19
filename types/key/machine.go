@@ -1,10 +1,10 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/hex"
 
@@ -67,9 +67,14 @@ func (k MachinePrivate) Public() MachinePublic {
 	return ret
 }
 
+// AppendText implements encoding.TextAppender.
+func (k MachinePrivate) AppendText(b []byte) ([]byte, error) {
+	return appendHexKey(b, machinePrivateHexPrefix, k.k[:]), nil
+}
+
 // MarshalText implements encoding.TextMarshaler.
 func (k MachinePrivate) MarshalText() ([]byte, error) {
-	return toHex(k.k[:], machinePrivateHexPrefix), nil
+	return k.AppendText(nil)
 }
 
 // MarshalText implements encoding.TextUnmarshaler.
@@ -87,7 +92,7 @@ func (k *MachinePrivate) UnmarshalText(b []byte) error {
 // specific raw byte serialization, please use
 // MarshalText/UnmarshalText.
 func (k MachinePrivate) UntypedBytes() []byte {
-	return append([]byte(nil), k.k[:]...)
+	return bytes.Clone(k.k[:])
 }
 
 // SealTo wraps cleartext into a NaCl box (see
@@ -103,6 +108,48 @@ func (k MachinePrivate) SealTo(p MachinePublic, cleartext []byte) (ciphertext []
 	var nonce [24]byte
 	rand(nonce[:])
 	return box.Seal(nonce[:], cleartext, &nonce, &p.k, &k.k)
+}
+
+// SharedKey returns the precomputed Nacl box shared key between k and p.
+func (k MachinePrivate) SharedKey(p MachinePublic) MachinePrecomputedSharedKey {
+	var shared MachinePrecomputedSharedKey
+	box.Precompute(&shared.k, &p.k, &k.k)
+	return shared
+}
+
+// MachinePrecomputedSharedKey is a precomputed shared NaCl box shared key.
+type MachinePrecomputedSharedKey struct {
+	k [32]byte
+}
+
+// Seal wraps cleartext into a NaCl box (see
+// golang.org/x/crypto/nacl) using the shared key k as generated
+// by MachinePrivate.SharedKey.
+//
+// The returned ciphertext is a 24-byte nonce concatenated with the
+// box value.
+func (k MachinePrecomputedSharedKey) Seal(cleartext []byte) (ciphertext []byte) {
+	if k == (MachinePrecomputedSharedKey{}) {
+		panic("can't seal with zero keys")
+	}
+	var nonce [24]byte
+	rand(nonce[:])
+	return box.SealAfterPrecomputation(nonce[:], cleartext, &nonce, &k.k)
+}
+
+// Open opens the NaCl box ciphertext, which must be a value created by
+// MachinePrecomputedSharedKey.Seal or MachinePrivate.SealTo, and returns the
+// inner cleartext if ciphertext is a valid box for the shared key k.
+func (k MachinePrecomputedSharedKey) Open(ciphertext []byte) (cleartext []byte, ok bool) {
+	if k == (MachinePrecomputedSharedKey{}) {
+		panic("can't open with zero keys")
+	}
+	if len(ciphertext) < 24 {
+		return nil, false
+	}
+	var nonce [24]byte
+	copy(nonce[:], ciphertext)
+	return box.OpenAfterPrecomputation(nil, ciphertext[len(nonce):], &nonce, &k.k)
 }
 
 // OpenFrom opens the NaCl box ciphertext, which must be a value
@@ -189,7 +236,7 @@ func (k MachinePublic) UntypedHexString() string {
 // specific raw byte serialization, please use
 // MarshalText/UnmarshalText.
 func (k MachinePublic) UntypedBytes() []byte {
-	return append([]byte(nil), k.k[:]...)
+	return bytes.Clone(k.k[:])
 }
 
 // String returns the output of MarshalText as a string.
@@ -201,9 +248,14 @@ func (k MachinePublic) String() string {
 	return string(bs)
 }
 
+// AppendText implements encoding.TextAppender.
+func (k MachinePublic) AppendText(b []byte) ([]byte, error) {
+	return appendHexKey(b, machinePublicHexPrefix, k.k[:]), nil
+}
+
 // MarshalText implements encoding.TextMarshaler.
 func (k MachinePublic) MarshalText() ([]byte, error) {
-	return toHex(k.k[:], machinePublicHexPrefix), nil
+	return k.AppendText(nil)
 }
 
 // MarshalText implements encoding.TextUnmarshaler.

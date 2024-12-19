@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -10,12 +9,11 @@ import (
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/client/tailscale"
 )
 
 var logoutCmd = &ffcli.Command{
 	Name:       "logout",
-	ShortUsage: "logout [flags]",
+	ShortUsage: "tailscale logout",
 	ShortHelp:  "Disconnect from Tailscale and expire current node key",
 
 	LongHelp: strings.TrimSpace(`
@@ -30,5 +28,5 @@ func runLogout(ctx context.Context, args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
-	return tailscale.Logout(ctx)
+	return localClient.Logout(ctx)
 }

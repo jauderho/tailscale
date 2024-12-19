@@ -1,19 +1,20 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
 import (
 	"bytes"
 	"encoding/hex"
+	"net/netip"
 	"reflect"
-	"regexp"
+	"strings"
 	"testing"
+	"unicode"
 
-	"inet.af/netaddr"
 	"tailscale.com/tstest"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/util/must"
 )
 
 const (
@@ -28,8 +29,8 @@ const (
 	Fragment = ipproto.Fragment
 )
 
-func mustIPPort(s string) netaddr.IPPort {
-	ipp, err := netaddr.ParseIPPort(s)
+func mustIPPort(s string) netip.AddrPort {
+	ipp, err := netip.ParseAddrPort(s)
 	if err != nil {
 		panic(err)
 	}
@@ -39,9 +40,9 @@ func mustIPPort(s string) netaddr.IPPort {
 var icmp4RequestBuffer = []byte{
 	// IP header up to checksum
 	0x45, 0x00, 0x00, 0x27, 0xde, 0xad, 0x00, 0x00, 0x40, 0x01, 0x8c, 0x15,
-	// source ip
+	// source IP
 	0x01, 0x02, 0x03, 0x04,
-	// destination ip
+	// destination IP
 	0x05, 0x06, 0x07, 0x08,
 	// ICMP header
 	0x08, 0x00, 0x7d, 0x22,
@@ -63,26 +64,14 @@ var icmp4RequestDecode = Parsed{
 
 var icmp4ReplyBuffer = []byte{
 	0x45, 0x00, 0x00, 0x25, 0x21, 0x52, 0x00, 0x00, 0x40, 0x01, 0x49, 0x73,
-	// source ip
+	// source IP
 	0x05, 0x06, 0x07, 0x08,
-	// destination ip
+	// destination IP
 	0x01, 0x02, 0x03, 0x04,
 	// ICMP header
 	0x00, 0x00, 0xe6, 0x9e,
 	// "reply_payload"
 	0x72, 0x65, 0x70, 0x6c, 0x79, 0x5f, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64,
-}
-
-var icmp4ReplyDecode = Parsed{
-	b:       icmp4ReplyBuffer,
-	subofs:  20,
-	dataofs: 24,
-	length:  len(icmp4ReplyBuffer),
-
-	IPVersion: 4,
-	IPProto:   ICMPv4,
-	Src:       mustIPPort("1.2.3.4:0"),
-	Dst:       mustIPPort("5.6.7.8:0"),
 }
 
 // ICMPv6 Router Solicitation
@@ -121,9 +110,9 @@ var unknownPacketDecode = Parsed{
 var tcp4PacketBuffer = []byte{
 	// IP header up to checksum
 	0x45, 0x00, 0x00, 0x37, 0xde, 0xad, 0x00, 0x00, 0x40, 0x06, 0x49, 0x5f,
-	// source ip
+	// source IP
 	0x01, 0x02, 0x03, 0x04,
-	// destination ip
+	// destination IP
 	0x05, 0x06, 0x07, 0x08,
 	// TCP header with SYN, ACK set
 	0x00, 0x7b, 0x02, 0x37, 0x00, 0x00, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00,
@@ -174,9 +163,9 @@ var tcp6RequestDecode = Parsed{
 var udp4RequestBuffer = []byte{
 	// IP header up to checksum
 	0x45, 0x00, 0x00, 0x2b, 0xde, 0xad, 0x00, 0x00, 0x40, 0x11, 0x8c, 0x01,
-	// source ip
+	// source IP
 	0x01, 0x02, 0x03, 0x04,
-	// destination ip
+	// destination IP
 	0x05, 0x06, 0x07, 0x08,
 	// UDP header
 	0x00, 0x7b, 0x02, 0x37, 0x00, 0x17, 0x72, 0x1d,
@@ -199,9 +188,9 @@ var udp4RequestDecode = Parsed{
 var invalid4RequestBuffer = []byte{
 	// IP header up to checksum. IHL field points beyond end of packet.
 	0x4a, 0x00, 0x00, 0x14, 0xde, 0xad, 0x00, 0x00, 0x40, 0x11, 0x8c, 0x01,
-	// source ip
+	// source IP
 	0x01, 0x02, 0x03, 0x04,
-	// destination ip
+	// destination IP
 	0x05, 0x06, 0x07, 0x08,
 }
 
@@ -246,9 +235,9 @@ var udp6RequestDecode = Parsed{
 var udp4ReplyBuffer = []byte{
 	// IP header up to checksum
 	0x45, 0x00, 0x00, 0x29, 0x21, 0x52, 0x00, 0x00, 0x40, 0x11, 0x49, 0x5f,
-	// source ip
+	// source IP
 	0x05, 0x06, 0x07, 0x08,
-	// destination ip
+	// destination IP
 	0x01, 0x02, 0x03, 0x04,
 	// UDP header
 	0x02, 0x37, 0x00, 0x7b, 0x00, 0x15, 0xd3, 0x9d,
@@ -256,15 +245,57 @@ var udp4ReplyBuffer = []byte{
 	0x72, 0x65, 0x70, 0x6c, 0x79, 0x5f, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64,
 }
 
-var udp4ReplyDecode = Parsed{
-	b:       udp4ReplyBuffer,
-	subofs:  20,
-	dataofs: 28,
-	length:  len(udp4ReplyBuffer),
+// First TCP fragment of a packet with leading 24 bytes of 'a's
+var tcp4MediumFragmentBuffer = []byte{
+	// IP header up to checksum
+	0x45, 0x20, 0x00, 0x4c, 0x2c, 0x62, 0x20, 0x00, 0x22, 0x06, 0x3a, 0x0f,
+	// source IP
+	0x01, 0x02, 0x03, 0x04,
+	// destination IP
+	0x05, 0x06, 0x07, 0x08,
+	// TCP header
+	0x00, 0x50, 0xf3, 0x8c, 0x58, 0xad, 0x60, 0x94, 0x25, 0xe4, 0x23, 0xa8, 0x80,
+	0x10, 0x01, 0xfd, 0xc6, 0x6e, 0x00, 0x00, 0x01, 0x01, 0x08, 0x0a, 0xff, 0x60,
+	0xfb, 0xfe, 0xba, 0x31, 0x78, 0x6a,
+	// data
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+}
 
-	IPProto: UDP,
-	Src:     mustIPPort("1.2.3.4:567"),
-	Dst:     mustIPPort("5.6.7.8:123"),
+var tcp4MediumFragmentDecode = Parsed{
+	b:       tcp4MediumFragmentBuffer,
+	subofs:  20,
+	dataofs: 52,
+	length:  len(tcp4MediumFragmentBuffer),
+
+	IPVersion: 4,
+	IPProto:   TCP,
+	Src:       mustIPPort("1.2.3.4:80"),
+	Dst:       mustIPPort("5.6.7.8:62348"),
+	TCPFlags:  0x10,
+}
+
+var tcp4ShortFragmentBuffer = []byte{
+	// IP header up to checksum
+	0x45, 0x20, 0x00, 0x1e, 0x2c, 0x62, 0x20, 0x00, 0x22, 0x06, 0x3c, 0x4f,
+	// source IP
+	0x01, 0x02, 0x03, 0x04,
+	// destination IP
+	0x05, 0x06, 0x07, 0x08,
+	// partial TCP header
+	0x00, 0x50, 0xf3, 0x8c, 0x58, 0xad, 0x60, 0x94, 0x00, 0x00,
+}
+
+var tcp4ShortFragmentDecode = Parsed{
+	b:       tcp4ShortFragmentBuffer,
+	subofs:  20,
+	dataofs: 0,
+	length:  len(tcp4ShortFragmentBuffer),
+	// short fragments are rejected (marked unknown) to avoid header attacks as described in RFC 1858
+	IPProto:   ipproto.Unknown,
+	IPVersion: 4,
+	Src:       mustIPPort("1.2.3.4:0"),
+	Dst:       mustIPPort("5.6.7.8:0"),
 }
 
 var igmpPacketBuffer = []byte{
@@ -389,6 +420,17 @@ func TestParsedString(t *testing.T) {
 	}
 }
 
+// mustHexDecode is like hex.DecodeString, but panics on error
+// and ignores whitespace in s.
+func mustHexDecode(s string) []byte {
+	return must.Get(hex.DecodeString(strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)))
+}
+
 func TestDecode(t *testing.T) {
 	tests := []struct {
 		name string
@@ -406,6 +448,31 @@ func TestDecode(t *testing.T) {
 		{"invalid4", invalid4RequestBuffer, invalid4RequestDecode},
 		{"ipv4_tsmp", ipv4TSMPBuffer, ipv4TSMPDecode},
 		{"ipv4_sctp", sctpBuffer, sctpDecode},
+		{"ipv4_frag", tcp4MediumFragmentBuffer, tcp4MediumFragmentDecode},
+		{"ipv4_fragtooshort", tcp4ShortFragmentBuffer, tcp4ShortFragmentDecode},
+
+		{"ip97", mustHexDecode("4500 0019 d186 4000 4061 751d 644a 4603 6449 e549 6865 6c6c 6f"), Parsed{
+			IPVersion: 4,
+			IPProto:   97,
+			Src:       netip.MustParseAddrPort("100.74.70.3:0"),
+			Dst:       netip.MustParseAddrPort("100.73.229.73:0"),
+			b:         mustHexDecode("4500 0019 d186 4000 4061 751d 644a 4603 6449 e549 6865 6c6c 6f"),
+			length:    25,
+			subofs:    20,
+		}},
+
+		// This packet purports to use protocol 0xFF, which is verboten and
+		// used internally as a sentinel value for fragments. So test that
+		// we map packets using 0xFF to Unknown (0) instead.
+		{"bogus_proto_ff", mustHexDecode("4500 0019 d186 4000 40" + "FF" /* bogus FF */ + " 751d 644a 4603 6449 e549 6865 6c6c 6f"), Parsed{
+			IPVersion: 4,
+			IPProto:   ipproto.Unknown, // 0, not bogus 0xFF
+			Src:       netip.MustParseAddrPort("100.74.70.3:0"),
+			Dst:       netip.MustParseAddrPort("100.73.229.73:0"),
+			b:         mustHexDecode("4500 0019 d186 4000 40" + "FF" /* bogus FF */ + " 751d 644a 4603 6449 e549 6865 6c6c 6f"),
+			length:    25,
+			subofs:    20,
+		}},
 	}
 
 	for _, tt := range tests {
@@ -445,7 +512,7 @@ func BenchmarkDecode(b *testing.B) {
 	for _, bench := range benches {
 		b.Run(bench.name, func(b *testing.B) {
 			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				var p Parsed
 				p.Decode(bench.buf)
 			}
@@ -557,63 +624,9 @@ func BenchmarkString(b *testing.B) {
 			var p Parsed
 			p.Decode(bench.buf)
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				sinkString = p.String()
 			}
 		})
 	}
-}
-
-func TestRemoveECNBits(t *testing.T) {
-	// withECNHex is a TCP SYN packet with ECN bits set in the TCP
-	// header as captured by Wireshark on macOS against the
-	// Tailscale interface. In this packet (because it's a SYN
-	// control packet), the ECN bits are not set in the IP header.
-	const withECNHex = `45 00 00 40 00 00 40 00
- 40 06 0c 66 64 7b 65 28 64 7f 00 30 f1 ab 00 16
- 5a 7a 63 e8 00 00 00 00 b0 c2 ff ff 97 76 00 00
- 02 04 04 d8 01 03 03 06 01 01 08 0a 03 e1 bd 49
- 00 00 00 00 04 02 00 00`
-
-	// Generated by hand-editing a pcap file in hexl-mode to set
-	// the TCP flags to just SYN (0x02), then loading that pcap
-	// file in wireshark to get the expected checksum value, then
-	// putting that checksum value (0x9836) in the file.
-	const wantStrippedHex = `45 00 00 40 00 00 40 00
- 40 06 0c 66 64 7b 65 28 64 7f 00 30 f1 ab 00 16
- 5a 7a 63 e8 00 00 00 00 b0 02 ff ff 98 36 00 00
- 02 04 04 d8 01 03 03 06 01 01 08 0a 03 e1 bd 49
- 00 00 00 00 04 02 00 00`
-
-	var p Parsed
-	pktBuf := bytesOfHex(withECNHex)
-	p.Decode(pktBuf)
-	if want := TCPCWR | TCPECNEcho | TCPSyn; p.TCPFlags != want {
-		t.Fatalf("pre flags = %v; want %v", p.TCPFlags, want)
-	}
-
-	if !p.RemoveECNBits() {
-		t.Fatal("didn't remove bits")
-	}
-	if want := TCPSyn; p.TCPFlags != want {
-		t.Fatalf("post flags = %v; want %v", p.TCPFlags, want)
-	}
-	wantPkt := bytesOfHex(wantStrippedHex)
-	if !bytes.Equal(pktBuf, wantPkt) {
-		t.Fatalf("wrong result.\n got: % 2x\nwant: % 2x\n", pktBuf, wantPkt)
-	}
-
-	if p.RemoveECNBits() {
-		t.Fatal("unexpected true return value on second call")
-	}
-}
-
-var nonHex = regexp.MustCompile(`[^0-9a-fA-F]+`)
-
-func bytesOfHex(s string) []byte {
-	b, err := hex.DecodeString(nonHex.ReplaceAllString(s, ""))
-	if err != nil {
-		panic(err)
-	}
-	return b
 }

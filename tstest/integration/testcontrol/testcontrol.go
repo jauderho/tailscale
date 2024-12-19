@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package testcontrol contains a minimal control plane server for testing purposes.
 package testcontrol
@@ -8,31 +7,37 @@ package testcontrol
 import (
 	"bytes"
 	"context"
-	crand "crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
-	"math/rand"
+	"maps"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
-	"go4.org/mem"
-	"inet.af/netaddr"
+	"golang.org/x/net/http2"
+	"tailscale.com/control/controlhttp/controlhttpserver"
+	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/ptr"
+	"tailscale.com/util/mak"
+	"tailscale.com/util/must"
+	"tailscale.com/util/rands"
+	"tailscale.com/util/set"
+	"tailscale.com/util/zstdframe"
 )
 
 const msgLimit = 1 << 20 // encrypted message length limit
@@ -40,11 +45,14 @@ const msgLimit = 1 << 20 // encrypted message length limit
 // Server is a control plane server. Its zero value is ready for use.
 // Everything is stored in-memory in one tailnet.
 type Server struct {
-	Logf        logger.Logf      // nil means to use the log package
-	DERPMap     *tailcfg.DERPMap // nil means to use prod DERP map
-	RequireAuth bool
-	Verbose     bool
-	DNSConfig   *tailcfg.DNSConfig // nil means no DNS config
+	Logf           logger.Logf      // nil means to use the log package
+	DERPMap        *tailcfg.DERPMap // nil means to use prod DERP map
+	RequireAuth    bool
+	RequireAuthKey string // required authkey for all nodes
+	Verbose        bool
+	DNSConfig      *tailcfg.DNSConfig // nil means no DNS config
+	MagicDNSDomain string
+	HandleC2N      http.Handler // if non-nil, used for /some-c2n-path/ in tests
 
 	// ExplicitBaseURL or HTTPTestServer must be set.
 	ExplicitBaseURL string           // e.g. "http://127.0.0.1:1234" with no trailing URL
@@ -59,8 +67,28 @@ type Server struct {
 	pubKey     key.MachinePublic
 	privKey    key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
 
+	// nodeSubnetRoutes is a list of subnet routes that are served
+	// by the specified node.
+	nodeSubnetRoutes map[key.NodePublic][]netip.Prefix
+
+	// peerIsJailed is the set of peers that are jailed for a node.
+	peerIsJailed map[key.NodePublic]map[key.NodePublic]bool // node => peer => isJailed
+
+	// masquerades is the set of masquerades that should be applied to
+	// MapResponses sent to clients. It is keyed by the requesting nodes
+	// public key, and then the peer node's public key. The value is the
+	// masquerade address to use for that peer.
+	masquerades map[key.NodePublic]map[key.NodePublic]netip.Addr // node => peer => SelfNodeV{4,6}MasqAddrForThisPeer IP
+
+	// nodeCapMaps overrides the capability map sent down to a client.
+	nodeCapMaps map[key.NodePublic]tailcfg.NodeCapMap
+
+	// suppressAutoMapResponses is the set of nodes that should not be sent
+	// automatic map responses from serveMap. (They should only get manually sent ones)
+	suppressAutoMapResponses set.Set[key.NodePublic]
+
 	noisePubKey  key.MachinePublic
-	noisePrivKey key.ControlPrivate // not strictly needed vs. MachinePrivate, but handy to test type interactions.
+	noisePrivKey key.MachinePrivate
 
 	nodes         map[key.NodePublic]*tailcfg.Node
 	users         map[key.NodePublic]*tailcfg.User
@@ -68,8 +96,8 @@ type Server struct {
 	updates       map[tailcfg.NodeID]chan updateType
 	authPath      map[string]*AuthPath
 	nodeKeyAuthed map[key.NodePublic]bool // key => true once authenticated
-	pingReqsToAdd map[key.NodePublic]*tailcfg.PingRequest
-	allExpired    bool // All nodes will be told their node key is expired.
+	msgToSend     map[key.NodePublic]any  // value is *tailcfg.PingRequest or entire *tailcfg.MapResponse
+	allExpired    bool                    // All nodes will be told their node key is expired.
 }
 
 // BaseURL returns the server's base URL, without trailing slash.
@@ -138,13 +166,32 @@ func (s *Server) AwaitNodeInMapRequest(ctx context.Context, k key.NodePublic) er
 	}
 }
 
-// AddPingRequest sends the ping pr to nodeKeyDst. It reports whether it did so. That is,
-// it reports whether nodeKeyDst was connected.
+// AddPingRequest sends the ping pr to nodeKeyDst.
+//
+// It reports whether the message was enqueued. That is, it reports whether
+// nodeKeyDst was connected.
 func (s *Server) AddPingRequest(nodeKeyDst key.NodePublic, pr *tailcfg.PingRequest) bool {
+	return s.addDebugMessage(nodeKeyDst, pr)
+}
+
+// AddRawMapResponse delivers the raw MapResponse mr to nodeKeyDst. It's meant
+// for testing incremental map updates.
+//
+// Once AddRawMapResponse has been sent to a node, all future automatic
+// MapResponses to that node will be suppressed and only explicit MapResponses
+// injected via AddRawMapResponse will be sent.
+//
+// It reports whether the message was enqueued. That is, it reports whether
+// nodeKeyDst was connected.
+func (s *Server) AddRawMapResponse(nodeKeyDst key.NodePublic, mr *tailcfg.MapResponse) bool {
+	return s.addDebugMessage(nodeKeyDst, mr)
+}
+
+func (s *Server) addDebugMessage(nodeKeyDst key.NodePublic, msg any) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.pingReqsToAdd == nil {
-		s.pingReqsToAdd = map[key.NodePublic]*tailcfg.PingRequest{}
+	if s.msgToSend == nil {
+		s.msgToSend = map[key.NodePublic]any{}
 	}
 	// Now send the update to the channel
 	node := s.nodeLocked(nodeKeyDst)
@@ -152,7 +199,14 @@ func (s *Server) AddPingRequest(nodeKeyDst key.NodePublic, pr *tailcfg.PingReque
 		return false
 	}
 
-	s.pingReqsToAdd[nodeKeyDst] = pr
+	if _, ok := msg.(*tailcfg.MapResponse); ok {
+		if s.suppressAutoMapResponses == nil {
+			s.suppressAutoMapResponses = set.Set[key.NodePublic]{}
+		}
+		s.suppressAutoMapResponses.Add(nodeKeyDst)
+	}
+
+	s.msgToSend[nodeKeyDst] = msg
 	nodeID := node.ID
 	oldUpdatesCh := s.updates[nodeID]
 	return sendUpdate(oldUpdatesCh, updateDebugInjection)
@@ -189,7 +243,7 @@ func (ap *AuthPath) CompleteSuccessfully() {
 	ap.closeOnce.Do(ap.completeSuccessfully)
 }
 
-func (s *Server) logf(format string, a ...interface{}) {
+func (s *Server) logf(format string, a ...any) {
 	if s.Logf != nil {
 		s.Logf(format, a...)
 	} else {
@@ -200,8 +254,15 @@ func (s *Server) logf(format string, a ...interface{}) {
 func (s *Server) initMux() {
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/", s.serveUnhandled)
+	s.mux.HandleFunc("/generate_204", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	s.mux.HandleFunc("/key", s.serveKey)
 	s.mux.HandleFunc("/machine/", s.serveMachine)
+	s.mux.HandleFunc("/ts2021", s.serveNoiseUpgrade)
+	if s.HandleC2N != nil {
+		s.mux.Handle("/some-c2n-path/", s.HandleC2N)
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -215,6 +276,36 @@ func (s *Server) serveUnhandled(w http.ResponseWriter, r *http.Request) {
 	go panic(fmt.Sprintf("testcontrol.Server received unhandled request: %s", got.Bytes()))
 }
 
+type peerMachinePublicContextKey struct{}
+
+func (s *Server) serveNoiseUpgrade(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if r.Method != "POST" {
+		http.Error(w, "POST required", 400)
+		return
+	}
+
+	s.mu.Lock()
+	noisePrivate := s.noisePrivKey
+	s.mu.Unlock()
+	cc, err := controlhttpserver.AcceptHTTP(ctx, w, r, noisePrivate, nil)
+	if err != nil {
+		log.Printf("AcceptHTTP: %v", err)
+		return
+	}
+	defer cc.Close()
+
+	var h2srv http2.Server
+	peerPub := cc.Peer()
+
+	h2srv.ServeConn(cc, &http2.ServeConnOpts{
+		Context: context.WithValue(ctx, peerMachinePublicContextKey{}, peerPub),
+		BaseConfig: &http.Server{
+			Handler: s.mux,
+		},
+	})
+}
+
 func (s *Server) publicKeys() (noiseKey, pubKey key.MachinePublic) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -222,66 +313,125 @@ func (s *Server) publicKeys() (noiseKey, pubKey key.MachinePublic) {
 	return s.noisePubKey, s.pubKey
 }
 
-func (s *Server) privateKey() key.ControlPrivate {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ensureKeyPairLocked()
-	return s.privKey
-}
-
 func (s *Server) ensureKeyPairLocked() {
 	if !s.pubKey.IsZero() {
 		return
 	}
-	s.noisePrivKey = key.NewControl()
+	s.noisePrivKey = key.NewMachine()
 	s.noisePubKey = s.noisePrivKey.Public()
 	s.privKey = key.NewControl()
 	s.pubKey = s.privKey.Public()
 }
 
 func (s *Server) serveKey(w http.ResponseWriter, r *http.Request) {
-	_, legacyKey := s.publicKeys()
+	noiseKey, legacyKey := s.publicKeys()
 	if r.FormValue("v") == "" {
 		w.Header().Set("Content-Type", "text/plain")
 		io.WriteString(w, legacyKey.UntypedHexString())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	// TODO(maisem/bradfitz): support noise protocol here.
 	json.NewEncoder(w).Encode(&tailcfg.OverTLSPublicKeyResponse{
 		LegacyPublicKey: legacyKey,
-		// PublicKey:       noiseKey,
+		PublicKey:       noiseKey,
 	})
 }
 
 func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
-	mkeyStr := strings.TrimPrefix(r.URL.Path, "/machine/")
-	rem := ""
-	if i := strings.IndexByte(mkeyStr, '/'); i != -1 {
-		rem = mkeyStr[i:]
-		mkeyStr = mkeyStr[:i]
-	}
-
-	// TODO(maisem/bradfitz): support noise protocol here.
-	mkey, err := key.ParseMachinePublicUntyped(mem.S(mkeyStr))
-	if err != nil {
-		http.Error(w, "bad machine key hex", 400)
-		return
-	}
-
 	if r.Method != "POST" {
 		http.Error(w, "POST required", 400)
 		return
 	}
+	ctx := r.Context()
 
-	switch rem {
-	case "":
-		s.serveRegister(w, r, mkey)
-	case "/map":
+	mkey, ok := ctx.Value(peerMachinePublicContextKey{}).(key.MachinePublic)
+	if !ok {
+		panic("no peer machine public key in context")
+	}
+
+	switch r.URL.Path {
+	case "/machine/map":
 		s.serveMap(w, r, mkey)
+	case "/machine/register":
+		s.serveRegister(w, r, mkey)
+	case "/machine/update-health":
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		s.serveUnhandled(w, r)
 	}
+}
+
+// SetSubnetRoutes sets the list of subnet routes which a node is routing.
+func (s *Server) SetSubnetRoutes(nodeKey key.NodePublic, routes []netip.Prefix) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logf("Setting subnet routes for %s: %v", nodeKey.ShortString(), routes)
+	mak.Set(&s.nodeSubnetRoutes, nodeKey, routes)
+}
+
+// MasqueradePair is a pair of nodes and the IP address that the
+// Node masquerades as for the Peer.
+//
+// Setting this will have future MapResponses for Node to have
+// Peer.SelfNodeV{4,6}MasqAddrForThisPeer set to NodeMasqueradesAs.
+// MapResponses for the Peer will now see Node.Addresses as
+// NodeMasqueradesAs.
+type MasqueradePair struct {
+	Node              key.NodePublic
+	Peer              key.NodePublic
+	NodeMasqueradesAs netip.Addr
+}
+
+// SetJailed sets b to be jailed when it is a peer of a.
+func (s *Server) SetJailed(a, b key.NodePublic, jailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.peerIsJailed == nil {
+		s.peerIsJailed = map[key.NodePublic]map[key.NodePublic]bool{}
+	}
+	if s.peerIsJailed[a] == nil {
+		s.peerIsJailed[a] = map[key.NodePublic]bool{}
+	}
+	s.peerIsJailed[a][b] = jailed
+	s.updateLocked("SetJailed", s.nodeIDsLocked(0))
+}
+
+// SetMasqueradeAddresses sets the masquerade addresses for the server.
+// See MasqueradePair for more details.
+func (s *Server) SetMasqueradeAddresses(pairs []MasqueradePair) {
+	m := make(map[key.NodePublic]map[key.NodePublic]netip.Addr)
+	for _, p := range pairs {
+		if m[p.Node] == nil {
+			m[p.Node] = make(map[key.NodePublic]netip.Addr)
+		}
+		m[p.Node][p.Peer] = p.NodeMasqueradesAs
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.masquerades = m
+	s.updateLocked("SetMasqueradeAddresses", s.nodeIDsLocked(0))
+}
+
+// SetNodeCapMap overrides the capability map the specified client receives.
+func (s *Server) SetNodeCapMap(nodeKey key.NodePublic, capMap tailcfg.NodeCapMap) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mak.Set(&s.nodeCapMaps, nodeKey, capMap)
+	s.updateLocked("SetNodeCapMap", s.nodeIDsLocked(0))
+}
+
+// nodeIDsLocked returns the node IDs of all nodes in the server, except
+// for the node with the given ID.
+func (s *Server) nodeIDsLocked(except tailcfg.NodeID) []tailcfg.NodeID {
+	var ids []tailcfg.NodeID
+	for _, n := range s.nodes {
+		if n.ID == except {
+			continue
+		}
+		ids = append(ids, n.ID)
+	}
+	return ids
 }
 
 // Node returns the node for nodeKey. It's always nil or cloned memory.
@@ -311,7 +461,7 @@ func (s *Server) AddFakeNode() {
 	r := nk.Raw32()
 	id := int64(binary.LittleEndian.Uint64(r[:]))
 	ip := netaddr.IPv4(r[0], r[1], r[2], r[3])
-	addr := netaddr.IPPrefixFrom(ip, 32)
+	addr := netip.PrefixFrom(ip, 32)
 	s.nodes[nk] = &tailcfg.Node{
 		ID:                tailcfg.NodeID(id),
 		StableID:          tailcfg.StableNodeID(fmt.Sprintf("TESTCTRL%08x", id)),
@@ -320,10 +470,19 @@ func (s *Server) AddFakeNode() {
 		Key:               nk,
 		MachineAuthorized: true,
 		DiscoKey:          dk,
-		Addresses:         []netaddr.IPPrefix{addr},
-		AllowedIPs:        []netaddr.IPPrefix{addr},
+		Addresses:         []netip.Prefix{addr},
+		AllowedIPs:        []netip.Prefix{addr},
 	}
 	// TODO: send updates to other (non-fake?) nodes
+}
+
+func (s *Server) AllUsers() (users []*tailcfg.User) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.users {
+		users = append(users, u.Clone())
+	}
+	return users
 }
 
 func (s *Server) AllNodes() (nodes []*tailcfg.Node) {
@@ -338,6 +497,8 @@ func (s *Server) AllNodes() (nodes []*tailcfg.Node) {
 	return nodes
 }
 
+const domain = "fake-control.example.net"
+
 func (s *Server) getUser(nodeKey key.NodePublic) (*tailcfg.User, *tailcfg.Login) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -351,7 +512,6 @@ func (s *Server) getUser(nodeKey key.NodePublic) (*tailcfg.User, *tailcfg.Login)
 		return u, s.logins[nodeKey]
 	}
 	id := tailcfg.UserID(len(s.users) + 1)
-	domain := "fake-control.example.net"
 	loginName := fmt.Sprintf("user-%d@%s", id, domain)
 	displayName := fmt.Sprintf("User %d", id)
 	login := &tailcfg.Login{
@@ -360,13 +520,11 @@ func (s *Server) getUser(nodeKey key.NodePublic) (*tailcfg.User, *tailcfg.Login)
 		LoginName:     loginName,
 		DisplayName:   displayName,
 		ProfilePicURL: "https://tailscale.com/static/images/marketing/team-carney.jpg",
-		Domain:        domain,
 	}
 	user := &tailcfg.User{
 		ID:          id,
 		LoginName:   loginName,
 		DisplayName: displayName,
-		Domain:      domain,
 		Logins:      []tailcfg.LoginID{login.ID},
 	}
 	s.users[nodeKey] = user
@@ -425,7 +583,7 @@ func (s *Server) CompleteAuth(authPathOrURL string) bool {
 }
 
 func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.MachinePublic) {
-	msg, err := ioutil.ReadAll(io.LimitReader(r.Body, msgLimit))
+	msg, err := io.ReadAll(io.LimitReader(r.Body, msgLimit))
 	r.Body.Close()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("bad map request read: %v", err), 400)
@@ -433,7 +591,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 	}
 
 	var req tailcfg.RegisterRequest
-	if err := s.decode(mkey, msg, &req); err != nil {
+	if err := s.decode(msg, &req); err != nil {
 		go panic(fmt.Sprintf("serveRegister: decode: %v", err))
 	}
 	if req.Version == 0 {
@@ -445,6 +603,14 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 	if s.Verbose {
 		j, _ := json.MarshalIndent(req, "", "\t")
 		log.Printf("Got %T: %s", req, j)
+	}
+	if s.RequireAuthKey != "" && (req.Auth == nil || req.Auth.AuthKey != s.RequireAuthKey) {
+		res := must.Get(s.encode(false, tailcfg.RegisterResponse{
+			Error: "invalid authkey",
+		}))
+		w.WriteHeader(200)
+		w.Write(res)
+		return
 	}
 
 	// If this is a followup request, wait until interactive followup URL visit complete.
@@ -460,7 +626,7 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		case <-doneCh:
 		}
 		// TODO(bradfitz): support a side test API to mark an
-		// auth as failued so we can send an error response in
+		// auth as failed so we can send an error response in
 		// some follow-ups? For now all are successes.
 	}
 
@@ -474,10 +640,10 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 
 	machineAuthorized := true // TODO: add Server.RequireMachineAuth
 
-	v4Prefix := netaddr.IPPrefixFrom(netaddr.IPv4(100, 64, uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID))), 32)
-	v6Prefix := netaddr.IPPrefixFrom(tsaddr.Tailscale4To6(v4Prefix.IP()), 128)
+	v4Prefix := netip.PrefixFrom(netaddr.IPv4(100, 64, uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID))), 32)
+	v6Prefix := netip.PrefixFrom(tsaddr.Tailscale4To6(v4Prefix.Addr()), 128)
 
-	allowedIPs := []netaddr.IPPrefix{
+	allowedIPs := []netip.Prefix{
 		v4Prefix,
 		v6Prefix,
 	}
@@ -492,6 +658,12 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 		Addresses:         allowedIPs,
 		AllowedIPs:        allowedIPs,
 		Hostinfo:          req.Hostinfo.View(),
+		Name:              req.Hostinfo.Hostname,
+		Capabilities: []tailcfg.NodeCapability{
+			tailcfg.CapabilityHTTPS,
+			tailcfg.NodeAttrFunnel,
+			tailcfg.CapabilityFunnelPorts + "?ports=8080,443",
+		},
 	}
 	requireAuth := s.RequireAuth
 	if requireAuth && s.nodeKeyAuthed[nk] {
@@ -502,14 +674,12 @@ func (s *Server) serveRegister(w http.ResponseWriter, r *http.Request, mkey key.
 
 	authURL := ""
 	if requireAuth {
-		randHex := make([]byte, 10)
-		crand.Read(randHex)
-		authPath := fmt.Sprintf("/auth/%x", randHex)
+		authPath := fmt.Sprintf("/auth/%s", rands.HexString(20))
 		s.addAuthPath(authPath, nk)
 		authURL = s.BaseURL() + authPath
 	}
 
-	res, err := s.encode(mkey, false, tailcfg.RegisterResponse{
+	res, err := s.encode(false, tailcfg.RegisterResponse{
 		User:              *user,
 		Login:             *login,
 		NodeKeyExpired:    allExpired,
@@ -537,6 +707,7 @@ const (
 	updateSelfChanged
 
 	// updateDebugInjection is an update used for PingRequests
+	// or a raw MapResponse.
 	updateDebugInjection
 )
 
@@ -570,12 +741,7 @@ func (s *Server) UpdateNode(n *tailcfg.Node) (peersToUpdate []tailcfg.NodeID) {
 		panic("zero nodekey")
 	}
 	s.nodes[n.Key] = n.Clone()
-	for _, n2 := range s.nodes {
-		if n.ID != n2.ID {
-			peersToUpdate = append(peersToUpdate, n2.ID)
-		}
-	}
-	return peersToUpdate
+	return s.nodeIDsLocked(n.ID)
 }
 
 func (s *Server) incrInServeMap(delta int) {
@@ -596,7 +762,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 	defer s.incrInServeMap(-1)
 	ctx := r.Context()
 
-	msg, err := ioutil.ReadAll(io.LimitReader(r.Body, msgLimit))
+	msg, err := io.ReadAll(io.LimitReader(r.Body, msgLimit))
 	if err != nil {
 		r.Body.Close()
 		http.Error(w, fmt.Sprintf("bad map request read: %v", err), 400)
@@ -605,11 +771,11 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 	r.Body.Close()
 
 	req := new(tailcfg.MapRequest)
-	if err := s.decode(mkey, msg, req); err != nil {
+	if err := s.decode(msg, req); err != nil {
 		go panic(fmt.Sprintf("bad map request: %v", err))
 	}
 
-	jitter := time.Duration(rand.Intn(8000)) * time.Millisecond
+	jitter := rand.N(8 * time.Second)
 	keepAlive := 50*time.Second + jitter
 
 	node := s.Node(req.NodeKey)
@@ -665,32 +831,48 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 
 	w.WriteHeader(200)
 	for {
-		res, err := s.MapResponse(req)
-		if err != nil {
-			// TODO: log
+		if resBytes, ok := s.takeRawMapMessage(req.NodeKey); ok {
+			if err := s.sendMapMsg(w, compress, resBytes); err != nil {
+				s.logf("sendMapMsg of raw message: %v", err)
+				return
+			}
+			if streaming {
+				continue
+			}
 			return
-		}
-		if res == nil {
-			return // done
 		}
 
-		s.mu.Lock()
-		allExpired := s.allExpired
-		s.mu.Unlock()
-		if allExpired {
-			res.Node.KeyExpiry = time.Now().Add(-1 * time.Minute)
-		}
-		// TODO: add minner if/when needed
-		resBytes, err := json.Marshal(res)
-		if err != nil {
-			s.logf("json.Marshal: %v", err)
-			return
-		}
-		if err := s.sendMapMsg(w, mkey, compress, resBytes); err != nil {
-			return
+		if s.canGenerateAutomaticMapResponseFor(req.NodeKey) {
+			res, err := s.MapResponse(req)
+			if err != nil {
+				// TODO: log
+				return
+			}
+			if res == nil {
+				return // done
+			}
+
+			s.mu.Lock()
+			allExpired := s.allExpired
+			s.mu.Unlock()
+			if allExpired {
+				res.Node.KeyExpiry = time.Now().Add(-1 * time.Minute)
+			}
+			// TODO: add minner if/when needed
+			resBytes, err := json.Marshal(res)
+			if err != nil {
+				s.logf("json.Marshal: %v", err)
+				return
+			}
+			if err := s.sendMapMsg(w, compress, resBytes); err != nil {
+				return
+			}
 		}
 		if !streaming {
 			return
+		}
+		if s.hasPendingRawMapMessage(req.NodeKey) {
+			continue
 		}
 	keepAliveLoop:
 		for {
@@ -713,7 +895,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 				}
 				break keepAliveLoop
 			case <-keepAliveTimerCh:
-				if err := s.sendMapMsg(w, mkey, compress, keepAliveMsg); err != nil {
+				if err := s.sendMapMsg(w, compress, keepAliveMsg); err != nil {
 					return
 				}
 			}
@@ -727,6 +909,20 @@ var keepAliveMsg = &struct {
 	KeepAlive: true,
 }
 
+func packetFilterWithIngressCaps() []tailcfg.FilterRule {
+	out := slices.Clone(tailcfg.FilterAllowAll)
+	out = append(out, tailcfg.FilterRule{
+		SrcIPs: []string{"*"},
+		CapGrant: []tailcfg.CapGrant{
+			{
+				Dsts: []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()},
+				Caps: []tailcfg.PeerCapability{tailcfg.PeerCapabilityIngress},
+			},
+		},
+	})
+	return out
+}
+
 // MapResponse generates a MapResponse for a MapRequest.
 //
 // No updates to s are done here.
@@ -737,50 +933,135 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 		// node key rotated away (once test server supports that)
 		return nil, nil
 	}
+
+	s.mu.Lock()
+	nodeCapMap := maps.Clone(s.nodeCapMaps[nk])
+	s.mu.Unlock()
+
+	node.CapMap = nodeCapMap
+	node.Capabilities = append(node.Capabilities, tailcfg.NodeAttrDisableUPnP)
+
 	user, _ := s.getUser(nk)
 	t := time.Date(2020, 8, 3, 0, 0, 0, 1, time.UTC)
+	dns := s.DNSConfig
+	if dns != nil && s.MagicDNSDomain != "" {
+		dns = dns.Clone()
+		dns.CertDomains = []string{
+			fmt.Sprintf(node.Hostinfo.Hostname() + "." + s.MagicDNSDomain),
+		}
+	}
+
 	res = &tailcfg.MapResponse{
 		Node:            node,
 		DERPMap:         s.DERPMap,
-		Domain:          string(user.Domain),
+		Domain:          domain,
 		CollectServices: "true",
-		PacketFilter:    tailcfg.FilterAllowAll,
-		Debug: &tailcfg.Debug{
-			DisableUPnP: "true",
-		},
-		DNSConfig:   s.DNSConfig,
-		ControlTime: &t,
+		PacketFilter:    packetFilterWithIngressCaps(),
+		DNSConfig:       dns,
+		ControlTime:     &t,
 	}
+
+	s.mu.Lock()
+	nodeMasqs := s.masquerades[node.Key]
+	jailed := maps.Clone(s.peerIsJailed[node.Key])
+	s.mu.Unlock()
 	for _, p := range s.AllNodes() {
-		if p.StableID != node.StableID {
-			res.Peers = append(res.Peers, p)
+		if p.StableID == node.StableID {
+			continue
 		}
+		if masqIP := nodeMasqs[p.Key]; masqIP.IsValid() {
+			if masqIP.Is6() {
+				p.SelfNodeV6MasqAddrForThisPeer = ptr.To(masqIP)
+			} else {
+				p.SelfNodeV4MasqAddrForThisPeer = ptr.To(masqIP)
+			}
+		}
+		p.IsJailed = jailed[p.Key]
+
+		s.mu.Lock()
+		peerAddress := s.masquerades[p.Key][node.Key]
+		routes := s.nodeSubnetRoutes[p.Key]
+		s.mu.Unlock()
+		if peerAddress.IsValid() {
+			if peerAddress.Is6() {
+				p.Addresses[1] = netip.PrefixFrom(peerAddress, peerAddress.BitLen())
+				p.AllowedIPs[1] = netip.PrefixFrom(peerAddress, peerAddress.BitLen())
+			} else {
+				p.Addresses[0] = netip.PrefixFrom(peerAddress, peerAddress.BitLen())
+				p.AllowedIPs[0] = netip.PrefixFrom(peerAddress, peerAddress.BitLen())
+			}
+		}
+		if len(routes) > 0 {
+			p.PrimaryRoutes = routes
+			p.AllowedIPs = append(p.AllowedIPs, routes...)
+		}
+		res.Peers = append(res.Peers, p)
 	}
+
 	sort.Slice(res.Peers, func(i, j int) bool {
 		return res.Peers[i].ID < res.Peers[j].ID
 	})
+	for _, u := range s.AllUsers() {
+		res.UserProfiles = append(res.UserProfiles, tailcfg.UserProfile{
+			ID:          u.ID,
+			LoginName:   u.LoginName,
+			DisplayName: u.DisplayName,
+		})
+	}
 
-	v4Prefix := netaddr.IPPrefixFrom(netaddr.IPv4(100, 64, uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID))), 32)
-	v6Prefix := netaddr.IPPrefixFrom(tsaddr.Tailscale4To6(v4Prefix.IP()), 128)
+	v4Prefix := netip.PrefixFrom(netaddr.IPv4(100, 64, uint8(tailcfg.NodeID(user.ID)>>8), uint8(tailcfg.NodeID(user.ID))), 32)
+	v6Prefix := netip.PrefixFrom(tsaddr.Tailscale4To6(v4Prefix.Addr()), 128)
 
-	res.Node.Addresses = []netaddr.IPPrefix{
+	res.Node.Addresses = []netip.Prefix{
 		v4Prefix,
 		v6Prefix,
 	}
-	res.Node.AllowedIPs = res.Node.Addresses
 
-	// Consume the PingRequest while protected by mutex if it exists
 	s.mu.Lock()
-	if pr, ok := s.pingReqsToAdd[nk]; ok {
-		res.PingRequest = pr
-		delete(s.pingReqsToAdd, nk)
+	defer s.mu.Unlock()
+	res.Node.PrimaryRoutes = s.nodeSubnetRoutes[nk]
+	res.Node.AllowedIPs = append(res.Node.Addresses, s.nodeSubnetRoutes[nk]...)
+
+	// Consume a PingRequest while protected by mutex if it exists
+	switch m := s.msgToSend[nk].(type) {
+	case *tailcfg.PingRequest:
+		res.PingRequest = m
+		delete(s.msgToSend, nk)
 	}
-	s.mu.Unlock()
 	return res, nil
 }
 
-func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compress bool, msg interface{}) error {
-	resBytes, err := s.encode(mkey, compress, msg)
+func (s *Server) canGenerateAutomaticMapResponseFor(nk key.NodePublic) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.suppressAutoMapResponses.Contains(nk)
+}
+
+func (s *Server) hasPendingRawMapMessage(nk key.NodePublic) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.msgToSend[nk].(*tailcfg.MapResponse)
+	return ok
+}
+
+func (s *Server) takeRawMapMessage(nk key.NodePublic) (mapResJSON []byte, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mr, ok := s.msgToSend[nk].(*tailcfg.MapResponse)
+	if !ok {
+		return nil, false
+	}
+	delete(s.msgToSend, nk)
+	var err error
+	mapResJSON, err = json.Marshal(mr)
+	if err != nil {
+		panic(err)
+	}
+	return mapResJSON, true
+}
+
+func (s *Server) sendMapMsg(w http.ResponseWriter, compress bool, msg any) error {
+	resBytes, err := s.encode(compress, msg)
 	if err != nil {
 		return err
 	}
@@ -803,29 +1084,14 @@ func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compr
 	return nil
 }
 
-func (s *Server) decode(mkey key.MachinePublic, msg []byte, v interface{}) error {
+func (s *Server) decode(msg []byte, v any) error {
 	if len(msg) == msgLimit {
 		return errors.New("encrypted message too long")
 	}
-
-	decrypted, ok := s.privateKey().OpenFrom(mkey, msg)
-	if !ok {
-		return errors.New("can't decrypt request")
-	}
-	return json.Unmarshal(decrypted, v)
+	return json.Unmarshal(msg, v)
 }
 
-var zstdEncoderPool = &sync.Pool{
-	New: func() interface{} {
-		encoder, err := smallzstd.NewEncoder(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
-		if err != nil {
-			panic(err)
-		}
-		return encoder
-	},
-}
-
-func (s *Server) encode(mkey key.MachinePublic, compress bool, v interface{}) (b []byte, err error) {
+func (s *Server) encode(compress bool, v any) (b []byte, err error) {
 	var isBytes bool
 	if b, isBytes = v.([]byte); !isBytes {
 		b, err = json.Marshal(v)
@@ -834,12 +1100,9 @@ func (s *Server) encode(mkey key.MachinePublic, compress bool, v interface{}) (b
 		}
 	}
 	if compress {
-		encoder := zstdEncoderPool.Get().(*zstd.Encoder)
-		b = encoder.EncodeAll(b, nil)
-		encoder.Close()
-		zstdEncoderPool.Put(encoder)
+		b = zstdframe.AppendEncode(nil, b, zstdframe.FastestCompression)
 	}
-	return s.privateKey().SealTo(mkey, b), nil
+	return b, nil
 }
 
 // filterInvalidIPv6Endpoints removes invalid IPv6 endpoints from eps,
@@ -848,7 +1111,7 @@ func (s *Server) encode(mkey key.MachinePublic, compress bool, v interface{}) (b
 //
 // Two types of IPv6 endpoints are considered invalid: link-local
 // addresses, and anything with a zone.
-func filterInvalidIPv6Endpoints(eps []string) []string {
+func filterInvalidIPv6Endpoints(eps []netip.AddrPort) []netip.AddrPort {
 	clean := eps[:0]
 	for _, ep := range eps {
 		if keepClientEndpoint(ep) {
@@ -858,14 +1121,8 @@ func filterInvalidIPv6Endpoints(eps []string) []string {
 	return clean
 }
 
-func keepClientEndpoint(ep string) bool {
-	ipp, err := netaddr.ParseIPPort(ep)
-	if err != nil {
-		// Shouldn't have made it this far if we unmarshalled
-		// the incoming JSON response.
-		return false
-	}
-	ip := ipp.IP()
+func keepClientEndpoint(ipp netip.AddrPort) bool {
+	ip := ipp.Addr()
 	if ip.Zone() != "" {
 		return false
 	}

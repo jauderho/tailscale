@@ -1,16 +1,22 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
 	"fmt"
 	"os/exec"
+	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
 func flushCaches() error {
-	out, err := exec.Command("ipconfig", "/flushdns").CombinedOutput()
+	cmd := exec.Command("ipconfig", "/flushdns")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.DETACHED_PROCESS,
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v (output: %s)", err, out)
 	}

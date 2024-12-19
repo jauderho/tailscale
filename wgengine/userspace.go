@@ -1,40 +1,41 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgengine
 
 import (
 	"bufio"
-	"bytes"
+	"context"
 	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
+	"math"
+	"net/netip"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"go4.org/mem"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun"
-	"inet.af/netaddr"
-	"tailscale.com/control/controlclient"
+	"github.com/tailscale/wireguard-go/device"
+	"github.com/tailscale/wireguard-go/tun"
+	"tailscale.com/control/controlknobs"
+	"tailscale.com/drive"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
-	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/flowtrack"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/ipset"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tshttpproxy"
 	"tailscale.com/net/tstun"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/dnstype"
@@ -42,22 +43,23 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/deephash"
+	"tailscale.com/util/mak"
+	"tailscale.com/util/set"
+	"tailscale.com/util/testenv"
+	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
+	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
-	"tailscale.com/wgengine/monitor"
+	"tailscale.com/wgengine/netlog"
+	"tailscale.com/wgengine/netstack/gro"
 	"tailscale.com/wgengine/router"
 	"tailscale.com/wgengine/wgcfg"
+	"tailscale.com/wgengine/wgint"
 	"tailscale.com/wgengine/wglog"
-)
-
-const magicDNSPort = 53
-
-var (
-	magicDNSIP   = tsaddr.TailscaleServiceIP()
-	magicDNSIPv6 = tsaddr.TailscaleServiceIPv6()
 )
 
 // Lazy wireguard-go configuration parameters.
@@ -75,7 +77,7 @@ const (
 	// packetSendRecheckWireguardThreshold controls how long we can go
 	// between packet sends to an IP before checking to see
 	// whether this IP address needs to be added back to the
-	// Wireguard peer oconfig.
+	// WireGuard peer oconfig.
 	packetSendRecheckWireguardThreshold = 1 * time.Minute
 )
 
@@ -83,33 +85,39 @@ const (
 // status (as long as there's activity). See docs on its use below.
 const statusPollInterval = 1 * time.Minute
 
+// networkLoggerUploadTimeout is the maximum timeout to wait when
+// shutting down the network logger as it uploads the last network log messages.
+const networkLoggerUploadTimeout = 5 * time.Second
+
 type userspaceEngine struct {
-	logf              logger.Logf
-	wgLogger          *wglog.Logger //a wireguard-go logging wrapper
-	reqCh             chan struct{}
-	waitCh            chan struct{} // chan is closed when first Close call completes; contrast with closing bool
-	timeNow           func() mono.Time
-	tundev            *tstun.Wrapper
-	wgdev             *device.Device
-	router            router.Router
-	confListenPort    uint16 // original conf.ListenPort
-	dns               *dns.Manager
-	magicConn         *magicsock.Conn
-	linkMon           *monitor.Mon
-	linkMonOwned      bool       // whether we created linkMon (and thus need to close it)
-	linkMonUnregister func()     // unsubscribes from changes; used regardless of linkMonOwned
-	birdClient        BIRDClient // or nil
+	logf             logger.Logf
+	wgLogger         *wglog.Logger //a wireguard-go logging wrapper
+	reqCh            chan struct{}
+	waitCh           chan struct{} // chan is closed when first Close call completes; contrast with closing bool
+	timeNow          func() mono.Time
+	tundev           *tstun.Wrapper
+	wgdev            *device.Device
+	router           router.Router
+	confListenPort   uint16 // original conf.ListenPort
+	dns              *dns.Manager
+	magicConn        *magicsock.Conn
+	netMon           *netmon.Monitor
+	health           *health.Tracker
+	netMonOwned      bool                // whether we created netMon (and thus need to close it)
+	netMonUnregister func()              // unsubscribes from changes; used regardless of netMonOwned
+	birdClient       BIRDClient          // or nil
+	controlKnobs     *controlknobs.Knobs // or nil
 
 	testMaybeReconfigHook func() // for tests; if non-nil, fires if maybeReconfigWireguardLocked called
 
 	// isLocalAddr reports the whether an IP is assigned to the local
 	// tunnel interface. It's used to reflect local packets
 	// incorrectly sent to us.
-	isLocalAddr atomic.Value // of func(netaddr.IP)bool
+	isLocalAddr syncs.AtomicValue[func(netip.Addr) bool]
 
 	// isDNSIPOverTailscale reports the whether a DNS resolver's IP
 	// is being routed over Tailscale.
-	isDNSIPOverTailscale atomic.Value // of func(netaddr.IP)bool
+	isDNSIPOverTailscale syncs.AtomicValue[func(netip.Addr) bool]
 
 	wgLock              sync.Mutex // serializes all wgdev operations; see lock order comment below
 	lastCfgFull         wgcfg.Config
@@ -118,50 +126,34 @@ type userspaceEngine struct {
 	lastEngineSigFull   deephash.Sum // of full wireguard config
 	lastEngineSigTrim   deephash.Sum // of trimmed wireguard config
 	lastDNSConfig       *dns.Config
+	lastIsSubnetRouter  bool // was the node a primary subnet router in the last run.
 	recvActivityAt      map[key.NodePublic]mono.Time
 	trimmedNodes        map[key.NodePublic]bool   // set of node keys of peers currently excluded from wireguard config
-	sentActivityAt      map[netaddr.IP]*mono.Time // value is accessed atomically
-	destIPActivityFuncs map[netaddr.IP]func()
-	statusBufioReader   *bufio.Reader // reusable for UAPI
-	lastStatusPollTime  mono.Time     // last time we polled the engine status
+	sentActivityAt      map[netip.Addr]*mono.Time // value is accessed atomically
+	destIPActivityFuncs map[netip.Addr]func()
+	lastStatusPollTime  mono.Time    // last time we polled the engine status
+	reconfigureVPN      func() error // or nil
 
-	lastIsSubnetRouter bool // was the node a primary subnet router in the last run.
+	mu             sync.Mutex         // guards following; see lock order comment below
+	netMap         *netmap.NetworkMap // or nil
+	closing        bool               // Close was called (even if we're still closing)
+	statusCallback StatusCallback
+	peerSequence   []key.NodePublic
+	endpoints      []tailcfg.Endpoint
+	pendOpen       map[flowtrack.Tuple]*pendingOpenFlow // see pendopen.go
 
-	mu                  sync.Mutex         // guards following; see lock order comment below
-	netMap              *netmap.NetworkMap // or nil
-	closing             bool               // Close was called (even if we're still closing)
-	statusCallback      StatusCallback
-	peerSequence        []key.NodePublic
-	endpoints           []tailcfg.Endpoint
-	pendOpen            map[flowtrack.Tuple]*pendingOpenFlow // see pendopen.go
-	networkMapCallbacks map[*someHandle]NetworkMapCallback
-	tsIPByIPPort        map[netaddr.IPPort]netaddr.IP          // allows registration of IP:ports as belonging to a certain Tailscale IP for whois lookups
-	pongCallback        map[[8]byte]func(packet.TSMPPongReply) // for TSMP pong responses
+	// pongCallback is the map of response handlers waiting for disco or TSMP
+	// pong callbacks. The map key is a random slice of bytes.
+	pongCallback map[[8]byte]func(packet.TSMPPongReply)
+	// icmpEchoResponseCallback is the map of response handlers waiting for ICMP
+	// echo responses. The map key is a random uint32 that is the little endian
+	// value of the ICMP identifier and sequence number concatenated.
+	icmpEchoResponseCallback map[uint32]func()
+
+	// networkLogger logs statistics about network connections.
+	networkLogger netlog.Logger
 
 	// Lock ordering: magicsock.Conn.mu, wgLock, then mu.
-}
-
-// InternalsGetter is implemented by Engines that can export their internals.
-type InternalsGetter interface {
-	GetInternals() (_ *tstun.Wrapper, _ *magicsock.Conn, ok bool)
-}
-
-func (e *userspaceEngine) GetInternals() (_ *tstun.Wrapper, _ *magicsock.Conn, ok bool) {
-	return e.tundev, e.magicConn, true
-}
-
-// ResolvingEngine is implemented by Engines that have DNS resolvers.
-type ResolvingEngine interface {
-	GetResolver() (_ *resolver.Resolver, ok bool)
-}
-
-var (
-	_ ResolvingEngine = (*userspaceEngine)(nil)
-	_ ResolvingEngine = (*watchdogEngine)(nil)
-)
-
-func (e *userspaceEngine) GetResolver() (r *resolver.Resolver, ok bool) {
-	return e.dns.Resolver(), true
 }
 
 // BIRDClient handles communication with the BIRD Internet Routing Daemon.
@@ -190,13 +182,32 @@ type Config struct {
 	// If nil, a fake OSConfigurator that does nothing is used.
 	DNS dns.OSConfigurator
 
-	// LinkMonitor optionally provides an existing link monitor to re-use.
-	// If nil, a new link monitor is created.
-	LinkMonitor *monitor.Mon
+	// ReconfigureVPN provides an optional hook for platforms like Android to
+	// know when it's time to reconfigure their VPN implementation. Such
+	// platforms can only set their entire VPN configuration (routes, DNS, etc)
+	// at all once and can't make piecemeal incremental changes, so this
+	// provides a hook to "flush" a batch of Router and/or DNS changes.
+	ReconfigureVPN func() error
+
+	// NetMon optionally provides an existing network monitor to re-use.
+	// If nil, a new network monitor is created.
+	NetMon *netmon.Monitor
+
+	// HealthTracker, if non-nil, is the health tracker to use.
+	HealthTracker *health.Tracker
+
+	// Metrics is the usermetrics registry to use.
+	// Mandatory, if not set, an error is returned.
+	Metrics *usermetric.Registry
 
 	// Dialer is the dialer to use for outbound connections.
-	// If nil, a new Dialer is created
+	// If nil, a new Dialer is created.
 	Dialer *tsdial.Dialer
+
+	// ControlKnobs is the set of control plane-provied knobs
+	// to use.
+	// If nil, defaults are used.
+	ControlKnobs *controlknobs.Knobs
 
 	// ListenPort is the port on which the engine will listen.
 	// If zero, a port is automatically selected.
@@ -210,47 +221,47 @@ type Config struct {
 	// BIRDClient, if non-nil, will be used to configure BIRD whenever
 	// this node is a primary subnet router.
 	BIRDClient BIRDClient
+
+	// SetSubsystem, if non-nil, is called for each new subsystem created, just before a successful return.
+	SetSubsystem func(any)
+
+	// DriveForLocal, if populated, will cause the engine to expose a Taildrive
+	// listener at 100.100.100.100:8080.
+	DriveForLocal drive.FileSystemForLocal
 }
 
-func NewFakeUserspaceEngine(logf logger.Logf, listenPort uint16) (Engine, error) {
-	logf("Starting userspace wireguard engine (with fake TUN device)")
-	return NewUserspaceEngine(logf, Config{
-		ListenPort:    listenPort,
+// NewFakeUserspaceEngine returns a new userspace engine for testing.
+//
+// The opts may contain the following types:
+//
+//   - int or uint16: to set the ListenPort.
+func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
+	conf := Config{
 		RespondToPing: true,
-	})
-}
-
-// NetstackRouterType is a gross cross-package init-time registration
-// from netstack to here, informing this package of netstack's router
-// type.
-var NetstackRouterType reflect.Type
-
-// IsNetstackRouter reports whether e is either fully netstack based
-// (without TUN) or is at least using netstack for routing.
-func IsNetstackRouter(e Engine) bool {
-	switch e := e.(type) {
-	case *userspaceEngine:
-		if reflect.TypeOf(e.router) == NetstackRouterType {
-			return true
+	}
+	for _, o := range opts {
+		switch v := o.(type) {
+		case uint16:
+			conf.ListenPort = v
+		case int:
+			if v < 0 || v > math.MaxUint16 {
+				return nil, fmt.Errorf("invalid ListenPort: %d", v)
+			}
+			conf.ListenPort = uint16(v)
+		case func(any):
+			conf.SetSubsystem = v
+		case *controlknobs.Knobs:
+			conf.ControlKnobs = v
+		case *health.Tracker:
+			conf.HealthTracker = v
+		case *usermetric.Registry:
+			conf.Metrics = v
+		default:
+			return nil, fmt.Errorf("unknown option type %T", v)
 		}
-	case *watchdogEngine:
-		return IsNetstackRouter(e.wrap)
 	}
-	return IsNetstack(e)
-}
-
-// IsNetstack reports whether e is a netstack-based TUN-free engine.
-func IsNetstack(e Engine) bool {
-	ig, ok := e.(InternalsGetter)
-	if !ok {
-		return false
-	}
-	tw, _, ok := ig.GetInternals()
-	if !ok {
-		return false
-	}
-	name, err := tw.Name()
-	return err == nil && name == "FakeTUN"
+	logf("Starting userspace WireGuard engine (with fake TUN device)")
+	return NewUserspaceEngine(logf, conf)
 }
 
 // NewUserspaceEngine creates the named tun device and returns a
@@ -258,6 +269,14 @@ func IsNetstack(e Engine) bool {
 func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) {
 	var closePool closeOnErrorPool
 	defer closePool.closeAllIfError(&reterr)
+
+	if testenv.InTest() && conf.HealthTracker == nil {
+		panic("NewUserspaceEngine called without HealthTracker (being strict in tests)")
+	}
+
+	if conf.Metrics == nil {
+		return nil, errors.New("NewUserspaceEngine: opts.Metrics is required, please pass a *usermetric.Registry")
+	}
 
 	if conf.Tun == nil {
 		logf("[v1] using fake (no-op) tun device")
@@ -276,16 +295,33 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		conf.DNS = d
 	}
 	if conf.Dialer == nil {
-		conf.Dialer = new(tsdial.Dialer)
+		conf.Dialer = &tsdial.Dialer{Logf: logf}
 	}
 
 	var tsTUNDev *tstun.Wrapper
 	if conf.IsTAP {
-		tsTUNDev = tstun.WrapTAP(logf, conf.Tun)
+		tsTUNDev = tstun.WrapTAP(logf, conf.Tun, conf.Metrics)
 	} else {
-		tsTUNDev = tstun.Wrap(logf, conf.Tun)
+		tsTUNDev = tstun.Wrap(logf, conf.Tun, conf.Metrics)
 	}
 	closePool.add(tsTUNDev)
+
+	rtr := conf.Router
+	if version.IsMobile() {
+		// Android and iOS don't handle large numbers of routes well, so we
+		// wrap the Router with one that consolidates routes down to the
+		// smallest number possible.
+		//
+		// On Android, too many routes at VPN configuration time result in an
+		// android.os.TransactionTooLargeException because Android's VPNBuilder
+		// tries to send the entire set of routes to the VPNService as a single
+		// Bundle, which is typically limited to 1 MB. The number of routes
+		// that's too much seems to be very roughly around 4000.
+		//
+		// On iOS, the VPNExtension is limited to only 50 MB of memory, so
+		// keeping the number of routes down helps with memory consumption.
+		rtr = router.ConsolidatingRoutes(logf, rtr)
+	}
 
 	e := &userspaceEngine{
 		timeNow:        mono.Now,
@@ -293,9 +329,12 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		reqCh:          make(chan struct{}, 1),
 		waitCh:         make(chan struct{}),
 		tundev:         tsTUNDev,
-		router:         conf.Router,
+		router:         rtr,
 		confListenPort: conf.ListenPort,
 		birdClient:     conf.BIRDClient,
+		controlKnobs:   conf.ControlKnobs,
+		reconfigureVPN: conf.ReconfigureVPN,
+		health:         conf.HealthTracker,
 	}
 
 	if e.birdClient != nil {
@@ -304,34 +343,37 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 			return nil, err
 		}
 	}
-	e.isLocalAddr.Store(tsaddr.NewContainsIPFunc(nil))
-	e.isDNSIPOverTailscale.Store(tsaddr.NewContainsIPFunc(nil))
+	e.isLocalAddr.Store(ipset.FalseContainsIPFunc())
+	e.isDNSIPOverTailscale.Store(ipset.FalseContainsIPFunc())
 
-	if conf.LinkMonitor != nil {
-		e.linkMon = conf.LinkMonitor
+	if conf.NetMon != nil {
+		e.netMon = conf.NetMon
 	} else {
-		mon, err := monitor.New(logf)
+		mon, err := netmon.New(logf)
 		if err != nil {
 			return nil, err
 		}
 		closePool.add(mon)
-		e.linkMon = mon
-		e.linkMonOwned = true
+		e.netMon = mon
+		e.netMonOwned = true
 	}
 
 	tunName, _ := conf.Tun.Name()
 	conf.Dialer.SetTUNName(tunName)
-	conf.Dialer.SetLinkMonitor(e.linkMon)
-	e.dns = dns.NewManager(logf, conf.DNS, e.linkMon, conf.Dialer, fwdDNSLinkSelector{e, tunName})
+	conf.Dialer.SetNetMon(e.netMon)
+	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS)
 
-	logf("link state: %+v", e.linkMon.InterfaceState())
+	// TODO: there's probably a better place for this
+	sockstats.SetNetMon(e.netMon)
 
-	unregisterMonWatch := e.linkMon.RegisterChangeCallback(func(changed bool, st *interfaces.State) {
+	logf("link state: %+v", e.netMon.InterfaceState())
+
+	unregisterMonWatch := e.netMon.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
 		tshttpproxy.InvalidateCache()
-		e.linkChange(changed, st)
+		e.linkChange(delta)
 	})
 	closePool.addFunc(unregisterMonWatch)
-	e.linkMonUnregister = unregisterMonWatch
+	e.netMonUnregister = unregisterMonWatch
 
 	endpointsFn := func(endpoints []tailcfg.Endpoint) {
 		e.mu.Lock()
@@ -340,6 +382,13 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 
 		e.RequestStatus()
 	}
+	onPortUpdate := func(port uint16, network string) {
+		e.logf("onPortUpdate(port=%v, network=%s)", port, network)
+
+		if err := e.router.UpdateMagicsockPort(port, network); err != nil {
+			e.logf("UpdateMagicsockPort(port=%v, network=%s) failed: %v", port, network, err)
+		}
+	}
 	magicsockOpts := magicsock.Options{
 		Logf:             logf,
 		Port:             conf.ListenPort,
@@ -347,7 +396,12 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		DERPActiveFunc:   e.RequestStatus,
 		IdleFunc:         e.tundev.IdleDuration,
 		NoteRecvActivity: e.noteRecvActivity,
-		LinkMonitor:      e.linkMon,
+		NetMon:           e.netMon,
+		HealthTracker:    e.health,
+		Metrics:          conf.Metrics,
+		ControlKnobs:     conf.ControlKnobs,
+		OnPortUpdate:     onPortUpdate,
+		PeerByKeyFunc:    e.PeerByKey,
 	}
 
 	var err error
@@ -356,24 +410,24 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		return nil, fmt.Errorf("wgengine: %v", err)
 	}
 	closePool.add(e.magicConn)
-	e.magicConn.SetNetworkUp(e.linkMon.InterfaceState().AnyInterfaceUp())
+	e.magicConn.SetNetworkUp(e.netMon.InterfaceState().AnyInterfaceUp())
 
 	tsTUNDev.SetDiscoKey(e.magicConn.DiscoPublicKey())
 
 	if conf.RespondToPing {
-		e.tundev.PostFilterIn = echoRespondToAll
+		e.tundev.PostFilterPacketInboundFromWireGuard = echoRespondToAll
 	}
-	e.tundev.PreFilterOut = e.handleLocalPackets
+	e.tundev.PreFilterPacketOutboundToWireGuardEngineIntercept = e.handleLocalPackets
 
 	if envknob.BoolDefaultTrue("TS_DEBUG_CONNECT_FAILURES") {
-		if e.tundev.PreFilterIn != nil {
+		if e.tundev.PreFilterPacketInboundFromWireGuard != nil {
 			return nil, errors.New("unexpected PreFilterIn already set")
 		}
-		e.tundev.PreFilterIn = e.trackOpenPreFilterIn
-		if e.tundev.PostFilterOut != nil {
+		e.tundev.PreFilterPacketInboundFromWireGuard = e.trackOpenPreFilterIn
+		if e.tundev.PostFilterPacketOutboundToWireGuard != nil {
 			return nil, errors.New("unexpected PostFilterOut already set")
 		}
-		e.tundev.PostFilterOut = e.trackOpenPostFilterOut
+		e.tundev.PostFilterPacketOutboundToWireGuard = e.trackOpenPostFilterOut
 	}
 
 	e.wgLogger = wglog.NewLogger(logf)
@@ -387,8 +441,22 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 	}
 
+	e.tundev.OnICMPEchoResponseReceived = func(p *packet.Parsed) bool {
+		idSeq := p.EchoIDSeq()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		cb := e.icmpEchoResponseCallback[idSeq]
+		if cb == nil {
+			// We didn't swallow it, so let it flow to the host.
+			return false
+		}
+		e.logf("wgengine: got diagnostic ICMP response %02x", idSeq)
+		go cb()
+		return true
+	}
+
 	// wgdev takes ownership of tundev, will close it when closed.
-	e.logf("Creating wireguard device...")
+	e.logf("Creating WireGuard device...")
 	e.wgdev = wgcfg.NewDevice(e.tundev, e.magicConn.Bind(), e.wgLogger.DeviceLogger)
 	closePool.addFunc(e.wgdev.Close)
 	closePool.addFunc(func() {
@@ -413,7 +481,22 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 	}()
 
-	e.logf("Bringing wireguard device up...")
+	go func() {
+		select {
+		case <-e.wgdev.Wait():
+			e.mu.Lock()
+			closing := e.closing
+			e.mu.Unlock()
+			if !closing {
+				e.logf("Closing the engine because the WireGuard device has been closed...")
+				e.Close()
+			}
+		case <-e.waitCh:
+			// continue
+		}
+	}()
+
+	e.logf("Bringing WireGuard device up...")
 	if err := e.wgdev.Up(); err != nil {
 		return nil, fmt.Errorf("wgdev.Up: %w", err)
 	}
@@ -421,6 +504,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	if err := e.router.Up(); err != nil {
 		return nil, fmt.Errorf("router.Up: %w", err)
 	}
+	tsTUNDev.SetLinkFeaturesPostUp()
 
 	// It's a little pointless to apply no-op settings here (they
 	// should already be empty?), but it at least exercises the
@@ -429,17 +513,27 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	if err := e.router.Set(nil); err != nil {
 		return nil, fmt.Errorf("router.Set(nil): %w", err)
 	}
-	e.logf("Starting link monitor...")
-	e.linkMon.Start()
+	e.logf("Starting network monitor...")
+	e.netMon.Start()
 
-	go e.pollResolver()
+	if conf.SetSubsystem != nil {
+		conf.SetSubsystem(e.tundev)
+		conf.SetSubsystem(e.magicConn)
+		conf.SetSubsystem(e.dns)
+		conf.SetSubsystem(conf.Router)
+		conf.SetSubsystem(conf.Dialer)
+		conf.SetSubsystem(e.netMon)
+		if conf.DriveForLocal != nil {
+			conf.SetSubsystem(conf.DriveForLocal)
+		}
+	}
 
 	e.logf("Engine created.")
 	return e, nil
 }
 
 // echoRespondToAll is an inbound post-filter responding to all echo requests.
-func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
+func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper, gro *gro.GRO) (filter.Response, *gro.GRO) {
 	if p.IsEchoRequest() {
 		header := p.ICMP4Header()
 		header.ToResponse()
@@ -451,9 +545,9 @@ func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
 		// it away. If this ever gets run in non-fake mode, you'll
 		// get double responses to pings, which is an indicator you
 		// shouldn't be doing that I guess.)
-		return filter.Accept
+		return filter.Accept, gro
 	}
-	return filter.Accept
+	return filter.Accept, gro
 }
 
 // handleLocalPackets inspects packets coming from the local network
@@ -461,17 +555,11 @@ func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
 // tailscaled directly. Other packets are allowed to proceed into the
 // main ACL filter.
 func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
-	if verdict := e.handleDNS(p, t); verdict == filter.Drop {
-		metricMagicDNSPacketIn.Add(1)
-		// local DNS handled the packet.
-		return filter.Drop
-	}
-
 	if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
-		isLocalAddr, ok := e.isLocalAddr.Load().(func(netaddr.IP) bool)
+		isLocalAddr, ok := e.isLocalAddr.LoadOk()
 		if !ok {
 			e.logf("[unexpected] e.isLocalAddr was nil, can't check for loopback packet")
-		} else if isLocalAddr(p.Dst.IP()) {
+		} else if isLocalAddr(p.Dst.Addr()) {
 			// macOS NetworkExtension directs packets destined to the
 			// tunnel's local IP address into the tunnel, instead of
 			// looping back within the kernel network stack. We have to
@@ -486,104 +574,37 @@ func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper)
 	return filter.Accept
 }
 
-// handleDNS is an outbound pre-filter resolving Tailscale domains.
-func (e *userspaceEngine) handleDNS(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
-	if p.Dst.Port() == magicDNSPort && p.IPProto == ipproto.UDP {
-		switch p.Dst.IP() {
-		case magicDNSIP, magicDNSIPv6:
-			err := e.dns.EnqueueRequest(append([]byte(nil), p.Payload()...), p.Src)
-			if err != nil {
-				e.logf("dns: enqueue: %v", err)
-			}
-			return filter.Drop
-		}
-	}
-	return filter.Accept
-}
+var debugTrimWireguard = envknob.RegisterOptBool("TS_DEBUG_TRIM_WIREGUARD")
 
-// pollResolver reads responses from the DNS resolver and injects them inbound.
-func (e *userspaceEngine) pollResolver() {
-	for {
-		bs, to, err := e.dns.NextResponse()
-		if err == resolver.ErrClosed {
-			return
-		}
-		if err != nil {
-			e.logf("dns: error: %v", err)
-			continue
-		}
-
-		var buf []byte
-		const offset = tstun.PacketStartOffset
-		switch {
-		case to.IP().Is4():
-			h := packet.UDP4Header{
-				IP4Header: packet.IP4Header{
-					Src: magicDNSIP,
-					Dst: to.IP(),
-				},
-				SrcPort: magicDNSPort,
-				DstPort: to.Port(),
-			}
-			hlen := h.Len()
-			// TODO(dmytro): avoid this allocation without importing tstun quirks into dns.
-			buf = make([]byte, offset+hlen+len(bs))
-			copy(buf[offset+hlen:], bs)
-			h.Marshal(buf[offset:])
-		case to.IP().Is6():
-			h := packet.UDP6Header{
-				IP6Header: packet.IP6Header{
-					Src: magicDNSIPv6,
-					Dst: to.IP(),
-				},
-				SrcPort: magicDNSPort,
-				DstPort: to.Port(),
-			}
-			hlen := h.Len()
-			// TODO(dmytro): avoid this allocation without importing tstun quirks into dns.
-			buf = make([]byte, offset+hlen+len(bs))
-			copy(buf[offset+hlen:], bs)
-			h.Marshal(buf[offset:])
-		}
-		e.tundev.InjectInboundDirect(buf, offset)
-	}
-}
-
-var debugTrimWireguard = envknob.OptBool("TS_DEBUG_TRIM_WIREGUARD")
-
-// forceFullWireguardConfig reports whether we should give wireguard
-// our full network map, even for inactive peers
+// forceFullWireguardConfig reports whether we should give wireguard our full
+// network map, even for inactive peers.
 //
-// TODO(bradfitz): remove this after our 1.0 launch; we don't want to
-// enable wireguard config trimming quite yet because it just landed
-// and we haven't got enough time testing it.
-func forceFullWireguardConfig(numPeers int) bool {
-	// Did the user explicitly enable trimmming via the environment variable knob?
-	if b, ok := debugTrimWireguard.Get(); ok {
+// TODO(bradfitz): remove this at some point. We had a TODO to do it before 1.0
+// but it's still there as of 1.30. Really we should not do this wireguard lazy
+// peer config at all and just fix wireguard-go to not have so much extra memory
+// usage per peer. That would simplify a lot of Tailscale code. OTOH, we have 50
+// MB of memory on iOS now instead of 15 MB, so the other option is to just give
+// up on lazy wireguard config and blow the memory and hope for the best on iOS.
+// That's sad too. Or we get rid of these knobs (lazy wireguard config has been
+// stable!) but I'm worried that a future regression would be easier to debug
+// with these knobs in place.
+func (e *userspaceEngine) forceFullWireguardConfig(numPeers int) bool {
+	// Did the user explicitly enable trimming via the environment variable knob?
+	if b, ok := debugTrimWireguard().Get(); ok {
 		return !b
 	}
-	if opt := controlclient.TrimWGConfig(); opt != "" {
-		return !opt.EqualBool(true)
-	}
-
-	// On iOS with large networks, it's critical, so turn on trimming.
-	// Otherwise we run out of memory from wireguard-go goroutine stacks+buffers.
-	// This will be the default later for all platforms and network sizes.
-	if numPeers > 50 && version.OS() == "iOS" {
-		return false
-	}
-	return false
+	return e.controlKnobs != nil && e.controlKnobs.KeepFullWGConfig.Load()
 }
 
 // isTrimmablePeer reports whether p is a peer that we can trim out of the
 // network map.
 //
-// For implementation simplificy, we can only trim peers that have
+// For implementation simplicity, we can only trim peers that have
 // only non-subnet AllowedIPs (an IPv4 /32 or IPv6 /128), which is the
 // common case for most peers. Subnet router nodes will just always be
 // created in the wireguard-go config.
-func isTrimmablePeer(p *wgcfg.Peer, numPeers int) bool {
-	if forceFullWireguardConfig(numPeers) {
+func (e *userspaceEngine) isTrimmablePeer(p *wgcfg.Peer, numPeers int) bool {
+	if e.forceFullWireguardConfig(numPeers) {
 		return false
 	}
 
@@ -627,12 +648,12 @@ func (e *userspaceEngine) noteRecvActivity(nk key.NodePublic) {
 
 	// If the last activity time jumped a bunch (say, at least
 	// half the idle timeout) then see if we need to reprogram
-	// Wireguard. This could probably be just
+	// WireGuard. This could probably be just
 	// lazyPeerIdleThreshold without the divide by 2, but
 	// maybeReconfigWireguardLocked is cheap enough to call every
 	// couple minutes (just not on every packet).
 	if e.trimmedNodes[nk] {
-		e.logf("wgengine: idle peer %v now active, reconfiguring wireguard", nk.ShortString())
+		e.logf("wgengine: idle peer %v now active, reconfiguring WireGuard", nk.ShortString())
 		e.maybeReconfigWireguardLocked(nil)
 	}
 }
@@ -641,7 +662,7 @@ func (e *userspaceEngine) noteRecvActivity(nk key.NodePublic) {
 // has had a packet sent to or received from it since t.
 //
 // e.wgLock must be held.
-func (e *userspaceEngine) isActiveSinceLocked(nk key.NodePublic, ip netaddr.IP, t mono.Time) bool {
+func (e *userspaceEngine) isActiveSinceLocked(nk key.NodePublic, ip netip.Addr, t mono.Time) bool {
 	if e.recvActivityAt[nk].After(t) {
 		return true
 	}
@@ -680,20 +701,26 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 	activeCutoff := e.timeNow().Add(-lazyPeerIdleThreshold)
 
 	// Not all peers can be trimmed from the network map (see
-	// isTrimmablePeer).  For those are are trimmable, keep track of
-	// their NodeKey and Tailscale IPs.  These are the ones we'll need
+	// isTrimmablePeer). For those that are trimmable, keep track of
+	// their NodeKey and Tailscale IPs. These are the ones we'll need
 	// to install tracking hooks for to watch their send/receive
 	// activity.
 	trackNodes := make([]key.NodePublic, 0, len(full.Peers))
-	trackIPs := make([]netaddr.IP, 0, len(full.Peers))
+	trackIPs := make([]netip.Addr, 0, len(full.Peers))
 
-	trimmedNodes := map[key.NodePublic]bool{} // TODO: don't re-alloc this map each time
+	// Don't re-alloc the map; the Go compiler optimizes map clears as of
+	// Go 1.11, so we can re-use the existing + allocated map.
+	if e.trimmedNodes != nil {
+		clear(e.trimmedNodes)
+	} else {
+		e.trimmedNodes = make(map[key.NodePublic]bool)
+	}
 
 	needRemoveStep := false
 	for i := range full.Peers {
 		p := &full.Peers[i]
 		nk := p.PublicKey
-		if !isTrimmablePeer(p, len(full.Peers)) {
+		if !e.isTrimmablePeer(p, len(full.Peers)) {
 			min.Peers = append(min.Peers, *p)
 			if discoChanged[nk] {
 				needRemoveStep = true
@@ -703,8 +730,8 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 		trackNodes = append(trackNodes, nk)
 		recentlyActive := false
 		for _, cidr := range p.AllowedIPs {
-			trackIPs = append(trackIPs, cidr.IP())
-			recentlyActive = recentlyActive || e.isActiveSinceLocked(nk, cidr.IP(), activeCutoff)
+			trackIPs = append(trackIPs, cidr.Addr())
+			recentlyActive = recentlyActive || e.isActiveSinceLocked(nk, cidr.Addr(), activeCutoff)
 		}
 		if recentlyActive {
 			min.Peers = append(min.Peers, *p)
@@ -712,17 +739,19 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 				needRemoveStep = true
 			}
 		} else {
-			trimmedNodes[nk] = true
+			e.trimmedNodes[nk] = true
 		}
 	}
 	e.lastNMinPeers = len(min.Peers)
 
-	if !deephash.Update(&e.lastEngineSigTrim, &min, trimmedNodes, trackNodes, trackIPs) {
-		// No changes
+	if changed := deephash.Update(&e.lastEngineSigTrim, &struct {
+		WGConfig     *wgcfg.Config
+		TrimmedNodes map[key.NodePublic]bool
+		TrackNodes   []key.NodePublic
+		TrackIPs     []netip.Addr
+	}{&min, e.trimmedNodes, trackNodes, trackIPs}); !changed {
 		return nil
 	}
-
-	e.trimmedNodes = trimmedNodes
 
 	e.updateActivityMapsLocked(trackNodes, trackIPs)
 
@@ -746,7 +775,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 		}
 	}
 
-	e.logf("wgengine: Reconfig: configuring userspace wireguard config (with %d/%d peers)", len(min.Peers), len(full.Peers))
+	e.logf("wgengine: Reconfig: configuring userspace WireGuard config (with %d/%d peers)", len(min.Peers), len(full.Peers))
 	if err := wgcfg.ReconfigDevice(e.wgdev, &min, e.logf); err != nil {
 		e.logf("wgdev.Reconfig: %v", err)
 		return err
@@ -759,7 +788,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 // as given to wireguard-go.
 //
 // e.wgLock must be held.
-func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, trackIPs []netaddr.IP) {
+func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, trackIPs []netip.Addr) {
 	// Generate the new map of which nodekeys we want to track
 	// receive times for.
 	mr := map[key.NodePublic]mono.Time{} // TODO: only recreate this if set of keys changed
@@ -774,9 +803,9 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, 
 	e.recvActivityAt = mr
 
 	oldTime := e.sentActivityAt
-	e.sentActivityAt = make(map[netaddr.IP]*mono.Time, len(oldTime))
+	e.sentActivityAt = make(map[netip.Addr]*mono.Time, len(oldTime))
 	oldFunc := e.destIPActivityFuncs
-	e.destIPActivityFuncs = make(map[netaddr.IP]func(), len(oldFunc))
+	e.destIPActivityFuncs = make(map[netip.Addr]func(), len(oldFunc))
 
 	updateFn := func(timePtr *mono.Time) func() {
 		return func() {
@@ -822,18 +851,16 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, 
 
 // hasOverlap checks if there is a IPPrefix which is common amongst the two
 // provided slices.
-func hasOverlap(aips, rips []netaddr.IPPrefix) bool {
-	for _, aip := range aips {
-		for _, rip := range rips {
-			if aip == rip {
-				return true
-			}
+func hasOverlap(aips, rips views.Slice[netip.Prefix]) bool {
+	for _, aip := range aips.All() {
+		if views.SliceContains(rips, aip) {
+			return true
 		}
 	}
 	return false
 }
 
-func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config, debug *tailcfg.Debug) error {
+func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config) error {
 	if routerCfg == nil {
 		panic("routerCfg must not be nil")
 	}
@@ -841,36 +868,57 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		panic("dnsCfg must not be nil")
 	}
 
-	e.isLocalAddr.Store(tsaddr.NewContainsIPFunc(routerCfg.LocalAddrs))
+	e.isLocalAddr.Store(ipset.NewContainsIPFunc(views.SliceOf(routerCfg.LocalAddrs)))
 
 	e.wgLock.Lock()
 	defer e.wgLock.Unlock()
+	e.tundev.SetWGConfig(cfg)
 	e.lastDNSConfig = dnsCfg
 
-	peerSet := make(map[key.NodePublic]struct{}, len(cfg.Peers))
+	peerSet := make(set.Set[key.NodePublic], len(cfg.Peers))
 	e.mu.Lock()
 	e.peerSequence = e.peerSequence[:0]
 	for _, p := range cfg.Peers {
 		e.peerSequence = append(e.peerSequence, p.PublicKey)
-		peerSet[p.PublicKey] = struct{}{}
+		peerSet.Add(p.PublicKey)
 	}
+	nm := e.netMap
 	e.mu.Unlock()
 
 	listenPort := e.confListenPort
-	if debug != nil && debug.RandomizeClientPort {
+	if e.controlKnobs != nil && e.controlKnobs.RandomizeClientPort.Load() {
 		listenPort = 0
 	}
 
+	peerMTUEnable := e.magicConn.ShouldPMTUD()
+
 	isSubnetRouter := false
-	if e.birdClient != nil {
-		isSubnetRouter = hasOverlap(e.netMap.SelfNode.PrimaryRoutes, e.netMap.Hostinfo.RoutableIPs)
+	if e.birdClient != nil && nm != nil && nm.SelfNode.Valid() {
+		isSubnetRouter = hasOverlap(nm.SelfNode.PrimaryRoutes(), nm.SelfNode.Hostinfo().RoutableIPs())
+		e.logf("[v1] Reconfig: hasOverlap(%v, %v) = %v; isSubnetRouter=%v lastIsSubnetRouter=%v",
+			nm.SelfNode.PrimaryRoutes(), nm.SelfNode.Hostinfo().RoutableIPs(),
+			isSubnetRouter, isSubnetRouter, e.lastIsSubnetRouter)
 	}
 	isSubnetRouterChanged := isSubnetRouter != e.lastIsSubnetRouter
 
 	engineChanged := deephash.Update(&e.lastEngineSigFull, cfg)
-	routerChanged := deephash.Update(&e.lastRouterSig, routerCfg, dnsCfg)
-	if !engineChanged && !routerChanged && listenPort == e.magicConn.LocalPort() && !isSubnetRouterChanged {
+	routerChanged := deephash.Update(&e.lastRouterSig, &struct {
+		RouterConfig *router.Config
+		DNSConfig    *dns.Config
+	}{routerCfg, dnsCfg})
+	listenPortChanged := listenPort != e.magicConn.LocalPort()
+	peerMTUChanged := peerMTUEnable != e.magicConn.PeerMTUEnabled()
+	if !engineChanged && !routerChanged && !listenPortChanged && !isSubnetRouterChanged && !peerMTUChanged {
 		return ErrNoChanges
+	}
+	newLogIDs := cfg.NetworkLogging
+	oldLogIDs := e.lastCfgFull.NetworkLogging
+	netLogIDsNowValid := !newLogIDs.NodeID.IsZero() && !newLogIDs.DomainID.IsZero()
+	netLogIDsWasValid := !oldLogIDs.NodeID.IsZero() && !oldLogIDs.DomainID.IsZero()
+	netLogIDsChanged := netLogIDsNowValid && netLogIDsWasValid && newLogIDs != oldLogIDs
+	netLogRunning := netLogIDsNowValid && !routerCfg.Equal(&router.Config{})
+	if envknob.NoLogsNoSupport() {
+		netLogRunning = false
 	}
 
 	// TODO(bradfitz,danderson): maybe delete this isDNSIPOverTailscale
@@ -878,7 +926,7 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	// instead have ipnlocal populate a map of DNS IP => linkName and
 	// put that in the *dns.Config instead, and plumb it down to the
 	// dns.Manager. Maybe also with isLocalAddr above.
-	e.isDNSIPOverTailscale.Store(tsaddr.NewContainsIPFunc(dnsIPsOverTailscale(dnsCfg, routerCfg)))
+	e.isDNSIPOverTailscale.Store(ipset.NewContainsIPFunc(views.SliceOf(dnsIPsOverTailscale(dnsCfg, routerCfg))))
 
 	// See if any peers have changed disco keys, which means they've restarted.
 	// If so, we need to update the wireguard-go/device.Device in two phases:
@@ -916,15 +964,41 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	}
 	e.magicConn.UpdatePeers(peerSet)
 	e.magicConn.SetPreferredPort(listenPort)
+	e.magicConn.UpdatePMTUD()
 
 	if err := e.maybeReconfigWireguardLocked(discoChanged); err != nil {
 		return err
 	}
 
+	// Shutdown the network logger because the IDs changed.
+	// Let it be started back up by subsequent logic.
+	if netLogIDsChanged && e.networkLogger.Running() {
+		e.logf("wgengine: Reconfig: shutting down network logger")
+		ctx, cancel := context.WithTimeout(context.Background(), networkLoggerUploadTimeout)
+		defer cancel()
+		if err := e.networkLogger.Shutdown(ctx); err != nil {
+			e.logf("wgengine: Reconfig: error shutting down network logger: %v", err)
+		}
+	}
+
+	// Startup the network logger.
+	// Do this before configuring the router so that we capture initial packets.
+	if netLogRunning && !e.networkLogger.Running() {
+		nid := cfg.NetworkLogging.NodeID
+		tid := cfg.NetworkLogging.DomainID
+		logExitFlowEnabled := cfg.NetworkLogging.LogExitFlowEnabled
+		e.logf("wgengine: Reconfig: starting up network logger (node:%s tailnet:%s)", nid.Public(), tid.Public())
+		if err := e.networkLogger.Startup(cfg.NodeID, nid, tid, e.tundev, e.magicConn, e.netMon, e.health, logExitFlowEnabled); err != nil {
+			e.logf("wgengine: Reconfig: error starting up network logger: %v", err)
+		}
+		e.networkLogger.ReconfigRoutes(routerCfg)
+	}
+
 	if routerChanged {
 		e.logf("wgengine: Reconfig: configuring router")
+		e.networkLogger.ReconfigRoutes(routerCfg)
 		err := e.router.Set(routerCfg)
-		health.SetRouterHealth(err)
+		e.health.SetRouterHealth(err)
 		if err != nil {
 			return err
 		}
@@ -933,9 +1007,24 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		// assigned address.
 		e.logf("wgengine: Reconfig: configuring DNS")
 		err = e.dns.Set(*dnsCfg)
-		health.SetDNSHealth(err)
+		e.health.SetDNSHealth(err)
 		if err != nil {
 			return err
+		}
+		if err := e.reconfigureVPNIfNecessary(); err != nil {
+			return err
+		}
+	}
+
+	// Shutdown the network logger.
+	// Do this after configuring the router so that we capture final packets.
+	// This attempts to flush out any log messages and may block.
+	if !netLogRunning && e.networkLogger.Running() {
+		e.logf("wgengine: Reconfig: shutting down network logger")
+		ctx, cancel := context.WithTimeout(context.Background(), networkLoggerUploadTimeout)
+		defer cancel()
+		if err := e.networkLogger.Shutdown(ctx); err != nil {
+			e.logf("wgengine: Reconfig: error shutting down network logger: %v", err)
 		}
 	}
 
@@ -967,6 +1056,14 @@ func (e *userspaceEngine) SetFilter(filt *filter.Filter) {
 	e.tundev.SetFilter(filt)
 }
 
+func (e *userspaceEngine) GetJailedFilter() *filter.Filter {
+	return e.tundev.GetJailedFilter()
+}
+
+func (e *userspaceEngine) SetJailedFilter(filt *filter.Filter) {
+	e.tundev.SetJailedFilter(filt)
+}
+
 func (e *userspaceEngine) SetStatusCallback(cb StatusCallback) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -979,9 +1076,34 @@ func (e *userspaceEngine) getStatusCallback() StatusCallback {
 	return e.statusCallback
 }
 
-var singleNewline = []byte{'\n'}
-
 var ErrEngineClosing = errors.New("engine closing; no status")
+
+func (e *userspaceEngine) PeerByKey(pubKey key.NodePublic) (_ wgint.Peer, ok bool) {
+	e.wgLock.Lock()
+	dev := e.wgdev
+	e.wgLock.Unlock()
+
+	if dev == nil {
+		return wgint.Peer{}, false
+	}
+	peer := dev.LookupPeer(pubKey.Raw32())
+	if peer == nil {
+		return wgint.Peer{}, false
+	}
+	return wgint.PeerOf(peer), true
+}
+
+func (e *userspaceEngine) getPeerStatusLite(pk key.NodePublic) (status ipnstate.PeerStatusLite, ok bool) {
+	peer, ok := e.PeerByKey(pk)
+	if !ok {
+		return status, false
+	}
+	status.NodeKey = pk
+	status.RxBytes = int64(peer.RxBytes())
+	status.TxBytes = int64(peer.TxBytes())
+	status.LastHandshake = peer.LastHandshake()
+	return status, true
+}
 
 func (e *userspaceEngine) getStatus() (*Status, error) {
 	// Grab derpConns before acquiring wgLock to not violate lock ordering;
@@ -989,131 +1111,26 @@ func (e *userspaceEngine) getStatus() (*Status, error) {
 	// (See comment in userspaceEngine's declaration.)
 	derpConns := e.magicConn.DERPs()
 
-	e.wgLock.Lock()
-	defer e.wgLock.Unlock()
-
 	e.mu.Lock()
 	closing := e.closing
+	peerKeys := slices.Clone(e.peerSequence)
+	localAddrs := slices.Clone(e.endpoints)
 	e.mu.Unlock()
+
 	if closing {
 		return nil, ErrEngineClosing
 	}
 
-	if e.wgdev == nil {
-		// RequestStatus was invoked before the wgengine has
-		// finished initializing. This can happen when wgegine
-		// provides a callback to magicsock for endpoint
-		// updates that calls RequestStatus.
-		return nil, nil
-	}
-
-	pr, pw := io.Pipe()
-	defer pr.Close() // to unblock writes on error path returns
-
-	errc := make(chan error, 1)
-	go func() {
-		defer pw.Close()
-		// TODO(apenwarr): get rid of silly uapi stuff for in-process comms
-		// FIXME: get notified of status changes instead of polling.
-		err := e.wgdev.IpcGetOperation(pw)
-		if err != nil {
-			err = fmt.Errorf("IpcGetOperation: %w", err)
-		}
-		errc <- err
-	}()
-
-	pp := make(map[key.NodePublic]ipnstate.PeerStatusLite)
-	var p ipnstate.PeerStatusLite
-
-	var hst1, hst2, n int64
-
-	br := e.statusBufioReader
-	if br != nil {
-		br.Reset(pr)
-	} else {
-		br = bufio.NewReaderSize(pr, 1<<10)
-		e.statusBufioReader = br
-	}
-	for {
-		line, err := br.ReadSlice('\n')
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("reading from UAPI pipe: %w", err)
-		}
-		line = bytes.TrimSuffix(line, singleNewline)
-		k := line
-		var v mem.RO
-		if i := bytes.IndexByte(line, '='); i != -1 {
-			k = line[:i]
-			v = mem.B(line[i+1:])
-		}
-		switch string(k) {
-		case "public_key":
-			pk, err := key.ParseNodePublicUntyped(v)
-			if err != nil {
-				return nil, fmt.Errorf("IpcGetOperation: invalid key in line %q", line)
-			}
-			if !p.NodeKey.IsZero() {
-				pp[p.NodeKey] = p
-			}
-			p = ipnstate.PeerStatusLite{NodeKey: pk}
-		case "rx_bytes":
-			n, err = mem.ParseInt(v, 10, 64)
-			p.RxBytes = n
-			if err != nil {
-				return nil, fmt.Errorf("IpcGetOperation: rx_bytes invalid: %#v", line)
-			}
-		case "tx_bytes":
-			n, err = mem.ParseInt(v, 10, 64)
-			p.TxBytes = n
-			if err != nil {
-				return nil, fmt.Errorf("IpcGetOperation: tx_bytes invalid: %#v", line)
-			}
-		case "last_handshake_time_sec":
-			hst1, err = mem.ParseInt(v, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("IpcGetOperation: hst1 invalid: %#v", line)
-			}
-		case "last_handshake_time_nsec":
-			hst2, err = mem.ParseInt(v, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("IpcGetOperation: hst2 invalid: %#v", line)
-			}
-			if hst1 != 0 || hst2 != 0 {
-				p.LastHandshake = time.Unix(hst1, hst2)
-			} // else leave at time.IsZero()
-		}
-	}
-	if !p.NodeKey.IsZero() {
-		pp[p.NodeKey] = p
-	}
-	if err := <-errc; err != nil {
-		return nil, fmt.Errorf("IpcGetOperation: %v", err)
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Do two passes, one to calculate size and the other to populate.
-	// This code is sensitive to allocations.
-	npeers := 0
-	for _, pk := range e.peerSequence {
-		if _, ok := pp[pk]; ok { // ignore idle ones not in wireguard-go's config
-			npeers++
-		}
-	}
-
-	peers := make([]ipnstate.PeerStatusLite, 0, npeers)
-	for _, pk := range e.peerSequence {
-		if p, ok := pp[pk]; ok { // ignore idle ones not in wireguard-go's config
-			peers = append(peers, p)
+	peers := make([]ipnstate.PeerStatusLite, 0, len(peerKeys))
+	for _, key := range peerKeys {
+		if status, ok := e.getPeerStatusLite(key); ok {
+			peers = append(peers, status)
 		}
 	}
 
 	return &Status{
-		LocalAddrs: append([]tailcfg.Endpoint(nil), e.endpoints...),
+		AsOf:       time.Now(),
+		LocalAddrs: localAddrs,
 		Peers:      peers,
 		DERPs:      derpConns,
 	}, nil
@@ -1165,9 +1182,9 @@ func (e *userspaceEngine) Close() {
 	r := bufio.NewReader(strings.NewReader(""))
 	e.wgdev.IpcSetOperation(r)
 	e.magicConn.Close()
-	e.linkMonUnregister()
-	if e.linkMonOwned {
-		e.linkMon.Close()
+	e.netMonUnregister()
+	if e.netMonOwned {
+		e.netMon.Close()
 	}
 	e.dns.Down()
 	e.router.Close()
@@ -1178,24 +1195,21 @@ func (e *userspaceEngine) Close() {
 		e.birdClient.Close()
 	}
 	close(e.waitCh)
+
+	ctx, cancel := context.WithTimeout(context.Background(), networkLoggerUploadTimeout)
+	defer cancel()
+	if err := e.networkLogger.Shutdown(ctx); err != nil {
+		e.logf("wgengine: Close: error shutting down network logger: %v", err)
+	}
 }
 
-func (e *userspaceEngine) Wait() {
-	<-e.waitCh
+func (e *userspaceEngine) Done() <-chan struct{} {
+	return e.waitCh
 }
 
-func (e *userspaceEngine) GetLinkMonitor() *monitor.Mon {
-	return e.linkMon
-}
-
-// LinkChange signals a network change event. It's currently
-// (2021-03-03) only called on Android. On other platforms, linkMon
-// generates link change events for us.
-func (e *userspaceEngine) LinkChange(_ bool) {
-	e.linkMon.InjectEvent()
-}
-
-func (e *userspaceEngine) linkChange(changed bool, cur *interfaces.State) {
+func (e *userspaceEngine) linkChange(delta *netmon.ChangeDelta) {
+	changed := delta.Major // TODO(bradfitz): ask more specific questions?
+	cur := delta.New
 	up := cur.AnyInterfaceUp()
 	if !up {
 		e.logf("LinkChange: all links down; pausing: %v", cur)
@@ -1205,7 +1219,7 @@ func (e *userspaceEngine) linkChange(changed bool, cur *interfaces.State) {
 		e.logf("[v1] LinkChange: minor")
 	}
 
-	health.SetAnyInterfaceUp(up)
+	e.health.SetAnyInterfaceUp(up)
 	e.magicConn.SetNetworkUp(up)
 	if !up || changed {
 		if err := e.dns.FlushCaches(); err != nil {
@@ -1213,19 +1227,26 @@ func (e *userspaceEngine) linkChange(changed bool, cur *interfaces.State) {
 		}
 	}
 
-	// Hacky workaround for Linux DNS issue 2458: on
+	// Hacky workaround for Unix DNS issue 2458: on
 	// suspend/resume or whenever NetworkManager is started, it
 	// nukes all systemd-resolved configs. So reapply our DNS
 	// config on major link change.
-	if (runtime.GOOS == "linux" || runtime.GOOS == "android") && changed {
-		e.wgLock.Lock()
-		dnsCfg := e.lastDNSConfig
-		e.wgLock.Unlock()
-		if dnsCfg != nil {
-			if err := e.dns.Set(*dnsCfg); err != nil {
-				e.logf("wgengine: error setting DNS config after major link change: %v", err)
-			} else {
-				e.logf("wgengine: set DNS config again after major link change")
+	// TODO: explain why this is ncessary not just on Linux but also android
+	// and Apple platforms.
+	if changed {
+		switch runtime.GOOS {
+		case "linux", "android", "ios", "darwin", "openbsd":
+			e.wgLock.Lock()
+			dnsCfg := e.lastDNSConfig
+			e.wgLock.Unlock()
+			if dnsCfg != nil {
+				if err := e.dns.Set(*dnsCfg); err != nil {
+					e.logf("wgengine: error setting DNS config after major link change: %v", err)
+				} else if err := e.reconfigureVPNIfNecessary(); err != nil {
+					e.logf("wgengine: error reconfiguring VPN after major link change: %v", err)
+				} else {
+					e.logf("wgengine: set DNS config again after major link change")
+				}
 			}
 		}
 	}
@@ -1233,50 +1254,19 @@ func (e *userspaceEngine) linkChange(changed bool, cur *interfaces.State) {
 	why := "link-change-minor"
 	if changed {
 		why = "link-change-major"
+		metricNumMajorChanges.Add(1)
 		e.magicConn.Rebind()
+	} else {
+		metricNumMinorChanges.Add(1)
 	}
 	e.magicConn.ReSTUN(why)
-}
-
-func (e *userspaceEngine) AddNetworkMapCallback(cb NetworkMapCallback) func() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.networkMapCallbacks == nil {
-		e.networkMapCallbacks = make(map[*someHandle]NetworkMapCallback)
-	}
-	h := new(someHandle)
-	e.networkMapCallbacks[h] = cb
-	return func() {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		delete(e.networkMapCallbacks, h)
-	}
-}
-
-func (e *userspaceEngine) SetNetInfoCallback(cb NetInfoCallback) {
-	e.magicConn.SetNetInfoCallback(cb)
-}
-
-func (e *userspaceEngine) SetDERPMap(dm *tailcfg.DERPMap) {
-	e.magicConn.SetDERPMap(dm)
 }
 
 func (e *userspaceEngine) SetNetworkMap(nm *netmap.NetworkMap) {
 	e.magicConn.SetNetworkMap(nm)
 	e.mu.Lock()
 	e.netMap = nm
-	callbacks := make([]NetworkMapCallback, 0, 4)
-	for _, fn := range e.networkMapCallbacks {
-		callbacks = append(callbacks, fn)
-	}
 	e.mu.Unlock()
-	for _, fn := range callbacks {
-		fn(nm)
-	}
-}
-
-func (e *userspaceEngine) DiscoPublicKey() key.DiscoPublic {
-	return e.magicConn.DiscoPublicKey()
 }
 
 func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
@@ -1285,19 +1275,21 @@ func (e *userspaceEngine) UpdateStatus(sb *ipnstate.StatusBuilder) {
 		e.logf("wgengine: getStatus: %v", err)
 		return
 	}
-	for _, ps := range st.Peers {
-		sb.AddPeer(ps.NodeKey, &ipnstate.PeerStatus{
-			RxBytes:       int64(ps.RxBytes),
-			TxBytes:       int64(ps.TxBytes),
-			LastHandshake: ps.LastHandshake,
-			InEngine:      true,
-		})
+	if sb.WantPeers {
+		for _, ps := range st.Peers {
+			sb.AddPeer(ps.NodeKey, &ipnstate.PeerStatus{
+				RxBytes:       int64(ps.RxBytes),
+				TxBytes:       int64(ps.TxBytes),
+				LastHandshake: ps.LastHandshake,
+				InEngine:      true,
+			})
+		}
 	}
 
 	e.magicConn.UpdateStatus(sb)
 }
 
-func (e *userspaceEngine) Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.PingResult)) {
+func (e *userspaceEngine) Ping(ip netip.Addr, pingType tailcfg.PingType, size int, cb func(*ipnstate.PingResult)) {
 	res := &ipnstate.PingResult{IP: ip.String()}
 	pip, ok := e.PeerForIP(ip)
 	if !ok {
@@ -1314,36 +1306,86 @@ func (e *userspaceEngine) Ping(ip netaddr.IP, useTSMP bool, cb func(*ipnstate.Pi
 	}
 	peer := pip.Node
 
-	pingType := "disco"
-	if useTSMP {
-		pingType = "TSMP"
-	}
-	e.logf("ping(%v): sending %v ping to %v %v ...", ip, pingType, peer.Key.ShortString(), peer.ComputedName)
-	if useTSMP {
+	e.logf("ping(%v): sending %v ping to %v %v ...", ip, pingType, peer.Key().ShortString(), peer.ComputedName())
+	switch pingType {
+	case "disco":
+		e.magicConn.Ping(peer, res, size, cb)
+	case "TSMP":
 		e.sendTSMPPing(ip, peer, res, cb)
-	} else {
-		e.magicConn.Ping(peer, res, cb)
+	case "ICMP":
+		e.sendICMPEchoRequest(ip, peer, res, cb)
 	}
 }
 
-func (e *userspaceEngine) mySelfIPMatchingFamily(dst netaddr.IP) (src netaddr.IP, err error) {
+func (e *userspaceEngine) mySelfIPMatchingFamily(dst netip.Addr) (src netip.Addr, err error) {
+	var zero netip.Addr
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.netMap == nil {
-		return netaddr.IP{}, errors.New("no netmap")
+		return zero, errors.New("no netmap")
 	}
-	for _, a := range e.netMap.Addresses {
-		if a.IsSingleIP() && a.IP().BitLen() == dst.BitLen() {
-			return a.IP(), nil
+	addrs := e.netMap.GetAddresses()
+	if addrs.Len() == 0 {
+		return zero, errors.New("no self address in netmap")
+	}
+	for _, p := range addrs.All() {
+		if p.IsSingleIP() && p.Addr().BitLen() == dst.BitLen() {
+			return p.Addr(), nil
 		}
 	}
-	if len(e.netMap.Addresses) == 0 {
-		return netaddr.IP{}, errors.New("no self address in netmap")
-	}
-	return netaddr.IP{}, errors.New("no self address in netmap matching address family")
+	return zero, errors.New("no self address in netmap matching address family")
 }
 
-func (e *userspaceEngine) sendTSMPPing(ip netaddr.IP, peer *tailcfg.Node, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
+func (e *userspaceEngine) sendICMPEchoRequest(destIP netip.Addr, peer tailcfg.NodeView, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
+	srcIP, err := e.mySelfIPMatchingFamily(destIP)
+	if err != nil {
+		res.Err = err.Error()
+		cb(res)
+		return
+	}
+	var icmph packet.Header
+	if srcIP.Is4() {
+		icmph = packet.ICMP4Header{
+			IP4Header: packet.IP4Header{
+				IPProto: ipproto.ICMPv4,
+				Src:     srcIP,
+				Dst:     destIP,
+			},
+			Type: packet.ICMP4EchoRequest,
+			Code: packet.ICMP4NoCode,
+		}
+	} else {
+		icmph = packet.ICMP6Header{
+			IP6Header: packet.IP6Header{
+				IPProto: ipproto.ICMPv6,
+				Src:     srcIP,
+				Dst:     destIP,
+			},
+			Type: packet.ICMP6EchoRequest,
+			Code: packet.ICMP6NoCode,
+		}
+	}
+
+	idSeq, payload := packet.ICMPEchoPayload(nil)
+
+	expireTimer := time.AfterFunc(10*time.Second, func() {
+		e.setICMPEchoResponseCallback(idSeq, nil)
+	})
+	t0 := time.Now()
+	e.setICMPEchoResponseCallback(idSeq, func() {
+		expireTimer.Stop()
+		d := time.Since(t0)
+		res.LatencySeconds = d.Seconds()
+		res.NodeIP = destIP.String()
+		res.NodeName = peer.ComputedName()
+		cb(res)
+	})
+
+	icmpPing := packet.Generate(icmph, payload)
+	e.tundev.InjectOutbound(icmpPing)
+}
+
+func (e *userspaceEngine) sendTSMPPing(ip netip.Addr, peer tailcfg.NodeView, res *ipnstate.PingResult, cb func(*ipnstate.PingResult)) {
 	srcIP, err := e.mySelfIPMatchingFamily(ip)
 	if err != nil {
 		res.Err = err.Error()
@@ -1377,7 +1419,7 @@ func (e *userspaceEngine) sendTSMPPing(ip netaddr.IP, peer *tailcfg.Node, res *i
 		d := time.Since(t0)
 		res.LatencySeconds = d.Seconds()
 		res.NodeIP = ip.String()
-		res.NodeName = peer.ComputedName
+		res.NodeName = peer.ComputedName()
 		res.PeerAPIPort = pong.PeerAPIPort
 		cb(res)
 	})
@@ -1403,48 +1445,14 @@ func (e *userspaceEngine) setTSMPPongCallback(data [8]byte, cb func(packet.TSMPP
 	}
 }
 
-func (e *userspaceEngine) RegisterIPPortIdentity(ipport netaddr.IPPort, tsIP netaddr.IP) {
+func (e *userspaceEngine) setICMPEchoResponseCallback(idSeq uint32, cb func()) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.tsIPByIPPort == nil {
-		e.tsIPByIPPort = make(map[netaddr.IPPort]netaddr.IP)
+	if cb == nil {
+		delete(e.icmpEchoResponseCallback, idSeq)
+	} else {
+		mak.Set(&e.icmpEchoResponseCallback, idSeq, cb)
 	}
-	e.tsIPByIPPort[ipport] = tsIP
-}
-
-func (e *userspaceEngine) UnregisterIPPortIdentity(ipport netaddr.IPPort) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.tsIPByIPPort == nil {
-		return
-	}
-	delete(e.tsIPByIPPort, ipport)
-}
-
-var whoIsSleeps = [...]time.Duration{
-	0,
-	10 * time.Millisecond,
-	20 * time.Millisecond,
-	50 * time.Millisecond,
-	100 * time.Millisecond,
-}
-
-func (e *userspaceEngine) WhoIsIPPort(ipport netaddr.IPPort) (tsIP netaddr.IP, ok bool) {
-	// We currently have a registration race,
-	// https://github.com/tailscale/tailscale/issues/1616,
-	// so loop a few times for now waiting for the registration
-	// to appear.
-	// TODO(bradfitz,namansood): remove this once #1616 is fixed.
-	for _, d := range whoIsSleeps {
-		time.Sleep(d)
-		e.mu.Lock()
-		tsIP, ok = e.tsIPByIPPort[ipport]
-		e.mu.Unlock()
-		if ok {
-			return tsIP, true
-		}
-	}
-	return tsIP, false
 }
 
 // PeerForIP returns the Node in the wireguard config
@@ -1453,10 +1461,9 @@ func (e *userspaceEngine) WhoIsIPPort(ipport netaddr.IPPort) (tsIP netaddr.IP, o
 // If none is found in the wireguard config but one is found in
 // the netmap, it's described in an error.
 //
-//
 // peerForIP acquires both e.mu and e.wgLock, but neither at the same
 // time.
-func (e *userspaceEngine) PeerForIP(ip netaddr.IP) (ret PeerForIP, ok bool) {
+func (e *userspaceEngine) PeerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	e.mu.Lock()
 	nm := e.netMap
 	e.mu.Unlock()
@@ -1467,14 +1474,16 @@ func (e *userspaceEngine) PeerForIP(ip netaddr.IP) (ret PeerForIP, ok bool) {
 	// Check for exact matches before looking for subnet matches.
 	// TODO(bradfitz): add maps for these. on NetworkMap?
 	for _, p := range nm.Peers {
-		for _, a := range p.Addresses {
-			if a.IP() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
+		for i := range p.Addresses().Len() {
+			a := p.Addresses().At(i)
+			if a.Addr() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
 				return PeerForIP{Node: p, Route: a}, true
 			}
 		}
 	}
-	for _, a := range nm.Addresses {
-		if a.IP() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
+	addrs := nm.GetAddresses()
+	for i := range addrs.Len() {
+		if a := addrs.At(i); a.Addr() == ip && a.IsSingleIP() && tsaddr.IsTailscaleIP(ip) {
 			return PeerForIP{Node: nm.SelfNode, IsSelf: true, Route: a}, true
 		}
 	}
@@ -1483,14 +1492,14 @@ func (e *userspaceEngine) PeerForIP(ip netaddr.IP) (ret PeerForIP, ok bool) {
 	defer e.wgLock.Unlock()
 
 	// TODO(bradfitz): this is O(n peers). Add ART to netaddr?
-	var best netaddr.IPPrefix
+	var best netip.Prefix
 	var bestKey key.NodePublic
 	for _, p := range e.lastCfgFull.Peers {
 		for _, cidr := range p.AllowedIPs {
 			if !cidr.Contains(ip) {
 				continue
 			}
-			if best.IsZero() || cidr.Bits() > best.Bits() {
+			if !best.IsValid() || cidr.Bits() > best.Bits() {
 				best = cidr
 				bestKey = p.PublicKey
 			}
@@ -1500,7 +1509,7 @@ func (e *userspaceEngine) PeerForIP(ip netaddr.IP) (ret PeerForIP, ok bool) {
 	// call. But TODO(bradfitz): add a lookup map to netmap.NetworkMap.
 	if !bestKey.IsZero() {
 		for _, p := range nm.Peers {
-			if p.Key == bestKey {
+			if p.Key() == bestKey {
 				return PeerForIP{Node: p, Route: best}, true
 			}
 		}
@@ -1521,7 +1530,7 @@ func (p closeOnErrorPool) closeAllIfError(errp *error) {
 }
 
 // ipInPrefixes reports whether ip is in any of pp.
-func ipInPrefixes(ip netaddr.IP, pp []netaddr.IPPrefix) bool {
+func ipInPrefixes(ip netip.Addr, pp []netip.Prefix) bool {
 	for _, p := range pp {
 		if p.Contains(ip) {
 			return true
@@ -1533,15 +1542,15 @@ func ipInPrefixes(ip netaddr.IP, pp []netaddr.IPPrefix) bool {
 // dnsIPsOverTailscale returns the IPPrefixes of DNS resolver IPs that are
 // routed over Tailscale. The returned value does not contain duplicates is
 // not necessarily sorted.
-func dnsIPsOverTailscale(dnsCfg *dns.Config, routerCfg *router.Config) (ret []netaddr.IPPrefix) {
-	m := map[netaddr.IP]bool{}
+func dnsIPsOverTailscale(dnsCfg *dns.Config, routerCfg *router.Config) (ret []netip.Prefix) {
+	m := map[netip.Addr]bool{}
 
-	add := func(resolvers []dnstype.Resolver) {
+	add := func(resolvers []*dnstype.Resolver) {
 		for _, r := range resolvers {
-			ip, err := netaddr.ParseIP(r.Addr)
+			ip, err := netip.ParseAddr(r.Addr)
 			if err != nil {
-				if ipp, err := netaddr.ParseIPPort(r.Addr); err == nil {
-					ip = ipp.IP()
+				if ipp, err := netip.ParseAddrPort(r.Addr); err == nil {
+					ip = ipp.Addr()
 				} else {
 					continue
 				}
@@ -1557,9 +1566,9 @@ func dnsIPsOverTailscale(dnsCfg *dns.Config, routerCfg *router.Config) (ret []ne
 		add(resolvers)
 	}
 
-	ret = make([]netaddr.IPPrefix, 0, len(m))
+	ret = make([]netip.Prefix, 0, len(m))
 	for ip := range m {
-		ret = append(ret, netaddr.IPPrefixFrom(ip, ip.BitLen()))
+		ret = append(ret, netip.PrefixFrom(ip, ip.BitLen()))
 	}
 	return ret
 }
@@ -1571,14 +1580,28 @@ type fwdDNSLinkSelector struct {
 	tunName string
 }
 
-func (ls fwdDNSLinkSelector) PickLink(ip netaddr.IP) (linkName string) {
-	if ls.ue.isDNSIPOverTailscale.Load().(func(netaddr.IP) bool)(ip) {
+func (ls fwdDNSLinkSelector) PickLink(ip netip.Addr) (linkName string) {
+	if ls.ue.isDNSIPOverTailscale.Load()(ip) {
 		return ls.tunName
 	}
 	return ""
 }
 
 var (
-	metricMagicDNSPacketIn = clientmetric.NewGauge("magicdns_packet_in") // for 100.100.100.100
-	metricReflectToOS      = clientmetric.NewGauge("packet_reflect_to_os")
+	metricReflectToOS = clientmetric.NewCounter("packet_reflect_to_os")
+
+	metricNumMajorChanges = clientmetric.NewCounter("wgengine_major_changes")
+	metricNumMinorChanges = clientmetric.NewCounter("wgengine_minor_changes")
 )
+
+func (e *userspaceEngine) InstallCaptureHook(cb capture.Callback) {
+	e.tundev.InstallCaptureHook(cb)
+	e.magicConn.InstallCaptureHook(cb)
+}
+
+func (e *userspaceEngine) reconfigureVPNIfNecessary() error {
+	if e.reconfigureVPN == nil {
+		return nil
+	}
+	return e.reconfigureVPN()
+}

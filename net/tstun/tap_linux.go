@@ -1,26 +1,35 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
+//go:build !ts_omit_tap
 
 package tstun
 
 import (
+	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
+	"sync"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/sys/unix"
-	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
-	"inet.af/netaddr"
+	"tailscale.com/net/netaddr"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/tsaddr"
+	"tailscale.com/syncs"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/types/logger"
+	"tailscale.com/util/multierr"
 )
 
 // TODO: this was randomly generated once. Maybe do it per process start? But
@@ -31,13 +40,13 @@ var ourMAC = net.HardwareAddr{0x30, 0x2D, 0x66, 0xEC, 0x7A, 0x93}
 
 func init() { createTAP = createTAPLinux }
 
-func createTAPLinux(tapName, bridgeName string) (tun.Device, error) {
+func createTAPLinux(logf logger.Logf, tapName, bridgeName string) (tun.Device, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	dev, err := openDevice(fd, tapName, bridgeName)
+	dev, err := openDevice(logf, fd, tapName, bridgeName)
 	if err != nil {
 		unix.Close(fd)
 		return nil, err
@@ -46,7 +55,7 @@ func createTAPLinux(tapName, bridgeName string) (tun.Device, error) {
 	return dev, nil
 }
 
-func openDevice(fd int, tapName, bridgeName string) (tun.Device, error) {
+func openDevice(logf logger.Logf, fd int, tapName, bridgeName string) (tun.Device, error) {
 	ifr, err := unix.NewIfreq(tapName)
 	if err != nil {
 		return nil, err
@@ -67,13 +76,7 @@ func openDevice(fd int, tapName, bridgeName string) (tun.Device, error) {
 		}
 	}
 
-	// Also sets non-blocking I/O on fd when creating tun.Device.
-	dev, _, err := tun.CreateUnmonitoredTUNFromFD(fd) // TODO: MTU
-	if err != nil {
-		return nil, err
-	}
-
-	return dev, nil
+	return newTAPDevice(logf, fd, tapName)
 }
 
 type etherType [2]byte
@@ -93,7 +96,7 @@ const (
 
 // handleTAPFrame handles receiving a raw TAP ethernet frame and reports whether
 // it's been handled (that is, whether it should NOT be passed to wireguard).
-func (t *Wrapper) handleTAPFrame(ethBuf []byte) bool {
+func (t *tapDevice) handleTAPFrame(ethBuf []byte) bool {
 
 	if len(ethBuf) < ethernetFrameSize {
 		// Corrupt. Ignore.
@@ -156,7 +159,7 @@ func (t *Wrapper) handleTAPFrame(ethBuf []byte) bool {
 
 			// If the client's asking about their own IP, tell them it's
 			// their own MAC. TODO(bradfitz): remove String allocs.
-			if net.IP(req.ProtocolAddressTarget()).String() == theClientIP {
+			if net.IP(req.ProtocolAddressTarget()).String() == t.clientIPv4.Load() {
 				copy(res.HardwareAddressSender(), ethSrcMAC)
 			} else {
 				copy(res.HardwareAddressSender(), ourMAC[:])
@@ -166,7 +169,7 @@ func (t *Wrapper) handleTAPFrame(ethBuf []byte) bool {
 			copy(res.HardwareAddressTarget(), req.HardwareAddressSender())
 			copy(res.ProtocolAddressTarget(), req.ProtocolAddressSender())
 
-			n, err := t.tdev.Write(buf, 0)
+			n, err := t.WriteEthernet(buf)
 			if tapDebug {
 				t.logf("tap: wrote ARP reply %v, %v", n, err)
 			}
@@ -176,14 +179,17 @@ func (t *Wrapper) handleTAPFrame(ethBuf []byte) bool {
 	}
 }
 
-// TODO(bradfitz): remove these hard-coded values and move from a /24 to a /10 CGNAT as the range.
-const theClientIP = "100.70.145.3" // TODO: make dynamic from netmap
-const routerIP = "100.70.145.1"    // must be in same netmask (currently hack at /24) as theClientIP
+var (
+	// routerIP is the IP address of the DHCP server.
+	routerIP = net.ParseIP(tsaddr.TailscaleServiceIPString)
+	// cgnatNetMask is the netmask of the 100.64.0.0/10 CGNAT range.
+	cgnatNetMask = net.IPMask(net.ParseIP("255.192.0.0").To4())
+)
 
 // handleDHCPRequest handles receiving a raw TAP ethernet frame and reports whether
 // it's been handled as a DHCP request. That is, it reports whether the frame should
 // be ignored by the caller and not passed on.
-func (t *Wrapper) handleDHCPRequest(ethBuf []byte) bool {
+func (t *tapDevice) handleDHCPRequest(ethBuf []byte) bool {
 	const udpHeader = 8
 	if len(ethBuf) < ethernetFrameSize+ipv4HeaderLen+udpHeader {
 		if tapDebug {
@@ -208,7 +214,7 @@ func (t *Wrapper) handleDHCPRequest(ethBuf []byte) bool {
 	if p.IPProto != ipproto.UDP || p.Src.Port() != 68 || p.Dst.Port() != 67 {
 		// Not a DHCP request.
 		if tapDebug {
-			t.logf("tap: DHCP wrong meta")
+			t.logf("tap: DHCP wrong meta: %+v", p)
 		}
 		return passOnPacket
 	}
@@ -226,17 +232,22 @@ func (t *Wrapper) handleDHCPRequest(ethBuf []byte) bool {
 	}
 	switch dp.MessageType() {
 	case dhcpv4.MessageTypeDiscover:
+		ips := t.clientIPv4.Load()
+		if ips == "" {
+			t.logf("tap: DHCP no client IP")
+			return consumePacket
+		}
 		offer, err := dhcpv4.New(
 			dhcpv4.WithReply(dp),
 			dhcpv4.WithMessageType(dhcpv4.MessageTypeOffer),
-			dhcpv4.WithRouter(net.ParseIP(routerIP)), // the default route
-			dhcpv4.WithDNS(net.ParseIP("100.100.100.100")),
-			dhcpv4.WithServerIP(net.ParseIP("100.100.100.100")), // TODO: what is this?
-			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(net.ParseIP("100.100.100.100"))),
-			dhcpv4.WithYourIP(net.ParseIP(theClientIP)),
+			dhcpv4.WithRouter(routerIP), // the default route
+			dhcpv4.WithDNS(routerIP),
+			dhcpv4.WithServerIP(routerIP), // TODO: what is this?
+			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(routerIP)),
+			dhcpv4.WithYourIP(net.ParseIP(ips)),
 			dhcpv4.WithLeaseTime(3600), // hour works
 			//dhcpv4.WithHwAddr(ethSrcMAC),
-			dhcpv4.WithNetmask(net.IPMask(net.ParseIP("255.255.255.0").To4())), // TODO: wrong
+			dhcpv4.WithNetmask(cgnatNetMask),
 			//dhcpv4.WithTransactionID(dp.TransactionID),
 		)
 		if err != nil {
@@ -247,24 +258,30 @@ func (t *Wrapper) handleDHCPRequest(ethBuf []byte) bool {
 		pkt := packLayer2UDP(
 			offer.ToBytes(),
 			ourMAC, ethSrcMAC,
-			netaddr.IPPortFrom(netaddr.IPv4(100, 100, 100, 100), 67), // src
-			netaddr.IPPortFrom(netaddr.IPv4(255, 255, 255, 255), 68), // dst
+			netip.AddrPortFrom(netaddr.IPv4(100, 100, 100, 100), 67), // src
+			netip.AddrPortFrom(netaddr.IPv4(255, 255, 255, 255), 68), // dst
 		)
-		n, err := t.tdev.Write(pkt, 0)
+
+		n, err := t.WriteEthernet(pkt)
 		if tapDebug {
 			t.logf("tap: wrote DHCP OFFER %v, %v", n, err)
 		}
 	case dhcpv4.MessageTypeRequest:
+		ips := t.clientIPv4.Load()
+		if ips == "" {
+			t.logf("tap: DHCP no client IP")
+			return consumePacket
+		}
 		ack, err := dhcpv4.New(
 			dhcpv4.WithReply(dp),
 			dhcpv4.WithMessageType(dhcpv4.MessageTypeAck),
-			dhcpv4.WithDNS(net.ParseIP("100.100.100.100")),
-			dhcpv4.WithRouter(net.ParseIP(routerIP)),            // the default route
-			dhcpv4.WithServerIP(net.ParseIP("100.100.100.100")), // TODO: what is this?
-			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(net.ParseIP("100.100.100.100"))),
-			dhcpv4.WithYourIP(net.ParseIP(theClientIP)), // Hello world
-			dhcpv4.WithLeaseTime(3600),                  // hour works
-			dhcpv4.WithNetmask(net.IPMask(net.ParseIP("255.255.255.0").To4())),
+			dhcpv4.WithDNS(routerIP),
+			dhcpv4.WithRouter(routerIP),   // the default route
+			dhcpv4.WithServerIP(routerIP), // TODO: what is this?
+			dhcpv4.WithOption(dhcpv4.OptServerIdentifier(routerIP)),
+			dhcpv4.WithYourIP(net.ParseIP(ips)), // Hello world
+			dhcpv4.WithLeaseTime(3600),          // hour works
+			dhcpv4.WithNetmask(cgnatNetMask),
 		)
 		if err != nil {
 			t.logf("error building DHCP ack: %v", err)
@@ -274,10 +291,10 @@ func (t *Wrapper) handleDHCPRequest(ethBuf []byte) bool {
 		pkt := packLayer2UDP(
 			ack.ToBytes(),
 			ourMAC, ethSrcMAC,
-			netaddr.IPPortFrom(netaddr.IPv4(100, 100, 100, 100), 67), // src
-			netaddr.IPPortFrom(netaddr.IPv4(255, 255, 255, 255), 68), // dst
+			netip.AddrPortFrom(netaddr.IPv4(100, 100, 100, 100), 67), // src
+			netip.AddrPortFrom(netaddr.IPv4(255, 255, 255, 255), 68), // dst
 		)
-		n, err := t.tdev.Write(pkt, 0)
+		n, err := t.WriteEthernet(pkt)
 		if tapDebug {
 			t.logf("tap: wrote DHCP ACK %v, %v", n, err)
 		}
@@ -289,21 +306,26 @@ func (t *Wrapper) handleDHCPRequest(ethBuf []byte) bool {
 	return consumePacket
 }
 
-func packLayer2UDP(payload []byte, srcMAC, dstMAC net.HardwareAddr, src, dst netaddr.IPPort) []byte {
-	buf := buffer.NewView(header.EthernetMinimumSize + header.UDPMinimumSize + header.IPv4MinimumSize + len(payload))
-	payloadStart := len(buf) - len(payload)
-	copy(buf[payloadStart:], payload)
-	srcB := src.IP().As4()
-	srcIP := tcpip.Address(srcB[:])
-	dstB := dst.IP().As4()
-	dstIP := tcpip.Address(dstB[:])
+func writeEthernetFrame(buf []byte, srcMAC, dstMAC net.HardwareAddr, proto tcpip.NetworkProtocolNumber) {
 	// Ethernet header
 	eth := header.Ethernet(buf)
 	eth.Encode(&header.EthernetFields{
 		SrcAddr: tcpip.LinkAddress(srcMAC),
 		DstAddr: tcpip.LinkAddress(dstMAC),
-		Type:    ipv4.ProtocolNumber,
+		Type:    proto,
 	})
+}
+
+func packLayer2UDP(payload []byte, srcMAC, dstMAC net.HardwareAddr, src, dst netip.AddrPort) []byte {
+	buf := make([]byte, header.EthernetMinimumSize+header.UDPMinimumSize+header.IPv4MinimumSize+len(payload))
+	payloadStart := len(buf) - len(payload)
+	copy(buf[payloadStart:], payload)
+	srcB := src.Addr().As4()
+	srcIP := tcpip.AddrFromSlice(srcB[:])
+	dstB := dst.Addr().As4()
+	dstIP := tcpip.AddrFromSlice(dstB[:])
+	// Ethernet header
+	writeEthernetFrame(buf, srcMAC, dstMAC, ipv4.ProtocolNumber)
 	// IP header
 	ipbuf := buf[header.EthernetMinimumSize:]
 	ip := header.IPv4(ipbuf)
@@ -325,7 +347,7 @@ func packLayer2UDP(payload []byte, srcMAC, dstMAC net.HardwareAddr, src, dst net
 	// Calculate the UDP pseudo-header checksum.
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, srcIP, dstIP, uint16(len(u)))
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 	return []byte(buf)
 }
@@ -340,26 +362,141 @@ func run(prog string, args ...string) error {
 	return nil
 }
 
-func (t *Wrapper) destMAC() [6]byte {
-	mac, _ := t.destMACAtomic.Load().([6]byte)
-	return mac
+func (t *tapDevice) destMAC() [6]byte {
+	return t.destMACAtomic.Load()
 }
 
-func (t *Wrapper) tapWrite(buf []byte, offset int) (int, error) {
-	if offset < ethernetFrameSize {
-		return 0, fmt.Errorf("[unexpected] weird offset %d for TAP write", offset)
+func newTAPDevice(logf logger.Logf, fd int, tapName string) (tun.Device, error) {
+	err := unix.SetNonblock(fd, true)
+	if err != nil {
+		return nil, err
 	}
-	eth := buf[offset-ethernetFrameSize:]
-	dst := t.destMAC()
-	copy(eth[:6], dst[:])
-	copy(eth[6:12], ourMAC[:])
-	et := etherTypeIPv4
-	if buf[offset]>>4 == 6 {
-		et = etherTypeIPv6
+	file := os.NewFile(uintptr(fd), "/dev/tap")
+	d := &tapDevice{
+		logf:   logf,
+		file:   file,
+		events: make(chan tun.Event),
+		name:   tapName,
 	}
-	eth[12], eth[13] = et[0], et[1]
-	if tapDebug {
-		t.logf("tap: tapWrite off=%v % x", offset, buf)
+	return d, nil
+}
+
+type tapDevice struct {
+	file       *os.File
+	logf       func(format string, args ...any)
+	events     chan tun.Event
+	name       string
+	closeOnce  sync.Once
+	clientIPv4 syncs.AtomicValue[string]
+
+	destMACAtomic syncs.AtomicValue[[6]byte]
+}
+
+var _ setIPer = (*tapDevice)(nil)
+
+func (t *tapDevice) SetIP(ipV4, ipV6TODO netip.Addr) error {
+	t.clientIPv4.Store(ipV4.String())
+	return nil
+}
+
+func (t *tapDevice) File() *os.File {
+	return t.file
+}
+
+func (t *tapDevice) Name() (string, error) {
+	return t.name, nil
+}
+
+// Read reads an IP packet from the TAP device. It strips the ethernet frame header.
+func (t *tapDevice) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
+	n, err := t.ReadEthernet(buffs, sizes, offset)
+	if err != nil || n == 0 {
+		return n, err
 	}
-	return t.tdev.Write(buf, offset-ethernetFrameSize)
+	// Strip the ethernet frame header.
+	copy(buffs[0][offset:], buffs[0][offset+ethernetFrameSize:offset+sizes[0]])
+	sizes[0] -= ethernetFrameSize
+	return 1, nil
+}
+
+// ReadEthernet reads a raw ethernet frame from the TAP device.
+func (t *tapDevice) ReadEthernet(buffs [][]byte, sizes []int, offset int) (int, error) {
+	n, err := t.file.Read(buffs[0][offset:])
+	if err != nil {
+		return 0, err
+	}
+	if t.handleTAPFrame(buffs[0][offset : offset+n]) {
+		return 0, nil
+	}
+	sizes[0] = n
+	return 1, nil
+}
+
+// WriteEthernet writes a raw ethernet frame to the TAP device.
+func (t *tapDevice) WriteEthernet(buf []byte) (int, error) {
+	return t.file.Write(buf)
+}
+
+// ethBufPool holds a pool of bytes.Buffers for use in [tapDevice.Write].
+var ethBufPool = syncs.Pool[*bytes.Buffer]{New: func() *bytes.Buffer { return new(bytes.Buffer) }}
+
+// Write writes a raw IP packet to the TAP device. It adds the ethernet frame header.
+func (t *tapDevice) Write(buffs [][]byte, offset int) (int, error) {
+	errs := make([]error, 0)
+	wrote := 0
+	m := t.destMAC()
+	dstMac := net.HardwareAddr(m[:])
+	buf := ethBufPool.Get()
+	defer ethBufPool.Put(buf)
+	for _, buff := range buffs {
+		buf.Reset()
+		buf.Grow(header.EthernetMinimumSize + len(buff) - offset)
+
+		var ebuf [14]byte
+		switch buff[offset] >> 4 {
+		case 4:
+			writeEthernetFrame(ebuf[:], ourMAC, dstMac, ipv4.ProtocolNumber)
+		case 6:
+			writeEthernetFrame(ebuf[:], ourMAC, dstMac, ipv6.ProtocolNumber)
+		default:
+			continue
+		}
+		buf.Write(ebuf[:])
+		buf.Write(buff[offset:])
+		_, err := t.WriteEthernet(buf.Bytes())
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			wrote++
+		}
+	}
+	return wrote, multierr.New(errs...)
+}
+
+func (t *tapDevice) MTU() (int, error) {
+	ifr, err := unix.NewIfreq(t.name)
+	if err != nil {
+		return 0, err
+	}
+	if err := unix.IoctlIfreq(int(t.file.Fd()), unix.SIOCGIFMTU, ifr); err != nil {
+		return 0, err
+	}
+	return int(ifr.Uint32()), nil
+}
+
+func (t *tapDevice) Events() <-chan tun.Event {
+	return t.events
+}
+
+func (t *tapDevice) Close() error {
+	var err error
+	t.closeOnce.Do(func() {
+		close(t.events)
+		err = t.file.Close()
+	})
+	return err
+}
+
+func (t *tapDevice) BatchSize() int {
+	return 1
 }

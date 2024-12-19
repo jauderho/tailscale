@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package hostinfo
 
@@ -8,24 +7,35 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
+	"strings"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/winutil"
+	"tailscale.com/util/winutil/winenv"
 )
 
 func init() {
-	osVersion = osVersionWindows
-	packageType = packageTypeWindows
+	distroName = lazyDistroName.Get
+	osVersion = lazyOSVersion.Get
+	packageType = lazyPackageType.Get
 }
 
-var winVerCache atomic.Value // of string
+var (
+	lazyDistroName  = &lazyAtomicValue[string]{f: ptr.To(distroNameWindows)}
+	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionWindows)}
+	lazyPackageType = &lazyAtomicValue[string]{f: ptr.To(packageTypeWindows)}
+)
+
+func distroNameWindows() string {
+	if winenv.IsWindowsServer() {
+		return "Server"
+	}
+	return ""
+}
 
 func osVersionWindows() string {
-	if s, ok := winVerCache.Load().(string); ok {
-		return s
-	}
 	major, minor, build := windows.RtlGetNtVersionNumbers()
 	s := fmt.Sprintf("%d.%d.%d", major, minor, build)
 	// Windows 11 still uses 10 as its major number internally
@@ -33,9 +43,6 @@ func osVersionWindows() string {
 		if ubr, err := getUBR(); err == nil {
 			s += fmt.Sprintf(".%d", ubr)
 		}
-	}
-	if s != "" {
-		winVerCache.Store(s)
 	}
 	return s // "10.0.19041.388", ideally
 }
@@ -65,20 +72,23 @@ func packageTypeWindows() string {
 	if _, err := os.Stat(`C:\ProgramData\chocolatey\lib\tailscale`); err == nil {
 		return "choco"
 	}
-	if msiSentinel := winutil.GetRegInteger("MSI", 0); msiSentinel == 1 {
-		return "msi"
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
 	}
-	dir := filepath.Dir(exe)
-	nsisUninstaller := filepath.Join(dir, "Uninstall-Tailscale.exe")
-	_, err = os.Stat(nsisUninstaller)
-	if err == nil {
-		return "nsis"
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(exe, filepath.Join(home, "scoop", "apps", "tailscale")) {
+		return "scoop"
 	}
-	// Atypical. Not worth trying to detect. Likely open
-	// source tailscaled or a developer running by hand.
-	return ""
+	msiSentinel, _ := winutil.GetRegInteger("MSI")
+	if msiSentinel != 1 {
+		// Atypical. Not worth trying to detect. Likely open
+		// source tailscaled or a developer running by hand.
+		return ""
+	}
+	result := "msi"
+	if env, _ := winutil.GetRegString("MSIDist"); env != "" {
+		result += "/" + env
+	}
+	return result
 }

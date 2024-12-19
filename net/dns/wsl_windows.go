@@ -1,11 +1,11 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -13,15 +13,23 @@ import (
 	"os/user"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
+	"tailscale.com/health"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/winutil"
 )
 
 // wslDistros reports the names of the installed WSL2 linux distributions.
 func wslDistros() ([]string, error) {
-	b, err := wslCombinedOutput(exec.Command("wsl.exe", "-l"))
+	// There is a bug in some builds of wsl.exe that causes it to block
+	// indefinitely while executing this operation. Set a timeout so that we don't
+	// get wedged! (Issue #7476)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b, err := wslCombinedOutput(exec.CommandContext(ctx, "wsl.exe", "-l"))
 	if err != nil {
 		return nil, fmt.Errorf("%v: %q", err, string(b))
 	}
@@ -47,12 +55,14 @@ func wslDistros() ([]string, error) {
 // wslManager is a DNS manager for WSL2 linux distributions.
 // It configures /etc/wsl.conf and /etc/resolv.conf.
 type wslManager struct {
-	logf logger.Logf
+	logf   logger.Logf
+	health *health.Tracker
 }
 
-func newWSLManager(logf logger.Logf) *wslManager {
+func newWSLManager(logf logger.Logf, health *health.Tracker) *wslManager {
 	m := &wslManager{
-		logf: logf,
+		logf:   logf,
+		health: health,
 	}
 	return m
 }
@@ -66,7 +76,7 @@ func (wm *wslManager) SetDNS(cfg OSConfig) error {
 	}
 	managers := make(map[string]*directManager)
 	for _, distro := range distros {
-		managers[distro] = newDirectManagerOnFS(wm.logf, wslFS{
+		managers[distro] = newDirectManagerOnFS(wm.logf, wm.health, wslFS{
 			user:   "root",
 			distro: distro,
 		})
@@ -149,6 +159,10 @@ func (fs wslFS) Stat(name string) (isRegular bool, err error) {
 	return true, nil
 }
 
+func (fs wslFS) Chmod(name string, perm os.FileMode) error {
+	return wslRun(fs.cmd("chmod", "--", fmt.Sprintf("%04o", perm), name))
+}
+
 func (fs wslFS) Rename(oldName, newName string) error {
 	return wslRun(fs.cmd("mv", "--", oldName, newName))
 }
@@ -218,8 +232,8 @@ func wslRun(cmd *exec.Cmd) (err error) {
 	}
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Token:      syscall.Token(token),
-		HideWindow: true,
+		CreationFlags: windows.CREATE_NO_WINDOW,
+		Token:         syscall.Token(token),
 	}
 	return cmd.Run()
 }

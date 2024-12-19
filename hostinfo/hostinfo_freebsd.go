@@ -1,60 +1,64 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build freebsd
-// +build freebsd
 
 package hostinfo
 
 import (
-	"fmt"
+	"bytes"
 	"os"
 	"os/exec"
-	"strings"
 
 	"golang.org/x/sys/unix"
+	"tailscale.com/types/ptr"
 	"tailscale.com/version/distro"
 )
 
 func init() {
-	osVersion = osVersionFreebsd
+	osVersion = lazyOSVersion.Get
+	distroName = distroNameFreeBSD
+	distroVersion = distroVersionFreeBSD
 }
 
-func osVersionFreebsd() string {
-	un := unix.Utsname{}
+var (
+	lazyVersionMeta = &lazyAtomicValue[versionMeta]{f: ptr.To(freebsdVersionMeta)}
+	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionFreeBSD)}
+)
+
+func distroNameFreeBSD() string {
+	return lazyVersionMeta.Get().DistroName
+}
+
+func distroVersionFreeBSD() string {
+	return lazyVersionMeta.Get().DistroVersion
+}
+
+type versionMeta struct {
+	DistroName     string
+	DistroVersion  string
+	DistroCodeName string
+}
+
+func osVersionFreeBSD() string {
+	var un unix.Utsname
 	unix.Uname(&un)
+	return unix.ByteSliceToString(un.Release[:])
+}
 
-	var attrBuf strings.Builder
-	attrBuf.WriteString("; version=")
-	for _, b := range un.Release {
-		if b == 0 {
-			break
-		}
-		attrBuf.WriteByte(byte(b))
-	}
-	attr := attrBuf.String()
-
-	version := "FreeBSD"
-	switch distro.Get() {
+func freebsdVersionMeta() (meta versionMeta) {
+	d := distro.Get()
+	meta.DistroName = string(d)
+	switch d {
 	case distro.Pfsense:
 		b, _ := os.ReadFile("/etc/version")
-		version = fmt.Sprintf("pfSense %s", b)
+		meta.DistroVersion = string(bytes.TrimSpace(b))
 	case distro.OPNsense:
-		b, err := exec.Command("opnsense-version").Output()
-		if err == nil {
-			version = string(b)
-		} else {
-			version = "OPNsense"
-		}
+		b, _ := exec.Command("opnsense-version").Output()
+		meta.DistroVersion = string(bytes.TrimSpace(b))
 	case distro.TrueNAS:
-		b, err := os.ReadFile("/etc/version")
-		if err == nil {
-			version = string(b)
-		} else {
-			version = "TrueNAS"
-		}
+		b, _ := os.ReadFile("/etc/version")
+		meta.DistroVersion = string(bytes.TrimSpace(b))
 	}
-	// the /etc/version files end in a newline
-	return fmt.Sprintf("%s%s", strings.TrimSuffix(version, "\n"), attr)
+	return
 }

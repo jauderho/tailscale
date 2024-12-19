@@ -1,7 +1,6 @@
 #!/bin/sh
-# Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-# Use of this source code is governed by a BSD-style
-# license that can be found in the LICENSE file.
+# Copyright (c) Tailscale Inc & AUTHORS
+# SPDX-License-Identifier: BSD-3-Clause
 #
 # This script detects the current operating system, and installs
 # Tailscale according to that OS's conventions.
@@ -41,10 +40,10 @@ main() {
 		#  - ID: the short name of the OS (e.g. "debian", "freebsd")
 		#  - VERSION_ID: the numeric release version for the OS, if any (e.g. "18.04")
 		#  - VERSION_CODENAME: the codename of the OS release, if any (e.g. "buster")
-		#  - UBUNTU_CODENAME: if it exists, as in linuxmint, use instead of VERSION_CODENAME
+		#  - UBUNTU_CODENAME: if it exists, use instead of VERSION_CODENAME
 		. /etc/os-release
 		case "$ID" in
-			ubuntu|pop|neon|zorin|elementary|linuxmint)
+			ubuntu|pop|neon|zorin|tuxedo)
 				OS="ubuntu"
 				if [ "${UBUNTU_CODENAME:-}" != "" ]; then
 				    VERSION="$UBUNTU_CODENAME"
@@ -66,11 +65,65 @@ main() {
 				PACKAGETYPE="apt"
 				# Third-party keyrings became the preferred method of
 				# installation in Debian 11 (Bullseye).
-				if [ "$VERSION_ID" -lt 11 ]; then
+				if [ -z "${VERSION_ID:-}" ]; then
+					# rolling release. If you haven't kept current, that's on you.
+					APT_KEY_TYPE="keyring"
+				elif [ "$VERSION_ID" -lt 11 ]; then
 					APT_KEY_TYPE="legacy"
 				else
 					APT_KEY_TYPE="keyring"
 				fi
+				;;
+			linuxmint)
+				if [ "${UBUNTU_CODENAME:-}" != "" ]; then
+				    OS="ubuntu"
+				    VERSION="$UBUNTU_CODENAME"
+				elif [ "${DEBIAN_CODENAME:-}" != "" ]; then
+				    OS="debian"
+				    VERSION="$DEBIAN_CODENAME"
+				else
+				    OS="ubuntu"
+				    VERSION="$VERSION_CODENAME"
+				fi
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 5 ]; then
+					APT_KEY_TYPE="legacy"
+				else
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			elementary)
+				OS="ubuntu"
+				VERSION="$UBUNTU_CODENAME"
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 6 ]; then
+					APT_KEY_TYPE="legacy"
+				else
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			parrot|mendel)
+				OS="debian"
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 5 ]; then
+					VERSION="buster"
+					APT_KEY_TYPE="legacy"
+				else
+					VERSION="bullseye"
+					APT_KEY_TYPE="keyring"
+				fi
+				;;
+			galliumos)
+				OS="ubuntu"
+				PACKAGETYPE="apt"
+				VERSION="bionic"
+				APT_KEY_TYPE="legacy"
+				;;
+			pureos|kaisen)
+				OS="debian"
+				PACKAGETYPE="apt"
+				VERSION="bullseye"
+				APT_KEY_TYPE="keyring"
 				;;
 			raspbian)
 				OS="$ID"
@@ -101,6 +154,17 @@ main() {
 					APT_KEY_TYPE="keyring"
 				fi
 				;;
+			Deepin)  # https://github.com/tailscale/tailscale/issues/7862
+				OS="debian"
+				PACKAGETYPE="apt"
+				if [ "$VERSION_ID" -lt 20 ]; then
+					APT_KEY_TYPE="legacy"
+					VERSION="buster"
+				else
+					APT_KEY_TYPE="keyring"
+					VERSION="bullseye"
+				fi
+				;;
 			centos)
 				OS="$ID"
 				VERSION="$VERSION_ID"
@@ -121,13 +185,16 @@ main() {
 				OS="$ID"
 				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
 				PACKAGETYPE="dnf"
+				if [ "$VERSION" = "7" ]; then
+					PACKAGETYPE="yum"
+				fi
 				;;
 			fedora)
 				OS="$ID"
 				VERSION=""
 				PACKAGETYPE="dnf"
 				;;
-			rocky)
+			rocky|almalinux|nobara|openmandriva|sangoma|risios|cloudlinux|alinux|fedora-asahi-remix)
 				OS="fedora"
 				VERSION=""
 				PACKAGETYPE="dnf"
@@ -137,7 +204,12 @@ main() {
 				VERSION="$VERSION_ID"
 				PACKAGETYPE="yum"
 				;;
-			opensuse-leap)
+			xenenterprise)
+				OS="centos"
+				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
+				PACKAGETYPE="yum"
+				;;
+			opensuse-leap|sles)
 				OS="opensuse"
 				VERSION="leap/$VERSION_ID"
 				PACKAGETYPE="zypper"
@@ -147,18 +219,28 @@ main() {
 				VERSION="tumbleweed"
 				PACKAGETYPE="zypper"
 				;;
-			arch)
-				OS="$ID"
+			sle-micro-rancher)
+				OS="opensuse"
+				VERSION="leap/15.4"
+				PACKAGETYPE="zypper"
+				;;
+			arch|archarm|endeavouros|blendos|garuda|archcraft)
+				OS="arch"
 				VERSION="" # rolling release
 				PACKAGETYPE="pacman"
 				;;
-			manjaro)
-				OS="$ID"
+			manjaro|manjaro-arm)
+				OS="manjaro"
 				VERSION="" # rolling release
 				PACKAGETYPE="pacman"
 				;;
 			alpine)
 				OS="$ID"
+				VERSION="$VERSION_ID"
+				PACKAGETYPE="apk"
+				;;
+			postmarketos)
+				OS="alpine"
 				VERSION="$VERSION_ID"
 				PACKAGETYPE="apk"
 				;;
@@ -183,6 +265,18 @@ main() {
 				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
 				PACKAGETYPE="pkg"
 				;;
+			osmc)
+				OS="debian"
+				PACKAGETYPE="apt"
+				VERSION="bullseye"
+				APT_KEY_TYPE="keyring"
+				;;
+			photon)
+				OS="photon"
+				VERSION="$(echo "$VERSION_ID" | cut -f1 -d.)"
+				PACKAGETYPE="tdnf"
+				;;
+
 			# TODO: wsl?
 			# TODO: synology? qnap?
 		esac
@@ -220,75 +314,39 @@ main() {
 		fi
 	fi
 
+	# Ideally we want to use curl, but on some installs we
+	# only have wget. Detect and use what's available.
+	CURL=
+	if type curl >/dev/null; then
+		CURL="curl -fsSL"
+	elif type wget >/dev/null; then
+		CURL="wget -q -O-"
+	fi
+	if [ -z "$CURL" ]; then
+		echo "The installer needs either curl or wget to download files."
+		echo "Please install either curl or wget to proceed."
+		exit 1
+	fi
+
+	TEST_URL="https://pkgs.tailscale.com/"
+	RC=0
+	TEST_OUT=$($CURL "$TEST_URL" 2>&1) || RC=$?
+	if [ $RC != 0 ]; then
+		echo "The installer cannot reach $TEST_URL"
+		echo "Please make sure that your machine has internet access."
+		echo "Test output:"
+		echo $TEST_OUT
+		exit 1
+	fi
+
 	# Step 2: having detected an OS we support, is it one of the
 	# versions we support?
 	OS_UNSUPPORTED=
 	case "$OS" in
-		ubuntu)
-			if [ "$VERSION" != "xenial" ] && \
-			   [ "$VERSION" != "bionic" ] && \
-			   [ "$VERSION" != "eoan" ] && \
-			   [ "$VERSION" != "focal" ] && \
-			   [ "$VERSION" != "groovy" ] && \
-			   [ "$VERSION" != "hirsute" ] && \
-			   [ "$VERSION" != "impish" ] && \
-			   [ "$VERSION" != "jammy" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		debian)
-			if [ "$VERSION" != "stretch" ] && \
-			   [ "$VERSION" != "buster" ] && \
-			   [ "$VERSION" != "bullseye" ] && \
-			   [ "$VERSION" != "bookworm" ] && \
-			   [ "$VERSION" != "sid" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		raspbian)
-			if [ "$VERSION" != "buster" ] && \
-			   [ "$VERSION" != "bullseye" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		centos)
-			if [ "$VERSION" != "7" ] && \
-			   [ "$VERSION" != "8" ] && \
-			   [ "$VERSION" != "9" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		oracle)
-			if [ "$VERSION" != "7" ] && \
-			   [ "$VERSION" != "8" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		rhel)
-			if [ "$VERSION" != "8" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		amazon-linux)
-			if [ "$VERSION" != "2" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
-		;;
-		opensuse)
-			if [ "$VERSION" != "leap/15.1" ] && \
-			   [ "$VERSION" != "leap/15.2" ] && \
-			   [ "$VERSION" != "leap/15.3" ] && \
-			   [ "$VERSION" != "tumbleweed" ]
-			then
-				OS_UNSUPPORTED=1
-			fi
+		ubuntu|debian|raspbian|centos|oracle|rhel|amazon-linux|opensuse|photon)
+			# Check with the package server whether a given version is supported.
+			URL="https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/installer-supported"
+			$CURL "$URL" 2> /dev/null | grep -q OK || OS_UNSUPPORTED=1
 			;;
 		fedora)
 			# All versions supported, no version checking required.
@@ -390,24 +448,13 @@ main() {
 
 
 	# Step 4: run the installation.
-	echo "Installing Tailscale for $OS $VERSION, using method $PACKAGETYPE"
+	OSVERSION="$OS"
+	[ "$VERSION" != "" ] && OSVERSION="$OSVERSION $VERSION"
+	echo "Installing Tailscale for $OSVERSION, using method $PACKAGETYPE"
 	case "$PACKAGETYPE" in
 		apt)
-			# Ideally we want to use curl, but on some installs we
-			# only have wget. Detect and use what's available.
-			CURL=
-			if type curl >/dev/null; then
-				CURL="curl -fsSL"
-			elif type wget >/dev/null; then
-				CURL="wget -q -O-"
-			fi
-			if [ -z "$CURL" ]; then
-				echo "The installer needs either curl or wget to download files."
-				echo "Please install either curl or wget to proceed."
-				exit 1
-			fi
 			export DEBIAN_FRONTEND=noninteractive
-			if ! type gpg >/dev/null; then
+			if [ "$APT_KEY_TYPE" = "legacy" ] && ! type gpg >/dev/null; then
 				$SUDO apt-get update
 				$SUDO apt-get install -y gnupg
 			fi
@@ -425,7 +472,7 @@ main() {
 				;;
 			esac
 			$SUDO apt-get update
-			$SUDO apt-get install -y tailscale
+			$SUDO apt-get install -y tailscale tailscale-archive-keyring
 			if [ "$APT_SYSTEMCTL_START" = "true" ]; then
 				$SUDO systemctl enable --now tailscaled
 				$SUDO systemctl start tailscaled
@@ -434,47 +481,104 @@ main() {
 		;;
 		yum)
 			set -x
-			$SUDO yum install yum-utils
+			$SUDO yum install yum-utils -y
 			$SUDO yum-config-manager -y --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
 			$SUDO yum install tailscale -y
 			$SUDO systemctl enable --now tailscaled
 			set +x
 		;;
 		dnf)
+			# DNF 5 has a different argument format; determine which one we have.
+			DNF_VERSION="3"
+			if dnf --version | grep -q '^dnf5 version'; then
+				DNF_VERSION="5"
+			fi
+
+			# The 'config-manager' plugin wasn't implemented when
+			# DNF5 was released; detect that and use the old
+			# version if necessary.
+			if [ "$DNF_VERSION" = "5" ]; then
+				set -x
+				$SUDO dnf install -y 'dnf-command(config-manager)' && DNF_HAVE_CONFIG_MANAGER=1 || DNF_HAVE_CONFIG_MANAGER=0
+				set +x
+
+				if [ "$DNF_HAVE_CONFIG_MANAGER" != "1" ]; then
+					if type dnf-3 >/dev/null; then
+						DNF_VERSION="3"
+					else
+						echo "dnf 5 detected, but 'dnf-command(config-manager)' not available and dnf-3 not found"
+						exit 1
+					fi
+				fi
+			fi
+
 			set -x
-			$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			if [ "$DNF_VERSION" = "3" ]; then
+				$SUDO dnf install -y 'dnf-command(config-manager)'
+				$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			elif [ "$DNF_VERSION" = "5" ]; then
+				# Already installed config-manager, above.
+				$SUDO dnf config-manager addrepo --from-repofile="https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			else
+				echo "unexpected: unknown dnf version $DNF_VERSION"
+				exit 1
+			fi
 			$SUDO dnf install -y tailscale
+			$SUDO systemctl enable --now tailscaled
+			set +x
+		;;
+		tdnf)
+			set -x
+			curl -fsSL "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo" > /etc/yum.repos.d/tailscale.repo
+			$SUDO tdnf install -y tailscale
 			$SUDO systemctl enable --now tailscaled
 			set +x
 		;;
 		zypper)
 			set -x
-			$SUDO zypper ar -g -r "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
-			$SUDO zypper ref
-			$SUDO zypper in tailscale
+			$SUDO rpm --import "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/repo.gpg"
+			$SUDO zypper --non-interactive ar -g -r "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			$SUDO zypper --non-interactive --gpg-auto-import-keys refresh
+			$SUDO zypper --non-interactive install tailscale
 			$SUDO systemctl enable --now tailscaled
 			set +x
 			;;
 		pacman)
 			set -x
-			$SUDO pacman -S tailscale
+			$SUDO pacman -S tailscale --noconfirm
 			$SUDO systemctl enable --now tailscaled
+			set +x
+			;;
+		pkg)
+			set -x
+			$SUDO pkg install tailscale
+			$SUDO service tailscaled enable
+			$SUDO service tailscaled start
 			set +x
 			;;
 		apk)
 			set -x
+			if ! grep -Eq '^http.*/community$' /etc/apk/repositories; then
+				if type setup-apkrepos >/dev/null; then
+					$SUDO setup-apkrepos -c -1
+				else
+					echo "installing tailscale requires the community repo to be enabled in /etc/apk/repositories"
+					exit 1
+				fi
+			fi
 			$SUDO apk add tailscale
 			$SUDO rc-update add tailscale
+			$SUDO rc-service tailscale start
 			set +x
 			;;
 		xbps)
 			set -x
-			$SUDO xbps-install tailscale -y 
+			$SUDO xbps-install tailscale -y
 			set +x
 			;;
 		emerge)
 			set -x
-			$SUDO emerge net-vpn/tailscale
+			$SUDO emerge --ask=n net-vpn/tailscale
 			set +x
 			;;
 		appstore)

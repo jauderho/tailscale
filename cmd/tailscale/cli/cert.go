@@ -1,23 +1,26 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"software.sslmate.com/src/go-pkcs12"
 	"tailscale.com/atomicfile"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	"tailscale.com/version"
 )
@@ -25,32 +28,35 @@ import (
 var certCmd = &ffcli.Command{
 	Name:       "cert",
 	Exec:       runCert,
-	ShortHelp:  "get TLS certs",
-	ShortUsage: "cert [flags] <domain>",
+	ShortHelp:  "Get TLS certs",
+	ShortUsage: "tailscale cert [flags] <domain>",
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("cert")
 		fs.StringVar(&certArgs.certFile, "cert-file", "", "output cert file or \"-\" for stdout; defaults to DOMAIN.crt if --cert-file and --key-file are both unset")
-		fs.StringVar(&certArgs.keyFile, "key-file", "", "output cert file or \"-\" for stdout; defaults to DOMAIN.key if --cert-file and --key-file are both unset")
+		fs.StringVar(&certArgs.keyFile, "key-file", "", "output key file or \"-\" for stdout; defaults to DOMAIN.key if --cert-file and --key-file are both unset")
 		fs.BoolVar(&certArgs.serve, "serve-demo", false, "if true, serve on port :443 using the cert as a demo, instead of writing out the files to disk")
+		fs.DurationVar(&certArgs.minValidity, "min-validity", 0, "ensure the certificate is valid for at least this duration; the output certificate is never expired if this flag is unset or 0, but the lifetime may vary; the maximum allowed min-validity depends on the CA")
 		return fs
 	})(),
 }
 
 var certArgs struct {
-	certFile string
-	keyFile  string
-	serve    bool
+	certFile    string
+	keyFile     string
+	serve       bool
+	minValidity time.Duration
 }
 
 func runCert(ctx context.Context, args []string) error {
 	if certArgs.serve {
 		s := &http.Server{
+			Addr: ":443",
 			TLSConfig: &tls.Config{
-				GetCertificate: tailscale.GetCertificate,
+				GetCertificate: localClient.GetCertificate,
 			},
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.TLS != nil && !strings.Contains(r.Host, ".") && r.Method == "GET" {
-					if v, ok := tailscale.ExpandSNIName(r.Context(), r.Host); ok {
+					if v, ok := localClient.ExpandSNIName(r.Context(), r.Host); ok {
 						http.Redirect(w, r, "https://"+v+r.URL.Path, http.StatusTemporaryRedirect)
 						return
 					}
@@ -58,13 +64,22 @@ func runCert(ctx context.Context, args []string) error {
 				fmt.Fprintf(w, "<h1>Hello from Tailscale</h1>It works.")
 			}),
 		}
-		log.Printf("running TLS server on :443 ...")
+		switch len(args) {
+		case 0:
+			// Nothing.
+		case 1:
+			s.Addr = args[0]
+		default:
+			return errors.New("too many arguments; max 1 allowed with --serve-demo (the listen address)")
+		}
+
+		log.Printf("running TLS server on %s ...", s.Addr)
 		return s.ListenAndServeTLS("", "")
 	}
 
 	if len(args) != 1 {
 		var hint bytes.Buffer
-		if st, err := tailscale.Status(ctx); err == nil {
+		if st, err := localClient.Status(ctx); err == nil {
 			if st.BackendState != ipn.Running.String() {
 				fmt.Fprintf(&hint, "\nTailscale is not running.\n")
 			} else if len(st.CertDomains) == 0 {
@@ -79,7 +94,7 @@ func runCert(ctx context.Context, args []string) error {
 	}
 	domain := args[0]
 
-	printf := func(format string, a ...interface{}) {
+	printf := func(format string, a ...any) {
 		printf(format, a...)
 	}
 	if certArgs.certFile == "-" || certArgs.keyFile == "-" {
@@ -90,7 +105,7 @@ func runCert(ctx context.Context, args []string) error {
 		certArgs.certFile = domain + ".crt"
 		certArgs.keyFile = domain + ".key"
 	}
-	certPEM, keyPEM, err := tailscale.CertPair(ctx, domain)
+	certPEM, keyPEM, err := localClient.CertPairWithValidity(ctx, domain, certArgs.minValidity)
 	if err != nil {
 		return err
 	}
@@ -120,17 +135,25 @@ func runCert(ctx context.Context, args []string) error {
 			}
 		}
 	}
-	if certArgs.keyFile != "" {
-		keyChanged, err := writeIfChanged(certArgs.keyFile, keyPEM, 0600)
+	if dst := certArgs.keyFile; dst != "" {
+		contents := keyPEM
+		if isPKCS12(dst) {
+			var err error
+			contents, err = convertToPKCS12(certPEM, keyPEM)
+			if err != nil {
+				return err
+			}
+		}
+		keyChanged, err := writeIfChanged(dst, contents, 0600)
 		if err != nil {
 			return err
 		}
 		if certArgs.keyFile != "-" {
 			macWarn()
 			if keyChanged {
-				printf("Wrote private key to %v\n", certArgs.keyFile)
+				printf("Wrote private key to %v\n", dst)
 			} else {
-				printf("Private key unchanged at %v\n", certArgs.keyFile)
+				printf("Private key unchanged at %v\n", dst)
 			}
 		}
 	}
@@ -149,4 +172,30 @@ func writeIfChanged(filename string, contents []byte, mode os.FileMode) (changed
 		return false, err
 	}
 	return true, nil
+}
+
+func isPKCS12(dst string) bool {
+	return strings.HasSuffix(dst, ".p12") || strings.HasSuffix(dst, ".pfx")
+}
+
+func convertToPKCS12(certPEM, keyPEM []byte) ([]byte, error) {
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	var certs []*x509.Certificate
+	for _, c := range cert.Certificate {
+		cert, err := x509.ParseCertificate(c)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+	}
+	if len(certs) == 0 {
+		return nil, errors.New("no certs")
+	}
+	// TODO(bradfitz): I'm not sure this is right yet. The goal was to make this
+	// work for https://github.com/tailscale/tailscale/issues/2928 but I'm still
+	// fighting Windows.
+	return pkcs12.Encode(rand.Reader, cert.PrivateKey, certs[0], certs[1:], "" /* no password */)
 }

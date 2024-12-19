@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package safesocket
 
@@ -9,12 +8,16 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+
+	"tailscale.com/version"
 )
 
 func init() {
@@ -25,8 +28,9 @@ func init() {
 // from /Library/Tailscale.
 //
 // In that case the files are:
-//    /Library/Tailscale/ipnport => $port (symlink with localhost port number target)
-//    /Library/Tailscale/sameuserproof-$port is a file with auth
+//
+//	/Library/Tailscale/ipnport => $port (symlink with localhost port number target)
+//	/Library/Tailscale/sameuserproof-$port is a file with auth
 func localTCPPortAndTokenMacsys() (port int, token string, err error) {
 
 	const dir = "/Library/Tailscale"
@@ -46,8 +50,21 @@ func localTCPPortAndTokenMacsys() (port int, token string, err error) {
 	if auth == "" {
 		return 0, "", errors.New("empty auth token in sameuserproof file")
 	}
+
+	// The above files exist forever after the first run of
+	// /Applications/Tailscale.app, so check we can connect to avoid returning a
+	// port nothing is listening on. Connect to "127.0.0.1" rather than
+	// "localhost" due to #7851.
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+portStr, time.Second)
+	if err != nil {
+		return 0, "", err
+	}
+	conn.Close()
+
 	return port, auth, nil
 }
+
+var warnAboutRootOnce sync.Once
 
 func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 	// There are two ways this binary can be run: as the Mac App Store sandboxed binary,
@@ -57,7 +74,7 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 
 	if dir := os.Getenv("TS_MACOS_CLI_SHARED_DIR"); dir != "" {
 		// First see if we're running as the non-AppStore "macsys" variant.
-		if strings.Contains(os.Getenv("HOME"), "/Containers/io.tailscale.ipn.macsys/") {
+		if version.IsMacSys() {
 			if port, token, err := localTCPPortAndTokenMacsys(); err == nil {
 				return port, token, nil
 			}
@@ -66,7 +83,7 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 		// The current binary (this process) is sandboxed. The user is
 		// running the CLI via /Applications/Tailscale.app/Contents/MacOS/Tailscale
 		// which sets the TS_MACOS_CLI_SHARED_DIR environment variable.
-		fis, err := ioutil.ReadDir(dir)
+		fis, err := os.ReadDir(dir)
 		if err != nil {
 			return 0, "", err
 		}
@@ -82,6 +99,14 @@ func localTCPPortAndTokenDarwin() (port int, token string, err error) {
 					}
 				}
 			}
+		}
+		if os.Geteuid() == 0 {
+			// Log a warning as the clue to the user, in case the error
+			// message is swallowed. Only do this once since we may retry
+			// multiple times to connect, and don't want to spam.
+			warnAboutRootOnce.Do(func() {
+				fmt.Fprintf(os.Stderr, "Warning: The CLI is running as root from within a sandboxed binary. It cannot reach the local tailscaled, please try again as a regular user.\n")
+			})
 		}
 		return 0, "", fmt.Errorf("failed to find sandboxed sameuserproof-* file in TS_MACOS_CLI_SHARED_DIR %q", dir)
 	}

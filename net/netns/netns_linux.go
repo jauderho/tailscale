@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
-// +build linux,!android
 
 package netns
 
@@ -15,17 +13,11 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/envknob"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/linuxfw"
 )
-
-// tailscaleBypassMark is the mark indicating that packets originating
-// from a socket should bypass Tailscale-managed routes during routing
-// table lookups.
-//
-// Keep this in sync with tailscaleBypassMark in
-// wgengine/router/router_linux.go.
-const tailscaleBypassMark = 0x80000
 
 // socketMarkWorksOnce is the sync.Once & cached value for useSocketMark.
 var socketMarkWorksOnce struct {
@@ -62,9 +54,14 @@ func socketMarkWorks() bool {
 	return true
 }
 
-// useSocketMark reports whether SO_MARK works.
+var forceBindToDevice = envknob.RegisterBool("TS_FORCE_LINUX_BIND_TO_DEVICE")
+
+// UseSocketMark reports whether SO_MARK is in use.
 // If it doesn't, we have to use SO_BINDTODEVICE on our sockets instead.
-func useSocketMark() bool {
+func UseSocketMark() bool {
+	if forceBindToDevice() {
+		return false
+	}
 	socketMarkWorksOnce.Do(func() {
 		socketMarkWorksOnce.v = socketMarkWorks()
 	})
@@ -81,7 +78,7 @@ func ignoreErrors() bool {
 	return false
 }
 
-func control(logger.Logf) func(network, address string, c syscall.RawConn) error {
+func control(logger.Logf, *netmon.Monitor) func(network, address string, c syscall.RawConn) error {
 	return controlC
 }
 
@@ -97,7 +94,7 @@ func controlC(network, address string, c syscall.RawConn) error {
 
 	var sockErr error
 	err := c.Control(func(fd uintptr) {
-		if useSocketMark() {
+		if UseSocketMark() {
 			sockErr = setBypassMark(fd)
 		} else {
 			sockErr = bindToDevice(fd)
@@ -114,14 +111,14 @@ func controlC(network, address string, c syscall.RawConn) error {
 }
 
 func setBypassMark(fd uintptr) error {
-	if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, tailscaleBypassMark); err != nil {
+	if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, linuxfw.TailscaleBypassMarkNum); err != nil {
 		return fmt.Errorf("setting SO_MARK bypass: %w", err)
 	}
 	return nil
 }
 
 func bindToDevice(fd uintptr) error {
-	ifc, err := interfaces.DefaultRouteInterface()
+	ifc, err := netmon.DefaultRouteInterface()
 	if err != nil {
 		// Make sure we bind to *some* interface,
 		// or we could get a routing loop.

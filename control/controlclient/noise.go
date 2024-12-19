@@ -1,77 +1,152 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
 
 import (
+	"bytes"
+	"cmp"
 	"context"
-	"crypto/tls"
-	"fmt"
-	"net"
+	"encoding/json"
+	"errors"
+	"math"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
-	"tailscale.com/control/controlbase"
 	"tailscale.com/control/controlhttp"
+	"tailscale.com/health"
+	"tailscale.com/internal/noiseconn"
+	"tailscale.com/net/dnscache"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/tsdial"
+	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
+	"tailscale.com/util/singleflight"
 )
 
-// noiseConn is a wrapper around controlbase.Conn.
-// It allows attaching an ID to a connection to allow
-// cleaning up references in the pool when the connection
-// is closed.
-type noiseConn struct {
-	*controlbase.Conn
-	id   int
-	pool *noiseClient
-}
-
-func (c *noiseConn) Close() error {
-	if err := c.Conn.Close(); err != nil {
-		return err
-	}
-	c.pool.connClosed(c.id)
-	return nil
-}
-
-// noiseClient provides a http.Client to connect to tailcontrol over
+// NoiseClient provides a http.Client to connect to tailcontrol over
 // the ts2021 protocol.
-type noiseClient struct {
-	*http.Client // HTTP client used to talk to tailcontrol
+type NoiseClient struct {
+	// Client is an HTTP client to talk to the coordination server.
+	// It automatically makes a new Noise connection as needed.
+	// It does not support node key proofs. To do that, call
+	// noiseClient.getConn instead to make a connection.
+	*http.Client
+
+	// h2t is the HTTP/2 transport we use a bit to create new
+	// *http2.ClientConns. We don't use its connection pool and we don't use its
+	// dialing. We use it for exactly one reason: its idle timeout that can only
+	// be configured via the HTTP/1 config. And then we call NewClientConn (with
+	// an existing Noise connection) on the http2.Transport which sets up an
+	// http2.ClientConn using that idle timeout from an http1.Transport.
+	h2t *http2.Transport
+
+	// sfDial ensures that two concurrent requests for a noise connection only
+	// produce one shared one between the two callers.
+	sfDial singleflight.Group[struct{}, *noiseconn.Conn]
+
+	dialer       *tsdial.Dialer
+	dnsCache     *dnscache.Resolver
 	privKey      key.MachinePrivate
 	serverPubKey key.MachinePublic
-	serverHost   string // the host:port part of serverURL
+	host         string // the host part of serverURL
+	httpPort     string // the default port to dial
+	httpsPort    string // the fallback Noise-over-https port or empty if none
+
+	// dialPlan optionally returns a ControlDialPlan previously received
+	// from the control server; either the function or the return value can
+	// be nil.
+	dialPlan func() *tailcfg.ControlDialPlan
+
+	logf   logger.Logf
+	netMon *netmon.Monitor
+	health *health.Tracker
 
 	// mu only protects the following variables.
 	mu       sync.Mutex
+	closed   bool
+	last     *noiseconn.Conn // or nil
 	nextID   int
-	connPool map[int]*noiseConn // active connections not yet closed; see noiseConn.Close
+	connPool map[int]*noiseconn.Conn // active connections not yet closed; see noiseconn.Conn.Close
 }
 
-// newNoiseClient returns a new noiseClient for the provided server and machine key.
+// NoiseOpts contains options for the NewNoiseClient function. All fields are
+// required unless otherwise specified.
+type NoiseOpts struct {
+	// PrivKey is this node's private key.
+	PrivKey key.MachinePrivate
+	// ServerPubKey is the public key of the server.
+	ServerPubKey key.MachinePublic
+	// ServerURL is the URL of the server to connect to.
+	ServerURL string
+	// Dialer's SystemDial function is used to connect to the server.
+	Dialer *tsdial.Dialer
+	// DNSCache is the caching Resolver to use to connect to the server.
+	//
+	// This field can be nil.
+	DNSCache *dnscache.Resolver
+	// Logf is the log function to use. This field can be nil.
+	Logf logger.Logf
+	// NetMon is the network monitor that, if set, will be used to get the
+	// network interface state. This field can be nil; if so, the current
+	// state will be looked up dynamically.
+	NetMon *netmon.Monitor
+	// HealthTracker, if non-nil, is the health tracker to use.
+	HealthTracker *health.Tracker
+	// DialPlan, if set, is a function that should return an explicit plan
+	// on how to connect to the server.
+	DialPlan func() *tailcfg.ControlDialPlan
+}
+
+// NewNoiseClient returns a new noiseClient for the provided server and machine key.
 // serverURL is of the form https://<host>:<port> (no trailing slash).
-func newNoiseClient(priKey key.MachinePrivate, serverPubKey key.MachinePublic, serverURL string) (*noiseClient, error) {
-	u, err := url.Parse(serverURL)
+//
+// netMon may be nil, if non-nil it's used to do faster interface lookups.
+// dialPlan may be nil
+func NewNoiseClient(opts NoiseOpts) (*NoiseClient, error) {
+	u, err := url.Parse(opts.ServerURL)
 	if err != nil {
 		return nil, err
 	}
-	var host string
-	if u.Port() != "" {
-		// If there is an explicit port specified use it.
-		host = u.Host
+	var httpPort string
+	var httpsPort string
+	if port := u.Port(); port != "" {
+		// If there is an explicit port specified, trust the scheme and hope for the best
+		if u.Scheme == "http" {
+			httpPort = port
+			httpsPort = "443"
+			if u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost" {
+				httpsPort = ""
+			}
+		} else {
+			httpPort = "80"
+			httpsPort = port
+		}
 	} else {
-		// Otherwise, controlhttp.Dial expects an http endpoint.
-		host = fmt.Sprintf("%v:80", u.Hostname())
+		// Otherwise, use the standard ports
+		httpPort = "80"
+		httpsPort = "443"
 	}
-	np := &noiseClient{
-		serverPubKey: serverPubKey,
-		privKey:      priKey,
-		serverHost:   host,
+
+	np := &NoiseClient{
+		serverPubKey: opts.ServerPubKey,
+		privKey:      opts.PrivKey,
+		host:         u.Hostname(),
+		httpPort:     httpPort,
+		httpsPort:    httpsPort,
+		dialer:       opts.Dialer,
+		dnsCache:     opts.DNSCache,
+		dialPlan:     opts.DialPlan,
+		logf:         opts.Logf,
+		netMon:       opts.NetMon,
+		health:       opts.HealthTracker,
 	}
 
 	// Create the HTTP/2 Transport using a net/http.Transport
@@ -85,36 +160,121 @@ func newNoiseClient(priKey key.MachinePrivate, serverPubKey key.MachinePublic, s
 	if err != nil {
 		return nil, err
 	}
+	np.h2t = h2Transport
 
-	// Let the HTTP/2 Transport think it's dialing out using TLS,
-	// but it's actually our Noise dialer:
-	h2Transport.DialTLS = np.dial
-
-	// ConfigureTransports assumes it's being used to wire up an HTTP/1
-	// and HTTP/2 Transport together, so its returned http2.Transport
-	// has a ConnPool already initialized that's configured to not dial
-	// (assuming it's only called from the HTTP/1 Transport). But we
-	// want it to dial, so nil it out before use. On first use it has
-	// a sync.Once that lazily initializes the ConnPool to its default
-	// one that dials.
-	h2Transport.ConnPool = nil
-
-	np.Client = &http.Client{Transport: h2Transport}
+	np.Client = &http.Client{Transport: np}
 	return np, nil
+}
+
+// GetSingleUseRoundTripper returns a RoundTripper that can be only be used once
+// (and must be used once) to make a single HTTP request over the noise channel
+// to the coordination server.
+//
+// In addition to the RoundTripper, it returns the HTTP/2 channel's early noise
+// payload, if any.
+func (nc *NoiseClient) GetSingleUseRoundTripper(ctx context.Context) (http.RoundTripper, *tailcfg.EarlyNoise, error) {
+	for tries := 0; tries < 3; tries++ {
+		conn, err := nc.getConn(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		ok, earlyPayloadMaybeNil, err := conn.ReserveNewRequest(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ok {
+			return conn, earlyPayloadMaybeNil, nil
+		}
+	}
+	return nil, nil, errors.New("[unexpected] failed to reserve a request on a connection")
+}
+
+// contextErr is an error that wraps another error and is used to indicate that
+// the error was because a context expired.
+type contextErr struct {
+	err error
+}
+
+func (e contextErr) Error() string {
+	return e.err.Error()
+}
+
+func (e contextErr) Unwrap() error {
+	return e.err
+}
+
+// getConn returns a noiseconn.Conn that can be used to make requests to the
+// coordination server. It may return a cached connection or create a new one.
+// Dials are singleflighted, so concurrent calls to getConn may only dial once.
+// As such, context values may not be respected as there are no guarantees that
+// the context passed to getConn is the same as the context passed to dial.
+func (nc *NoiseClient) getConn(ctx context.Context) (*noiseconn.Conn, error) {
+	nc.mu.Lock()
+	if last := nc.last; last != nil && last.CanTakeNewRequest() {
+		nc.mu.Unlock()
+		return last, nil
+	}
+	nc.mu.Unlock()
+
+	for {
+		// We singeflight the dial to avoid making multiple connections, however
+		// that means that we can't simply cancel the dial if the context is
+		// canceled. Instead, we have to additionally check that the context
+		// which was canceled is our context and retry if our context is still
+		// valid.
+		conn, err, _ := nc.sfDial.Do(struct{}{}, func() (*noiseconn.Conn, error) {
+			c, err := nc.dial(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, contextErr{ctx.Err()}
+				}
+				return nil, err
+			}
+			return c, nil
+		})
+		var ce contextErr
+		if err == nil || !errors.As(err, &ce) {
+			return conn, err
+		}
+		if ctx.Err() == nil {
+			// The dial failed because of a context error, but our context
+			// is still valid. Retry.
+			continue
+		}
+		// The dial failed because our context was canceled. Return the
+		// underlying error.
+		return nil, ce.Unwrap()
+	}
+}
+
+func (nc *NoiseClient) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	conn, err := nc.getConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return conn.RoundTrip(req)
 }
 
 // connClosed removes the connection with the provided ID from the pool
 // of active connections.
-func (nc *noiseClient) connClosed(id int) {
+func (nc *NoiseClient) connClosed(id int) {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
-	delete(nc.connPool, id)
+	conn := nc.connPool[id]
+	if conn != nil {
+		delete(nc.connPool, id)
+		if nc.last == conn {
+			nc.last = nil
+		}
+	}
 }
 
 // Close closes all the underlying noise connections.
 // It is a no-op and returns nil if the connection is already closed.
-func (nc *noiseClient) Close() error {
+func (nc *NoiseClient) Close() error {
 	nc.mu.Lock()
+	nc.closed = true
 	conns := nc.connPool
 	nc.connPool = nil
 	nc.mu.Unlock()
@@ -129,31 +289,111 @@ func (nc *noiseClient) Close() error {
 }
 
 // dial opens a new connection to tailcontrol, fetching the server noise key
-// if not cached. It implements the signature needed by http2.Transport.DialTLS
-// but ignores all params as it only dials out to the server the noiseClient was
-// created for.
-func (nc *noiseClient) dial(_, _ string, _ *tls.Config) (net.Conn, error) {
+// if not cached.
+func (nc *NoiseClient) dial(ctx context.Context) (*noiseconn.Conn, error) {
 	nc.mu.Lock()
 	connID := nc.nextID
-	if nc.connPool == nil {
-		nc.connPool = make(map[int]*noiseConn)
-	}
 	nc.nextID++
 	nc.mu.Unlock()
 
-	// Timeout is a little arbitrary, but plenty long enough for even the
-	// highest latency links.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if tailcfg.CurrentCapabilityVersion > math.MaxUint16 {
+		// Panic, because a test should have started failing several
+		// thousand version numbers before getting to this point.
+		panic("capability version is too high to fit in the wire protocol")
+	}
+
+	var dialPlan *tailcfg.ControlDialPlan
+	if nc.dialPlan != nil {
+		dialPlan = nc.dialPlan()
+	}
+
+	// If we have a dial plan, then set our timeout as slightly longer than
+	// the maximum amount of time contained therein; we assume that
+	// explicit instructions on timeouts are more useful than a single
+	// hard-coded timeout.
+	//
+	// The default value of 5 is chosen so that, when there's no dial plan,
+	// we retain the previous behaviour of 10 seconds end-to-end timeout.
+	timeoutSec := 5.0
+	if dialPlan != nil {
+		for _, c := range dialPlan.Candidates {
+			if v := c.DialStartDelaySec + c.DialTimeoutSec; v > timeoutSec {
+				timeoutSec = v
+			}
+		}
+	}
+
+	// After we establish a connection, we need some time to actually
+	// upgrade it into a Noise connection. With a ballpark worst-case RTT
+	// of 1000ms, give ourselves an extra 5 seconds to complete the
+	// handshake.
+	timeoutSec += 5
+
+	// Be extremely defensive and ensure that the timeout is in the range
+	// [5, 60] seconds (e.g. if we accidentally get a negative number).
+	if timeoutSec > 60 {
+		timeoutSec = 60
+	} else if timeoutSec < 5 {
+		timeoutSec = 5
+	}
+
+	timeout := time.Duration(timeoutSec * float64(time.Second))
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	conn, err := controlhttp.Dial(ctx, nc.serverHost, nc.privKey, nc.serverPubKey)
+	clientConn, err := (&controlhttp.Dialer{
+		Hostname:        nc.host,
+		HTTPPort:        nc.httpPort,
+		HTTPSPort:       cmp.Or(nc.httpsPort, controlhttp.NoPort),
+		MachineKey:      nc.privKey,
+		ControlKey:      nc.serverPubKey,
+		ProtocolVersion: uint16(tailcfg.CurrentCapabilityVersion),
+		Dialer:          nc.dialer.SystemDial,
+		DNSCache:        nc.dnsCache,
+		DialPlan:        dialPlan,
+		Logf:            nc.logf,
+		NetMon:          nc.netMon,
+		HealthTracker:   nc.health,
+		Clock:           tstime.StdClock{},
+	}).Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ncc, err := noiseconn.New(clientConn.Conn, nc.h2t, connID, nc.connClosed)
 	if err != nil {
 		return nil, err
 	}
 
 	nc.mu.Lock()
+	if nc.closed {
+		nc.mu.Unlock()
+		ncc.Close() // Needs to be called without holding the lock.
+		return nil, errors.New("noise client closed")
+	}
 	defer nc.mu.Unlock()
-	ncc := &noiseConn{Conn: conn, id: connID, pool: nc}
-	nc.connPool[ncc.id] = ncc
+	mak.Set(&nc.connPool, connID, ncc)
+	nc.last = ncc
 	return ncc, nil
+}
+
+// post does a POST to the control server at the given path, JSON-encoding body.
+// The provided nodeKey is an optional load balancing hint.
+func (nc *NoiseClient) post(ctx context.Context, path string, nodeKey key.NodePublic, body any) (*http.Response, error) {
+	jbody, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+nc.host+path, bytes.NewReader(jbody))
+	if err != nil {
+		return nil, err
+	}
+	addLBHeader(req, nodeKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	conn, err := nc.getConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return conn.RoundTrip(req)
 }

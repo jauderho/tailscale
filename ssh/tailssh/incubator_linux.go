@@ -1,9 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
-// +build linux
 
 package tailssh
 
@@ -35,7 +33,7 @@ func ptyNameLinux(f *os.File) (string, error) {
 
 // callLogin1 invokes the provided method of the "login1" service over D-Bus.
 // https://www.freedesktop.org/software/systemd/man/org.freedesktop.login1.html
-func callLogin1(method string, flags dbus.Flags, args ...interface{}) (*dbus.Call, error) {
+func callLogin1(method string, flags dbus.Flags, args ...any) (*dbus.Call, error) {
 	conn, err := dbus.SystemBus()
 	if err != nil {
 		// DBus probably not running.
@@ -77,8 +75,8 @@ type createSessionArgs struct {
 	}
 }
 
-func (a createSessionArgs) args() []interface{} {
-	return []interface{}{
+func (a createSessionArgs) args() []any {
+	return []any{
 		a.uid,
 		a.pid,
 		a.service,
@@ -148,27 +146,28 @@ func releaseSession(sessionID string) error {
 }
 
 // maybeStartLoginSessionLinux is the linux implementation of maybeStartLoginSession.
-func maybeStartLoginSessionLinux(logf logger.Logf, uid uint32, localUser, remoteUser, remoteHost, tty string) (func() error, error) {
+func maybeStartLoginSessionLinux(dlogf logger.Logf, ia incubatorArgs) func() error {
 	if os.Geteuid() != 0 {
-		return nil, nil
+		return nil
 	}
-	logf("starting session for user %d", uid)
+	dlogf("starting session for user %d", ia.uid)
 	// The only way we can actually start a new session is if we are
 	// running outside one and are root, which is typically the case
 	// for systemd managed tailscaled.
-	resp, err := createSession(uint32(uid), remoteUser, remoteHost, tty)
+	resp, err := createSession(uint32(ia.uid), ia.remoteUser, ia.remoteIP, ia.ttyName)
 	if err != nil {
 		// TODO(maisem): figure out if we are running in a session.
 		// We can look at the DBus GetSessionByPID API.
 		// https://www.freedesktop.org/software/systemd/man/org.freedesktop.login1.html
 		// For now best effort is fine.
-		logf("ssh: failed to CreateSession for user %q (%d) %v", localUser, uid, err)
-		return nil, nil
+		dlogf("ssh: failed to CreateSession for user %q (%d) %v", ia.localUser, ia.uid, err)
+		return nil
 	}
+	os.Setenv("DBUS_SESSION_BUS_ADDRESS", fmt.Sprintf("unix:path=%v/bus", resp.runtimePath))
 	if !resp.existing {
 		return func() error {
 			return releaseSession(resp.sessionID)
-		}, nil
+		}
 	}
-	return nil, nil
+	return nil
 }

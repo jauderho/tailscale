@@ -1,47 +1,59 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
 import (
+	"cmp"
 	"encoding/json"
+	"net/netip"
 	"reflect"
 	"testing"
 
-	"inet.af/netaddr"
 	"tailscale.com/ipn"
 	"tailscale.com/net/dns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/netmap"
+	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
 )
 
-func ipps(ippStrs ...string) (ipps []netaddr.IPPrefix) {
+func ipps(ippStrs ...string) (ipps []netip.Prefix) {
 	for _, s := range ippStrs {
-		if ip, err := netaddr.ParseIP(s); err == nil {
-			ipps = append(ipps, netaddr.IPPrefixFrom(ip, ip.BitLen()))
+		if ip, err := netip.ParseAddr(s); err == nil {
+			ipps = append(ipps, netip.PrefixFrom(ip, ip.BitLen()))
 			continue
 		}
-		ipps = append(ipps, netaddr.MustParseIPPrefix(s))
+		ipps = append(ipps, netip.MustParsePrefix(s))
 	}
 	return
 }
 
-func ips(ss ...string) (ips []netaddr.IP) {
+func ips(ss ...string) (ips []netip.Addr) {
 	for _, s := range ss {
-		ips = append(ips, netaddr.MustParseIP(s))
+		ips = append(ips, netip.MustParseAddr(s))
 	}
 	return
+}
+
+func nodeViews(v []*tailcfg.Node) []tailcfg.NodeView {
+	nv := make([]tailcfg.NodeView, len(v))
+	for i, n := range v {
+		nv[i] = n.View()
+	}
+	return nv
 }
 
 func TestDNSConfigForNetmap(t *testing.T) {
 	tests := []struct {
 		name    string
 		nm      *netmap.NetworkMap
+		expired bool
+		peers   []tailcfg.NodeView
 		os      string // version.OS value; empty means linux
+		cloud   cloudenv.Cloud
 		prefs   *ipn.Prefs
 		want    *dns.Config
 		wantLog string
@@ -51,34 +63,39 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			nm:    &netmap.NetworkMap{},
 			prefs: &ipn.Prefs{},
 			want: &dns.Config{
-				Routes: map[dnsname.FQDN][]dnstype.Resolver{},
-				Hosts:  map[dnsname.FQDN][]netaddr.IP{},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts:  map[dnsname.FQDN][]netip.Addr{},
 			},
 		},
 		{
 			name: "self_name_and_peers",
 			nm: &netmap.NetworkMap{
-				Name:      "myname.net",
-				Addresses: ipps("100.101.101.101"),
-				Peers: []*tailcfg.Node{
-					{
-						Name:      "peera.net",
-						Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001", "fe75::1002"),
-					},
-					{
-						Name:      "b.net",
-						Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::2"),
-					},
-					{
-						Name:      "v6-only.net",
-						Addresses: ipps("fe75::3"), // no IPv4, so we don't ignore IPv6
-					},
-				},
+				Name: "myname.net",
+				SelfNode: (&tailcfg.Node{
+					Addresses: ipps("100.101.101.101"),
+				}).View(),
 			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "peera.net",
+					Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001", "fe75::1002"),
+				},
+				{
+					ID:        2,
+					Name:      "b.net",
+					Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::2"),
+				},
+				{
+					ID:        3,
+					Name:      "v6-only.net",
+					Addresses: ipps("fe75::3"), // no IPv4, so we don't ignore IPv6
+				},
+			}),
 			prefs: &ipn.Prefs{},
 			want: &dns.Config{
-				Routes: map[dnsname.FQDN][]dnstype.Resolver{},
-				Hosts: map[dnsname.FQDN][]netaddr.IP{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts: map[dnsname.FQDN][]netip.Addr{
 					"b.net.":       ips("100.102.0.1", "100.102.0.2"),
 					"myname.net.":  ips("100.101.101.101"),
 					"peera.net.":   ips("100.102.0.1", "100.102.0.2"),
@@ -92,28 +109,33 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			// even if they have IPv4.
 			name: "v6_only_self",
 			nm: &netmap.NetworkMap{
-				Name:      "myname.net",
-				Addresses: ipps("fe75::1"),
-				Peers: []*tailcfg.Node{
-					{
-						Name:      "peera.net",
-						Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001"),
-					},
-					{
-						Name:      "b.net",
-						Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::2"),
-					},
-					{
-						Name:      "v6-only.net",
-						Addresses: ipps("fe75::3"), // no IPv4, so we don't ignore IPv6
-					},
-				},
+				Name: "myname.net",
+				SelfNode: (&tailcfg.Node{
+					Addresses: ipps("fe75::1"),
+				}).View(),
 			},
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "peera.net",
+					Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001"),
+				},
+				{
+					ID:        2,
+					Name:      "b.net",
+					Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::2"),
+				},
+				{
+					ID:        3,
+					Name:      "v6-only.net",
+					Addresses: ipps("fe75::3"), // no IPv4, so we don't ignore IPv6
+				},
+			}),
 			prefs: &ipn.Prefs{},
 			want: &dns.Config{
 				OnlyIPv6: true,
-				Routes:   map[dnsname.FQDN][]dnstype.Resolver{},
-				Hosts: map[dnsname.FQDN][]netaddr.IP{
+				Routes:   map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts: map[dnsname.FQDN][]netip.Addr{
 					"b.net.":       ips("fe75::2"),
 					"myname.net.":  ips("fe75::1"),
 					"peera.net.":   ips("fe75::1001"),
@@ -124,8 +146,10 @@ func TestDNSConfigForNetmap(t *testing.T) {
 		{
 			name: "extra_records",
 			nm: &netmap.NetworkMap{
-				Name:      "myname.net",
-				Addresses: ipps("100.101.101.101"),
+				Name: "myname.net",
+				SelfNode: (&tailcfg.Node{
+					Addresses: ipps("100.101.101.101"),
+				}).View(),
 				DNS: tailcfg.DNSConfig{
 					ExtraRecords: []tailcfg.DNSRecord{
 						{Name: "foo.com", Value: "1.2.3.4"},
@@ -136,8 +160,8 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			},
 			prefs: &ipn.Prefs{},
 			want: &dns.Config{
-				Routes: map[dnsname.FQDN][]dnstype.Resolver{},
-				Hosts: map[dnsname.FQDN][]netaddr.IP{
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				Hosts: map[dnsname.FQDN][]netip.Addr{
 					"myname.net.": ips("100.101.101.101"),
 					"foo.com.":    ips("1.2.3.4"),
 					"bar.com.":    ips("1::6"),
@@ -157,8 +181,8 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				CorpDNS: true,
 			},
 			want: &dns.Config{
-				Hosts: map[dnsname.FQDN][]netaddr.IP{},
-				Routes: map[dnsname.FQDN][]dnstype.Resolver{
+				Hosts: map[dnsname.FQDN][]netip.Addr{},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{
 					"0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa.": nil,
 					"100.100.in-addr.arpa.":             nil,
 					"101.100.in-addr.arpa.":             nil,
@@ -242,13 +266,13 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			os:   "android",
 			nm: &netmap.NetworkMap{
 				DNS: tailcfg.DNSConfig{
-					Resolvers: []dnstype.Resolver{
+					Resolvers: []*dnstype.Resolver{
 						{Addr: "8.8.8.8"},
 					},
-					FallbackResolvers: []dnstype.Resolver{
+					FallbackResolvers: []*dnstype.Resolver{
 						{Addr: "8.8.4.4"},
 					},
-					Routes: map[string][]dnstype.Resolver{
+					Routes: map[string][]*dnstype.Resolver{
 						"foo.com.": {{Addr: "1.2.3.4"}},
 					},
 				},
@@ -257,12 +281,12 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				CorpDNS: true,
 			},
 			want: &dns.Config{
-				Hosts: map[dnsname.FQDN][]netaddr.IP{},
-				DefaultResolvers: []dnstype.Resolver{
-					{Addr: "8.8.8.8:53"},
+				Hosts: map[dnsname.FQDN][]netip.Addr{},
+				DefaultResolvers: []*dnstype.Resolver{
+					{Addr: "8.8.8.8"},
 				},
-				Routes: map[dnsname.FQDN][]dnstype.Resolver{
-					"foo.com.": {{Addr: "1.2.3.4:53"}},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+					"foo.com.": {{Addr: "1.2.3.4"}},
 				},
 			},
 		},
@@ -270,7 +294,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			name: "exit_nodes_need_fallbacks",
 			nm: &netmap.NetworkMap{
 				DNS: tailcfg.DNSConfig{
-					FallbackResolvers: []dnstype.Resolver{
+					FallbackResolvers: []*dnstype.Resolver{
 						{Addr: "8.8.4.4"},
 					},
 				},
@@ -280,10 +304,10 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				ExitNodeID: "some-id",
 			},
 			want: &dns.Config{
-				Hosts:  map[dnsname.FQDN][]netaddr.IP{},
-				Routes: map[dnsname.FQDN][]dnstype.Resolver{},
-				DefaultResolvers: []dnstype.Resolver{
-					{Addr: "8.8.4.4:53"},
+				Hosts:  map[dnsname.FQDN][]netip.Addr{},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
+				DefaultResolvers: []*dnstype.Resolver{
+					{Addr: "8.8.4.4"},
 				},
 			},
 		},
@@ -291,7 +315,7 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			name: "not_exit_node_NOT_need_fallbacks",
 			nm: &netmap.NetworkMap{
 				DNS: tailcfg.DNSConfig{
-					FallbackResolvers: []dnstype.Resolver{
+					FallbackResolvers: []*dnstype.Resolver{
 						{Addr: "8.8.4.4"},
 					},
 				},
@@ -300,19 +324,35 @@ func TestDNSConfigForNetmap(t *testing.T) {
 				CorpDNS: true,
 			},
 			want: &dns.Config{
-				Hosts:  map[dnsname.FQDN][]netaddr.IP{},
-				Routes: map[dnsname.FQDN][]dnstype.Resolver{},
+				Hosts:  map[dnsname.FQDN][]netip.Addr{},
+				Routes: map[dnsname.FQDN][]*dnstype.Resolver{},
 			},
+		},
+		{
+			name: "self_expired",
+			nm: &netmap.NetworkMap{
+				Name: "myname.net",
+				SelfNode: (&tailcfg.Node{
+					Addresses: ipps("100.101.101.101"),
+				}).View(),
+			},
+			expired: true,
+			peers: nodeViews([]*tailcfg.Node{
+				{
+					ID:        1,
+					Name:      "peera.net",
+					Addresses: ipps("100.102.0.1", "100.102.0.2", "fe75::1001", "fe75::1002"),
+				},
+			}),
+			prefs: &ipn.Prefs{},
+			want:  &dns.Config{},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			verOS := tt.os
-			if verOS == "" {
-				verOS = "linux"
-			}
+			verOS := cmp.Or(tt.os, "linux")
 			var log tstest.MemLogger
-			got := dnsConfigForNetmap(tt.nm, tt.prefs, log.Logf, verOS)
+			got := dnsConfigForNetmap(tt.nm, peersMap(tt.peers), tt.prefs.View(), tt.expired, log.Logf, verOS)
 			if !reflect.DeepEqual(got, tt.want) {
 				gotj, _ := json.MarshalIndent(got, "", "\t")
 				wantj, _ := json.MarshalIndent(tt.want, "", "\t")
@@ -323,6 +363,17 @@ func TestDNSConfigForNetmap(t *testing.T) {
 			}
 		})
 	}
+}
+
+func peersMap(s []tailcfg.NodeView) map[tailcfg.NodeID]tailcfg.NodeView {
+	m := make(map[tailcfg.NodeID]tailcfg.NodeView)
+	for _, n := range s {
+		if n.ID() == 0 {
+			panic("zero Node.ID")
+		}
+		m[n.ID()] = n
+	}
+	return m
 }
 
 func TestAllowExitNodeDNSProxyToServeName(t *testing.T) {

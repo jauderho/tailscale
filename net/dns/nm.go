@@ -1,23 +1,22 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
-// +build linux
 
 package dns
 
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/netip"
 	"sort"
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"inet.af/netaddr"
-	"tailscale.com/net/interfaces"
+	"github.com/josharian/native"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/endian"
 )
 
 const (
@@ -25,6 +24,13 @@ const (
 	mediumPriority  = int32(1)   // Highest priority that doesn't hard-override
 	lowerPriority   = int32(200) // lower than all builtin auto priorities
 )
+
+// reconfigTimeout is the time interval within which Manager.{Up,Down} should complete.
+//
+// This is particularly useful because certain conditions can cause indefinite hangs
+// (such as improper dbus auth followed by contextless dbus.Object.Call).
+// Such operations should be wrapped in a timeout context.
+const reconfigTimeout = time.Second
 
 // nmManager uses the NetworkManager DBus API.
 type nmManager struct {
@@ -131,7 +137,7 @@ func (m *nmManager) trySet(ctx context.Context, config OSConfig) error {
 	for _, ip := range config.Nameservers {
 		b := ip.As16()
 		if ip.Is4() {
-			dnsv4 = append(dnsv4, endian.Native.Uint32(b[12:]))
+			dnsv4 = append(dnsv4, native.Endian.Uint32(b[12:]))
 		} else {
 			dnsv6 = append(dnsv6, b[:])
 		}
@@ -140,15 +146,19 @@ func (m *nmManager) trySet(ctx context.Context, config OSConfig) error {
 	// NetworkManager wipes out IPv6 address configuration unless we
 	// tell it explicitly to keep it. Read out the current interface
 	// settings and mirror them out to NetworkManager.
-	var addrs6 []map[string]interface{}
-	addrs, _, err := interfaces.Tailscale()
-	if err == nil {
+	var addrs6 []map[string]any
+	if tsIf, err := net.InterfaceByName(m.interfaceName); err == nil {
+		addrs, _ := tsIf.Addrs()
 		for _, a := range addrs {
-			if a.Is6() {
-				addrs6 = append(addrs6, map[string]interface{}{
-					"address": a.String(),
-					"prefix":  uint32(128),
-				})
+			if ipnet, ok := a.(*net.IPNet); ok {
+				nip, ok := netip.AddrFromSlice(ipnet.IP)
+				nip = nip.Unmap()
+				if ok && tsaddr.IsTailscaleIP(nip) && nip.Is6() {
+					addrs6 = append(addrs6, map[string]any{
+						"address": nip.String(),
+						"prefix":  uint32(128),
+					})
+				}
 			}
 		}
 	}
@@ -293,7 +303,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 	}
 
 	type dnsPrio struct {
-		resolvers []netaddr.IP
+		resolvers []netip.Addr
 		domains   []string
 		priority  int32
 	}
@@ -302,7 +312,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 	for _, cfg := range cfgs {
 		if name, ok := cfg["interface"]; ok {
 			if s, ok := name.Value().(string); ok && s == m.interfaceName {
-				// Config for the taislcale interface, skip.
+				// Config for the tailscale interface, skip.
 				continue
 			}
 		}
@@ -312,7 +322,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 		if v, ok := cfg["nameservers"]; ok {
 			if ips, ok := v.Value().([]string); ok {
 				for _, s := range ips {
-					ip, err := netaddr.ParseIP(s)
+					ip, err := netip.ParseAddr(s)
 					if err != nil {
 						// hmm, what do? Shouldn't really happen.
 						continue
@@ -341,7 +351,7 @@ func (m *nmManager) GetBaseConfig() (OSConfig, error) {
 
 	var (
 		ret           OSConfig
-		seenResolvers = map[netaddr.IP]bool{}
+		seenResolvers = map[netip.Addr]bool{}
 		seenSearch    = map[string]bool{}
 	)
 

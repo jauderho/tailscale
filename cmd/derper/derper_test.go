@@ -1,15 +1,18 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
 import (
+	"bytes"
 	"context"
-	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
-	"tailscale.com/net/stun"
+	"tailscale.com/derp/derphttp"
+	"tailscale.com/tstest/deptest"
 )
 
 func TestProdAutocertHostPolicy(t *testing.T) {
@@ -36,34 +39,102 @@ func TestProdAutocertHostPolicy(t *testing.T) {
 	}
 }
 
-func BenchmarkServerSTUN(b *testing.B) {
-	b.ReportAllocs()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+func TestNoContent(t *testing.T) {
+	testCases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name: "no challenge",
+		},
+		{
+			name:  "valid challenge",
+			input: "input",
+			want:  "response input",
+		},
+		{
+			name:  "valid challenge hostname",
+			input: "ts_derp99b.tailscale.com",
+			want:  "response ts_derp99b.tailscale.com",
+		},
+		{
+			name:  "invalid challenge",
+			input: "foo\x00bar",
+			want:  "",
+		},
+		{
+			name:  "whitespace invalid challenge",
+			input: "foo bar",
+			want:  "",
+		},
+		{
+			name:  "long challenge",
+			input: strings.Repeat("x", 65),
+			want:  "",
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "https://localhost/generate_204", nil)
+			if tt.input != "" {
+				req.Header.Set(derphttp.NoContentChallengeHeader, tt.input)
+			}
+			w := httptest.NewRecorder()
+			derphttp.ServeNoContent(w, req)
+			resp := w.Result()
+
+			if tt.want == "" {
+				if h, found := resp.Header[derphttp.NoContentResponseHeader]; found {
+					t.Errorf("got %+v; expected no response header", h)
+				}
+				return
+			}
+
+			if got := resp.Header.Get(derphttp.NoContentResponseHeader); got != tt.want {
+				t.Errorf("got %q; want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		BadDeps: map[string]string{
+			"testing":                            "do not use testing package in production code",
+			"gvisor.dev/gvisor/pkg/buffer":       "https://github.com/tailscale/tailscale/issues/9756",
+			"gvisor.dev/gvisor/pkg/cpuid":        "https://github.com/tailscale/tailscale/issues/9756",
+			"gvisor.dev/gvisor/pkg/tcpip":        "https://github.com/tailscale/tailscale/issues/9756",
+			"gvisor.dev/gvisor/pkg/tcpip/header": "https://github.com/tailscale/tailscale/issues/9756",
+			"tailscale.com/net/packet":           "not needed in derper",
+			"github.com/gaissmai/bart":           "not needed in derper",
+			"database/sql/driver":                "not needed in derper", // previously came in via github.com/google/uuid
+		},
+	}.Check(t)
+}
+
+func TestTemplate(t *testing.T) {
+	buf := &bytes.Buffer{}
+	err := homePageTemplate.Execute(buf, templateData{
+		ShowAbuseInfo: true,
+		Disabled:      true,
+		AllowDebug:    true,
+	})
 	if err != nil {
-		b.Fatal(err)
-	}
-	defer pc.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go serverSTUNListener(ctx, pc.(*net.UDPConn))
-	addr := pc.LocalAddr().(*net.UDPAddr)
-
-	var resBuf [1500]byte
-	cc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		b.Fatal(err)
+		t.Fatal(err)
 	}
 
-	tx := stun.NewTxID()
-	req := stun.Request(tx)
-	for i := 0; i < b.N; i++ {
-		if _, err := cc.WriteToUDP(req, addr); err != nil {
-			b.Fatal(err)
-		}
-		_, _, err := cc.ReadFromUDP(resBuf[:])
-		if err != nil {
-			b.Fatal(err)
-		}
+	str := buf.String()
+	if !strings.Contains(str, "If you suspect abuse") {
+		t.Error("Output is missing abuse mailto")
 	}
-
+	if !strings.Contains(str, "Tailscale Security Policies") {
+		t.Error("Output is missing Tailscale Security Policies link")
+	}
+	if !strings.Contains(str, "Status:") {
+		t.Error("Output is missing disabled status")
+	}
+	if !strings.Contains(str, "Debug info") {
+		t.Error("Output is missing debug info")
+	}
 }

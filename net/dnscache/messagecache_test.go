@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dnscache
 
@@ -19,9 +18,9 @@ import (
 )
 
 func TestMessageCache(t *testing.T) {
-	clock := &tstest.Clock{
+	clock := tstest.NewClock(tstest.ClockOpts{
 		Start: time.Date(1987, 11, 1, 0, 0, 0, 0, time.UTC),
-	}
+	})
 	mc := &MessageCache{Clock: clock.Now}
 	mc.SetMaxCacheSize(2)
 	clock.Advance(time.Second)
@@ -118,17 +117,17 @@ type responseOpt bool
 
 type ttlOpt uint32
 
-func makeQ(txID uint16, name string, opt ...interface{}) []byte {
+func makeQ(txID uint16, name string, opt ...any) []byte {
 	opt = append(opt, responseOpt(false))
 	return makeDNSPkt(txID, name, opt...)
 }
 
-func makeRes(txID uint16, name string, opt ...interface{}) []byte {
+func makeRes(txID uint16, name string, opt ...any) []byte {
 	opt = append(opt, responseOpt(true))
 	return makeDNSPkt(txID, name, opt...)
 }
 
-func makeDNSPkt(txID uint16, name string, opt ...interface{}) []byte {
+func makeDNSPkt(txID uint16, name string, opt ...any) []byte {
 	typ := dnsmessage.TypeA
 	class := dnsmessage.ClassINET
 	var response bool

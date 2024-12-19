@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgcfg
 
@@ -9,11 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
 	"go4.org/mem"
-	"inet.af/netaddr"
 	"tailscale.com/types/key"
 )
 
@@ -163,7 +162,7 @@ func (cfg *Config) handlePeerLine(peer *Peer, k, value mem.RO, valueBytes []byte
 		}
 		peer.PersistentKeepalive = uint16(n)
 	case k.EqualString("allowed_ip"):
-		ipp := netaddr.IPPrefix{}
+		ipp := netip.Prefix{}
 		err := ipp.UnmarshalText(valueBytes)
 		if err != nil {
 			return err

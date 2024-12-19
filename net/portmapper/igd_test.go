@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
@@ -10,22 +9,27 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 
-	"inet.af/netaddr"
+	"tailscale.com/control/controlknobs"
+	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
 	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 )
 
-// TestIGD is an IGD (Intenet Gateway Device) for testing. It supports fake
+// TestIGD is an IGD (Internet Gateway Device) for testing. It supports fake
 // implementations of NAT-PMP, PCP, and/or UPnP to test clients against.
 type TestIGD struct {
 	upnpConn net.PacketConn // for UPnP discovery
 	pxpConn  net.PacketConn // for NAT-PMP and/or PCP
 	ts       *httptest.Server
+	upnpHTTP syncs.AtomicValue[http.Handler]
 	logf     logger.Logf
-	closed   syncs.AtomicBool
+	closed   atomic.Bool
 
 	// do* will log which packets are sent, but will not reply to unexpected packets.
 
@@ -47,9 +51,7 @@ type TestIGDOptions struct {
 type igdCounters struct {
 	numUPnPDiscoRecv     int32
 	numUPnPOtherUDPRecv  int32
-	numUPnPHTTPRecv      int32
 	numPMPRecv           int32
-	numPMPDiscoRecv      int32
 	numPCPRecv           int32
 	numPCPDiscoRecv      int32
 	numPCPMapRecv        int32
@@ -67,10 +69,10 @@ func NewTestIGD(logf logger.Logf, t TestIGDOptions) (*TestIGD, error) {
 		doPCP:  t.PCP,
 		doUPnP: t.UPnP,
 	}
-	d.logf = func(msg string, args ...interface{}) {
+	d.logf = func(msg string, args ...any) {
 		// Don't log after the device has closed;
 		// stray trailing logging angers testing.T.Logf.
-		if d.closed.Get() {
+		if d.closed.Load() {
 			return
 		}
 		logf(msg, args...)
@@ -101,12 +103,12 @@ func (d *TestIGD) TestUPnPPort() uint16 {
 	return uint16(d.upnpConn.LocalAddr().(*net.UDPAddr).Port)
 }
 
-func testIPAndGateway() (gw, ip netaddr.IP, ok bool) {
+func testIPAndGateway() (gw, ip netip.Addr, ok bool) {
 	return netaddr.IPv4(127, 0, 0, 1), netaddr.IPv4(1, 2, 3, 4), true
 }
 
 func (d *TestIGD) Close() error {
-	d.closed.Set(true)
+	d.closed.Store(true)
 	d.ts.Close()
 	d.upnpConn.Close()
 	d.pxpConn.Close()
@@ -125,8 +127,17 @@ func (d *TestIGD) stats() igdCounters {
 	return d.counters
 }
 
+func (d *TestIGD) SetUPnPHandler(h http.Handler) {
+	d.upnpHTTP.Store(h)
+}
+
 func (d *TestIGD) serveUPnPHTTP(w http.ResponseWriter, r *http.Request) {
-	http.NotFound(w, r) // TODO
+	if handler := d.upnpHTTP.Load(); handler != nil {
+		handler.ServeHTTP(w, r)
+		return
+	}
+
+	http.NotFound(w, r)
 }
 
 func (d *TestIGD) serveUPnPDiscovery() {
@@ -134,7 +145,7 @@ func (d *TestIGD) serveUPnPDiscovery() {
 	for {
 		n, src, err := d.upnpConn.ReadFrom(buf)
 		if err != nil {
-			if !d.closed.Get() {
+			if !d.closed.Load() {
 				d.logf("serveUPnP failed: %v", err)
 			}
 			return
@@ -142,7 +153,7 @@ func (d *TestIGD) serveUPnPDiscovery() {
 		pkt := buf[:n]
 		if bytes.Equal(pkt, uPnPPacket) { // a super lazy "parse"
 			d.inc(&d.counters.numUPnPDiscoRecv)
-			resPkt := []byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nUSN: uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nEXT:\r\nSERVER: Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1\r\nLOCATION: %s\r\nOPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n01-NLS: 1627958564\r\nBOOTID.UPNP.ORG: 1627958564\r\nCONFIGID.UPNP.ORG: 1337\r\n\r\n", d.ts.URL+"/rootDesc.xml"))
+			resPkt := fmt.Appendf(nil, "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nUSN: uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nEXT:\r\nSERVER: Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1\r\nLOCATION: %s\r\nOPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n01-NLS: 1627958564\r\nBOOTID.UPNP.ORG: 1627958564\r\nCONFIGID.UPNP.ORG: 1337\r\n\r\n", d.ts.URL+"/rootDesc.xml")
 			if d.doUPnP {
 				_, err = d.upnpConn.WriteTo(resPkt, src)
 				if err != nil {
@@ -161,14 +172,13 @@ func (d *TestIGD) servePxP() {
 	for {
 		n, a, err := d.pxpConn.ReadFrom(buf)
 		if err != nil {
-			if !d.closed.Get() {
+			if !d.closed.Load() {
 				d.logf("servePxP failed: %v", err)
 			}
 			return
 		}
-		ua := a.(*net.UDPAddr)
-		src, ok := netaddr.FromStdAddr(ua.IP, ua.Port, ua.Zone)
-		if !ok {
+		src := netaddr.Unmap(a.(*net.UDPAddr).AddrPort())
+		if !src.IsValid() {
 			panic("bogus addr")
 		}
 		pkt := buf[:n]
@@ -187,7 +197,7 @@ func (d *TestIGD) servePxP() {
 	}
 }
 
-func (d *TestIGD) handlePMPQuery(pkt []byte, src netaddr.IPPort) {
+func (d *TestIGD) handlePMPQuery(pkt []byte, src netip.AddrPort) {
 	d.inc(&d.counters.numPMPRecv)
 	if len(pkt) < 2 {
 		return
@@ -205,7 +215,7 @@ func (d *TestIGD) handlePMPQuery(pkt []byte, src netaddr.IPPort) {
 	// TODO
 }
 
-func (d *TestIGD) handlePCPQuery(pkt []byte, src netaddr.IPPort) {
+func (d *TestIGD) handlePCPQuery(pkt []byte, src netip.AddrPort) {
 	d.inc(&d.counters.numPCPRecv)
 	if len(pkt) < 24 {
 		return
@@ -213,11 +223,11 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netaddr.IPPort) {
 	op := pkt[1]
 	pktSrcBytes := [16]byte{}
 	copy(pktSrcBytes[:], pkt[8:24])
-	pktSrc := netaddr.IPFrom16(pktSrcBytes)
-	if pktSrc != src.IP() {
+	pktSrc := netip.AddrFrom16(pktSrcBytes).Unmap()
+	if pktSrc != src.Addr() {
 		// TODO this error isn't fatal but should be rejected by server.
 		// Since it's a test it's difficult to get them the same though.
-		d.logf("mismatch of packet source and source IP: got %v, expected %v", pktSrc, src.IP())
+		d.logf("mismatch of packet source and source IP: got %v, expected %v", pktSrc, src.Addr())
 	}
 	switch op {
 	case pcpOpAnnounce:
@@ -226,7 +236,7 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netaddr.IPPort) {
 			return
 		}
 		resp := buildPCPDiscoResponse(pkt)
-		if _, err := d.pxpConn.WriteTo(resp, src.UDPAddr()); err != nil {
+		if _, err := d.pxpConn.WriteTo(resp, net.UDPAddrFromAddrPort(src)); err != nil {
 			d.inc(&d.counters.numFailedWrites)
 		}
 	case pcpOpMap:
@@ -240,7 +250,7 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netaddr.IPPort) {
 			return
 		}
 		resp := buildPCPMapResponse(pkt)
-		d.pxpConn.WriteTo(resp, src.UDPAddr())
+		d.pxpConn.WriteTo(resp, net.UDPAddrFromAddrPort(src))
 	default:
 		// unknown op code, ignore it for now.
 		d.inc(&d.counters.numPCPOtherRecv)
@@ -250,12 +260,13 @@ func (d *TestIGD) handlePCPQuery(pkt []byte, src netaddr.IPPort) {
 
 func newTestClient(t *testing.T, igd *TestIGD) *Client {
 	var c *Client
-	c = NewClient(t.Logf, func() {
+	c = NewClient(t.Logf, netmon.NewStatic(), nil, new(controlknobs.Knobs), func() {
 		t.Logf("port map changed")
 		t.Logf("have mapping: %v", c.HaveMapping())
 	})
 	c.testPxPPort = igd.TestPxPPort()
 	c.testUPnPPort = igd.TestUPnPPort()
+	c.netMon = netmon.NewStatic()
 	c.SetGatewayLookupFunc(testIPAndGateway)
 	return c
 }

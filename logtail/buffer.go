@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package logtail
 
@@ -21,6 +20,7 @@ type Buffer interface {
 	TryReadLine() ([]byte, error)
 
 	// Write writes a log line into the ring buffer.
+	// Implementations must not retain the provided buffer.
 	Write([]byte) (int, error)
 }
 
@@ -49,9 +49,7 @@ func (m *memBuffer) TryReadLine() ([]byte, error) {
 	case ent := <-m.pending:
 		if ent.dropCount > 0 {
 			m.next = ent.msg
-			buf := new(bytes.Buffer)
-			fmt.Fprintf(buf, "----------- %d logs dropped ----------", ent.dropCount)
-			return buf.Bytes(), nil
+			return fmt.Appendf(nil, "----------- %d logs dropped ----------", ent.dropCount), nil
 		}
 		return ent.msg, nil
 	default:
@@ -64,7 +62,7 @@ func (m *memBuffer) Write(b []byte) (int, error) {
 	defer m.dropMu.Unlock()
 
 	ent := qentry{
-		msg:       b,
+		msg:       bytes.Clone(b),
 		dropCount: m.dropCount,
 	}
 	select {

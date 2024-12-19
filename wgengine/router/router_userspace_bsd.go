@@ -1,35 +1,36 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build darwin || freebsd
-// +build darwin freebsd
 
 package router
 
 import (
 	"fmt"
 	"log"
+	"net/netip"
 	"os/exec"
 	"runtime"
 
-	"golang.zx2c4.com/wireguard/tun"
-	"inet.af/netaddr"
+	"github.com/tailscale/wireguard-go/tun"
+	"go4.org/netipx"
+	"tailscale.com/health"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/version"
-	"tailscale.com/wgengine/monitor"
 )
 
 type userspaceBSDRouter struct {
 	logf    logger.Logf
-	linkMon *monitor.Mon
+	netMon  *netmon.Monitor
+	health  *health.Tracker
 	tunname string
-	local   []netaddr.IPPrefix
-	routes  map[netaddr.IPPrefix]struct{}
+	local   []netip.Prefix
+	routes  map[netip.Prefix]bool
 }
 
-func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
@@ -37,12 +38,13 @@ func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor
 
 	return &userspaceBSDRouter{
 		logf:    logf,
-		linkMon: linkMon,
+		netMon:  netMon,
+		health:  health,
 		tunname: tunname,
 	}, nil
 }
 
-func (r *userspaceBSDRouter) addrsToRemove(newLocalAddrs []netaddr.IPPrefix) (remove []netaddr.IPPrefix) {
+func (r *userspaceBSDRouter) addrsToRemove(newLocalAddrs []netip.Prefix) (remove []netip.Prefix) {
 	for _, cur := range r.local {
 		found := false
 		for _, v := range newLocalAddrs {
@@ -58,7 +60,7 @@ func (r *userspaceBSDRouter) addrsToRemove(newLocalAddrs []netaddr.IPPrefix) (re
 	return
 }
 
-func (r *userspaceBSDRouter) addrsToAdd(newLocalAddrs []netaddr.IPPrefix) (add []netaddr.IPPrefix) {
+func (r *userspaceBSDRouter) addrsToAdd(newLocalAddrs []netip.Prefix) (add []netip.Prefix) {
 	for _, cur := range newLocalAddrs {
 		found := false
 		for _, v := range r.local {
@@ -90,8 +92,8 @@ func (r *userspaceBSDRouter) Up() error {
 	return nil
 }
 
-func inet(p netaddr.IPPrefix) string {
-	if p.IP().Is6() {
+func inet(p netip.Prefix) string {
+	if p.Addr().Is6() {
 		return "inet6"
 	}
 	return "inet"
@@ -102,15 +104,19 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 		cfg = &shutdownConfig
 	}
 
-	var errq error
 	setErr := func(err error) {
-		if errq == nil {
-			errq = err
+		if reterr == nil {
+			reterr = err
 		}
 	}
+	addrsToRemove := r.addrsToRemove(cfg.LocalAddrs)
+
+	// If we're removing all addresses, we need to remove and re-add all
+	// routes.
+	resetRoutes := len(r.local) > 0 && len(addrsToRemove) == len(r.local)
 
 	// Update the addresses.
-	for _, addr := range r.addrsToRemove(cfg.LocalAddrs) {
+	for _, addr := range addrsToRemove {
 		arg := []string{"ifconfig", r.tunname, inet(addr), addr.String(), "-alias"}
 		out, err := cmd(arg...).CombinedOutput()
 		if err != nil {
@@ -120,15 +126,15 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 	}
 	for _, addr := range r.addrsToAdd(cfg.LocalAddrs) {
 		var arg []string
-		if runtime.GOOS == "freebsd" && addr.IP().Is6() && addr.Bits() == 128 {
+		if runtime.GOOS == "freebsd" && addr.Addr().Is6() && addr.Bits() == 128 {
 			// FreeBSD rejects tun addresses of the form fc00::1/128 -> fc00::1,
 			// https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=218508
 			// Instead add our whole /48, which works because we use a /48 route.
 			// Full history: https://github.com/tailscale/tailscale/issues/1307
-			tmp := netaddr.IPPrefixFrom(addr.IP(), 48)
+			tmp := netip.PrefixFrom(addr.Addr(), 48)
 			arg = []string{"ifconfig", r.tunname, inet(tmp), tmp.String()}
 		} else {
-			arg = []string{"ifconfig", r.tunname, inet(addr), addr.String(), addr.IP().String()}
+			arg = []string{"ifconfig", r.tunname, inet(addr), addr.String(), addr.Addr().String()}
 		}
 		out, err := cmd(arg...).CombinedOutput()
 		if err != nil {
@@ -137,7 +143,7 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 		}
 	}
 
-	newRoutes := make(map[netaddr.IPPrefix]struct{})
+	newRoutes := make(map[netip.Prefix]bool)
 	for _, route := range cfg.Routes {
 		if runtime.GOOS != "darwin" && route == tsaddr.TailscaleULARange() {
 			// Because we added the interface address as a /48 above,
@@ -145,12 +151,12 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 			// implicitly. We mustn't try to add/delete it ourselves.
 			continue
 		}
-		newRoutes[route] = struct{}{}
+		newRoutes[route] = true
 	}
-	// Delete any pre-existing routes.
+	// Delete any preexisting routes.
 	for route := range r.routes {
-		if _, keep := newRoutes[route]; !keep {
-			net := route.IPNet()
+		if resetRoutes || !newRoutes[route] {
+			net := netipx.PrefixIPNet(route)
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits())
 			del := "del"
@@ -169,8 +175,8 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 	}
 	// Add the routes.
 	for route := range newRoutes {
-		if _, exists := r.routes[route]; !exists {
-			net := route.IPNet()
+		if resetRoutes || !r.routes[route] {
+			net := netipx.PrefixIPNet(route)
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits())
 			routeadd := []string{"route", "-q", "-n",
@@ -185,12 +191,19 @@ func (r *userspaceBSDRouter) Set(cfg *Config) (reterr error) {
 	}
 
 	// Store the interface and routes so we know what to change on an update.
-	if errq == nil {
-		r.local = append([]netaddr.IPPrefix{}, cfg.LocalAddrs...)
+	if reterr == nil {
+		r.local = append([]netip.Prefix{}, cfg.LocalAddrs...)
 	}
 	r.routes = newRoutes
 
-	return errq
+	return reterr
+}
+
+// UpdateMagicsockPort implements the Router interface. This implementation
+// does nothing and returns nil because this router does not currently need
+// to know what the magicsock UDP port is.
+func (r *userspaceBSDRouter) UpdateMagicsockPort(_ uint16, _ string) error {
+	return nil
 }
 
 func (r *userspaceBSDRouter) Close() error {

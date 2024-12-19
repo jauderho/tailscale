@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -8,10 +7,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"net/netip"
 	"sync"
 	"time"
 
-	"inet.af/netaddr"
 	"tailscale.com/net/packet"
 	"tailscale.com/types/ipproto"
 )
@@ -94,7 +93,7 @@ func NewTrafficGen(onFirstPacket func()) *TrafficGen {
 
 // Start starts the traffic generator. It assumes mu is already locked,
 // and unlocks it.
-func (t *TrafficGen) Start(src, dst netaddr.IP, bytesPerPacket int, maxPackets int64) {
+func (t *TrafficGen) Start(src, dst netip.Addr, bytesPerPacket int, maxPackets int64) {
 	h12 := packet.ICMP4Header{
 		IP4Header: packet.IP4Header{
 			IPProto: ipproto.ICMPv4,

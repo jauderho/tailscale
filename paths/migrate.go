@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package paths
 
@@ -13,11 +12,11 @@ import (
 
 // TryConfigFileMigration carefully copies the contents of oldFile to
 // newFile, returning the path which should be used to read the config.
-// - if newFile already exists, don't modify it just return its path
-// - if neither oldFile nor newFile exist, return newFile for a fresh
-//   default config to be written to.
-// - if oldFile exists but copying to newFile fails, return oldFile so
-//   there will at least be some config to work with.
+//   - if newFile already exists, don't modify it just return its path
+//   - if neither oldFile nor newFile exist, return newFile for a fresh
+//     default config to be written to.
+//   - if oldFile exists but copying to newFile fails, return oldFile so
+//     there will at least be some config to work with.
 func TryConfigFileMigration(logf logger.Logf, oldFile, newFile string) string {
 	_, err := os.Stat(newFile)
 	if err == nil {

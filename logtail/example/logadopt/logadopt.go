@@ -1,12 +1,12 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
+// Command logadopt is a CLI tool to adopt a machine into a logtail collection.
 package main
 
 import (
 	"flag"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -25,7 +25,7 @@ func main() {
 	}
 	log.SetFlags(0)
 
-	req, err := http.NewRequest("POST", "https://log.tailscale.io/instances", strings.NewReader(url.Values{
+	req, err := http.NewRequest("POST", "https://log.tailscale.com/instances", strings.NewReader(url.Values{
 		"collection": []string{*collection},
 		"instances":  []string{*publicID},
 		"adopt":      []string{"true"},
@@ -39,7 +39,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
 		log.Fatalf("logadopt: response read failed %d: %v", resp.StatusCode, err)

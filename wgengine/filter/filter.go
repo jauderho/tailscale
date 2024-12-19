@@ -1,36 +1,51 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package filter is a stateful packet filter.
 package filter
 
 import (
 	"fmt"
+	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
-	"inet.af/netaddr"
+	"go4.org/netipx"
 	"tailscale.com/envknob"
 	"tailscale.com/net/flowtrack"
+	"tailscale.com/net/ipset"
+	"tailscale.com/net/netaddr"
 	"tailscale.com/net/packet"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/rate"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
+	"tailscale.com/util/mak"
+	"tailscale.com/util/slicesx"
+	"tailscale.com/wgengine/filter/filtertype"
 )
 
 // Filter is a stateful packet filter.
 type Filter struct {
 	logf logger.Logf
-	// local is the set of IPs prefixes that we know to be "local" to
-	// this node. All packets coming in over tailscale must have a
-	// destination within local, regardless of the policy filter
-	// below.
-	local *netaddr.IPSet
+	// local4 and local6 report whether an IP is "local" to this node, for the
+	// respective address family. All packets coming in over tailscale must have
+	// a destination within local, regardless of the policy filter below.
+	local4 func(netip.Addr) bool
+	local6 func(netip.Addr) bool
+
 	// logIPs is the set of IPs that are allowed to appear in flow
 	// logs. If a packet is to or from an IP not in logIPs, it will
 	// never be logged.
-	logIPs *netaddr.IPSet
+	logIPs4 func(netip.Addr) bool
+	logIPs6 func(netip.Addr) bool
+
+	// srcIPHasCap optionally specifies a function that reports
+	// whether a given source IP address has a given capability.
+	srcIPHasCap CapTestFunc
+
 	// matches4 and matches6 are lists of match->action rules
 	// applied to all packets arriving over tailscale
 	// tunnels. Matches are checked in order, and processing stops
@@ -38,6 +53,11 @@ type Filter struct {
 	// match is to drop the packet.
 	matches4 matches
 	matches6 matches
+
+	// cap4 and cap6 are the subsets of the matches that are about
+	// capability grants, partitioned by source IP address family.
+	cap4, cap6 matches
+
 	// state is the connection tracking state attached to this
 	// filter. It is used to allow incoming traffic that is a response
 	// to an outbound connection that this node made, even if those
@@ -50,7 +70,7 @@ type Filter struct {
 // filterState is a state cache of past seen packets.
 type filterState struct {
 	mu  sync.Mutex
-	lru *flowtrack.Cache // from flowtrack.Tuple -> nil
+	lru *flowtrack.Cache[struct{}] // from flowtrack.Tuple -> struct{}
 }
 
 // lruMax is the size of the LRU cache in filterState.
@@ -95,16 +115,23 @@ const (
 	HexdumpAccepts                      // print packet hexdump when logging accepts
 )
 
+type (
+	Match        = filtertype.Match
+	NetPortRange = filtertype.NetPortRange
+	PortRange    = filtertype.PortRange
+	CapMatch     = filtertype.CapMatch
+)
+
 // NewAllowAllForTest returns a packet filter that accepts
 // everything. Use in tests only, as it permits some kinds of spoofing
 // attacks to reach the OS network stack.
 func NewAllowAllForTest(logf logger.Logf) *Filter {
-	any4 := netaddr.IPPrefixFrom(netaddr.IPv4(0, 0, 0, 0), 0)
-	any6 := netaddr.IPPrefixFrom(netaddr.IPFrom16([16]byte{}), 0)
+	any4 := netip.PrefixFrom(netaddr.IPv4(0, 0, 0, 0), 0)
+	any6 := netip.PrefixFrom(netip.AddrFrom16([16]byte{}), 0)
 	ms := []Match{
 		{
-			IPProto: []ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv4},
-			Srcs:    []netaddr.IPPrefix{any4},
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv4}),
+			Srcs:    []netip.Prefix{any4},
 			Dsts: []NetPortRange{
 				{
 					Net: any4,
@@ -116,8 +143,8 @@ func NewAllowAllForTest(logf logger.Logf) *Filter {
 			},
 		},
 		{
-			IPProto: []ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv6},
-			Srcs:    []netaddr.IPPrefix{any6},
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv6}),
+			Srcs:    []netip.Prefix{any6},
 			Dsts: []NetPortRange{
 				{
 					Net: any6,
@@ -130,75 +157,122 @@ func NewAllowAllForTest(logf logger.Logf) *Filter {
 		},
 	}
 
-	var sb netaddr.IPSetBuilder
+	var sb netipx.IPSetBuilder
 	sb.AddPrefix(any4)
 	sb.AddPrefix(any6)
 	ipSet, _ := sb.IPSet()
-	return New(ms, ipSet, ipSet, nil, logf)
+	return New(ms, nil, ipSet, ipSet, nil, logf)
 }
 
 // NewAllowNone returns a packet filter that rejects everything.
-func NewAllowNone(logf logger.Logf, logIPs *netaddr.IPSet) *Filter {
-	return New(nil, &netaddr.IPSet{}, logIPs, nil, logf)
+func NewAllowNone(logf logger.Logf, logIPs *netipx.IPSet) *Filter {
+	return New(nil, nil, &netipx.IPSet{}, logIPs, nil, logf)
 }
 
 // NewShieldsUpFilter returns a packet filter that rejects incoming connections.
 //
 // If shareStateWith is non-nil, the returned filter shares state with the previous one,
 // as long as the previous one was also a shields up filter.
-func NewShieldsUpFilter(localNets *netaddr.IPSet, logIPs *netaddr.IPSet, shareStateWith *Filter, logf logger.Logf) *Filter {
+func NewShieldsUpFilter(localNets *netipx.IPSet, logIPs *netipx.IPSet, shareStateWith *Filter, logf logger.Logf) *Filter {
 	// Don't permit sharing state with a prior filter that wasn't a shields-up filter.
 	if shareStateWith != nil && !shareStateWith.shieldsUp {
 		shareStateWith = nil
 	}
-	f := New(nil, localNets, logIPs, shareStateWith, logf)
+	f := New(nil, nil, localNets, logIPs, shareStateWith, logf)
 	f.shieldsUp = true
 	return f
 }
 
-// New creates a new packet filter. The filter enforces that incoming
-// packets must be destined to an IP in localNets, and must be allowed
-// by matches. If shareStateWith is non-nil, the returned filter
-// shares state with the previous one, to enable changing rules at
-// runtime without breaking existing stateful flows.
-func New(matches []Match, localNets *netaddr.IPSet, logIPs *netaddr.IPSet, shareStateWith *Filter, logf logger.Logf) *Filter {
+// New creates a new packet filter. The filter enforces that incoming packets
+// must be destined to an IP in localNets, and must be allowed by matches.
+// The optional capTest func is used to evaluate a Match that uses capabilities.
+// If nil, such matches will always fail.
+//
+// If shareStateWith is non-nil, the returned filter shares state with the
+// previous one, to enable changing rules at runtime without breaking existing
+// stateful flows.
+func New(matches []Match, capTest CapTestFunc, localNets, logIPs *netipx.IPSet, shareStateWith *Filter, logf logger.Logf) *Filter {
 	var state *filterState
 	if shareStateWith != nil {
 		state = shareStateWith.state
 	} else {
 		state = &filterState{
-			lru: &flowtrack.Cache{MaxEntries: lruMax},
+			lru: &flowtrack.Cache[struct{}]{MaxEntries: lruMax},
 		}
 	}
+
 	f := &Filter{
-		logf:     logf,
-		matches4: matchesFamily(matches, netaddr.IP.Is4),
-		matches6: matchesFamily(matches, netaddr.IP.Is6),
-		local:    localNets,
-		logIPs:   logIPs,
-		state:    state,
+		logf:        logf,
+		matches4:    matchesFamily(matches, netip.Addr.Is4),
+		matches6:    matchesFamily(matches, netip.Addr.Is6),
+		cap4:        capMatchesFunc(matches, netip.Addr.Is4),
+		cap6:        capMatchesFunc(matches, netip.Addr.Is6),
+		local4:      ipset.FalseContainsIPFunc(),
+		local6:      ipset.FalseContainsIPFunc(),
+		logIPs4:     ipset.FalseContainsIPFunc(),
+		logIPs6:     ipset.FalseContainsIPFunc(),
+		state:       state,
+		srcIPHasCap: capTest,
 	}
+	if localNets != nil {
+		p := localNets.Prefixes()
+		p4, p6 := slicesx.Partition(p, func(p netip.Prefix) bool { return p.Addr().Is4() })
+		f.local4 = ipset.NewContainsIPFunc(views.SliceOf(p4))
+		f.local6 = ipset.NewContainsIPFunc(views.SliceOf(p6))
+	}
+	if logIPs != nil {
+		p := logIPs.Prefixes()
+		p4, p6 := slicesx.Partition(p, func(p netip.Prefix) bool { return p.Addr().Is4() })
+		f.logIPs4 = ipset.NewContainsIPFunc(views.SliceOf(p4))
+		f.logIPs6 = ipset.NewContainsIPFunc(views.SliceOf(p6))
+	}
+
 	return f
 }
 
 // matchesFamily returns the subset of ms for which keep(srcNet.IP)
 // and keep(dstNet.IP) are both true.
-func matchesFamily(ms matches, keep func(netaddr.IP) bool) matches {
+func matchesFamily(ms matches, keep func(netip.Addr) bool) matches {
 	var ret matches
 	for _, m := range ms {
 		var retm Match
 		retm.IPProto = m.IPProto
+		retm.SrcCaps = m.SrcCaps
 		for _, src := range m.Srcs {
-			if keep(src.IP()) {
+			if keep(src.Addr()) {
 				retm.Srcs = append(retm.Srcs, src)
 			}
 		}
+
 		for _, dst := range m.Dsts {
-			if keep(dst.Net.IP()) {
+			if keep(dst.Net.Addr()) {
 				retm.Dsts = append(retm.Dsts, dst)
 			}
 		}
-		if len(retm.Srcs) > 0 && len(retm.Dsts) > 0 {
+		if (len(retm.Srcs) > 0 || len(retm.SrcCaps) > 0) && len(retm.Dsts) > 0 {
+			retm.SrcsContains = ipset.NewContainsIPFunc(views.SliceOf(retm.Srcs))
+			ret = append(ret, retm)
+		}
+	}
+	return ret
+}
+
+// capMatchesFunc returns a copy of the subset of ms for which keep(srcNet.IP)
+// and the match is a capability grant.
+func capMatchesFunc(ms matches, keep func(netip.Addr) bool) matches {
+	var ret matches
+	for _, m := range ms {
+		if len(m.Caps) == 0 {
+			continue
+		}
+		retm := Match{Caps: m.Caps}
+		for _, src := range m.Srcs {
+			if keep(src.Addr()) {
+				retm.Srcs = append(retm.Srcs, src)
+			}
+		}
+		if len(retm.Srcs) > 0 {
+			retm.SrcsContains = ipset.NewContainsIPFunc(views.SliceOf(retm.Srcs))
 			ret = append(ret, retm)
 		}
 	}
@@ -213,17 +287,17 @@ func maybeHexdump(flag RunFlags, b []byte) string {
 }
 
 // TODO(apenwarr): use a bigger bucket for specifically TCP SYN accept logging?
-//   Logging is a quick way to record every newly opened TCP connection, but
-//   we have to be cautious about flooding the logs vs letting people use
-//   flood protection to hide their traffic. We could use a rate limiter in
-//   the actual *filter* for SYN accepts, perhaps.
+// Logging is a quick way to record every newly opened TCP connection, but
+// we have to be cautious about flooding the logs vs letting people use
+// flood protection to hide their traffic. We could use a rate limiter in
+// the actual *filter* for SYN accepts, perhaps.
 var acceptBucket = rate.NewLimiter(rate.Every(10*time.Second), 3)
 var dropBucket = rate.NewLimiter(rate.Every(5*time.Second), 10)
 
 // NOTE(Xe): This func init is used to detect
-//   TS_DEBUG_FILTER_RATE_LIMIT_LOGS=all, and if it matches, to
-//   effectively disable the limits on the log rate by setting the limit
-//   to 1 millisecond. This should capture everything.
+// TS_DEBUG_FILTER_RATE_LIMIT_LOGS=all, and if it matches, to
+// effectively disable the limits on the log rate by setting the limit
+// to 1 millisecond. This should capture everything.
 func init() {
 	if envknob.String("TS_DEBUG_FILTER_RATE_LIMIT_LOGS") != "all" {
 		return
@@ -234,7 +308,7 @@ func init() {
 }
 
 func (f *Filter) logRateLimit(runflags RunFlags, q *packet.Parsed, dir direction, r Response, why string) {
-	if !f.loggingAllowed(q) {
+	if runflags == 0 || !f.loggingAllowed(q) {
 		return
 	}
 
@@ -247,7 +321,7 @@ func (f *Filter) logRateLimit(runflags RunFlags, q *packet.Parsed, dir direction
 		verdict = "Drop"
 		runflags &= HexdumpDrops
 	} else if r == Accept && (runflags&LogAccepts) != 0 && acceptBucket.Allow() {
-		verdict = "Accept"
+		verdict = "[v1] Accept"
 		runflags &= HexdumpAccepts
 	}
 
@@ -266,14 +340,14 @@ var dummyPacket = []byte{
 	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 }
 
-// CheckTCP determines whether TCP traffic from srcIP to dstIP:dstPort
-// is allowed.
-func (f *Filter) CheckTCP(srcIP, dstIP netaddr.IP, dstPort uint16) Response {
+// Check determines whether traffic from srcIP to dstIP:dstPort is allowed
+// using protocol proto.
+func (f *Filter) Check(srcIP, dstIP netip.Addr, dstPort uint16, proto ipproto.Proto) Response {
 	pkt := &packet.Parsed{}
 	pkt.Decode(dummyPacket) // initialize private fields
 	switch {
 	case (srcIP.Is4() && dstIP.Is6()) || (srcIP.Is6() && srcIP.Is4()):
-		// Mistmatched address families, no filters will
+		// Mismatched address families, no filters will
 		// match.
 		return Drop
 	case srcIP.Is4():
@@ -283,12 +357,49 @@ func (f *Filter) CheckTCP(srcIP, dstIP netaddr.IP, dstPort uint16) Response {
 	default:
 		panic("unreachable")
 	}
-	pkt.Src = netaddr.IPPortFrom(srcIP, 0)
-	pkt.Dst = netaddr.IPPortFrom(dstIP, dstPort)
-	pkt.IPProto = ipproto.TCP
-	pkt.TCPFlags = packet.TCPSyn
+	pkt.Src = netip.AddrPortFrom(srcIP, 0)
+	pkt.Dst = netip.AddrPortFrom(dstIP, dstPort)
+	pkt.IPProto = proto
+	if proto == ipproto.TCP {
+		pkt.TCPFlags = packet.TCPSyn
+	}
 
 	return f.RunIn(pkt, 0)
+}
+
+// CheckTCP determines whether TCP traffic from srcIP to dstIP:dstPort
+// is allowed.
+func (f *Filter) CheckTCP(srcIP, dstIP netip.Addr, dstPort uint16) Response {
+	return f.Check(srcIP, dstIP, dstPort, ipproto.TCP)
+}
+
+// CapsWithValues appends to base the capabilities that srcIP has talking
+// to dstIP.
+func (f *Filter) CapsWithValues(srcIP, dstIP netip.Addr) tailcfg.PeerCapMap {
+	var mm matches
+	switch {
+	case srcIP.Is4():
+		mm = f.cap4
+	case srcIP.Is6():
+		mm = f.cap6
+	}
+	var out tailcfg.PeerCapMap
+	for _, m := range mm {
+		if !m.SrcsContains(srcIP) {
+			continue
+		}
+		for _, cm := range m.Caps {
+			if cm.Cap != "" && cm.Dst.Contains(dstIP) {
+				prev, ok := out[cm.Cap]
+				if !ok {
+					mak.Set(&out, cm.Cap, slices.Clone(cm.Values))
+					continue
+				}
+				out[cm.Cap] = append(prev, cm.Values...)
+			}
+		}
+	}
+	return out
 }
 
 // ShieldsUp reports whether this is a "shields up" (block everything
@@ -323,7 +434,7 @@ func (f *Filter) RunIn(q *packet.Parsed, rf RunFlags) Response {
 func (f *Filter) RunOut(q *packet.Parsed, rf RunFlags) Response {
 	dir := out
 	r := f.pre(q, rf, dir)
-	if r == Drop || r == Accept {
+	if r == Accept || r == Drop {
 		// already logged
 		return r
 	}
@@ -332,11 +443,22 @@ func (f *Filter) RunOut(q *packet.Parsed, rf RunFlags) Response {
 	return r
 }
 
+var unknownProtoStringCache sync.Map // ipproto.Proto -> string
+
+func unknownProtoString(proto ipproto.Proto) string {
+	if v, ok := unknownProtoStringCache.Load(proto); ok {
+		return v.(string)
+	}
+	s := fmt.Sprintf("unknown-protocol-%d", proto)
+	unknownProtoStringCache.Store(proto, s)
+	return s
+}
+
 func (f *Filter) runIn4(q *packet.Parsed) (r Response, why string) {
 	// A compromised peer could try to send us packets for
 	// destinations we didn't explicitly advertise. This check is to
 	// prevent that.
-	if !f.local.Contains(q.Dst.IP()) {
+	if !f.local4(q.Dst.Addr()) {
 		return Drop, "destination not allowed"
 	}
 
@@ -349,7 +471,7 @@ func (f *Filter) runIn4(q *packet.Parsed) (r Response, why string) {
 			//  related to an existing ICMP-Echo, TCP, or UDP
 			//  session.
 			return Accept, "icmp response ok"
-		} else if f.matches4.matchIPsOnly(q) {
+		} else if f.matches4.matchIPsOnly(q, f.srcIPHasCap) {
 			// If any port is open to an IP, allow ICMP to it.
 			return Accept, "icmp ok"
 		}
@@ -365,11 +487,11 @@ func (f *Filter) runIn4(q *packet.Parsed) (r Response, why string) {
 		if !q.IsTCPSyn() {
 			return Accept, "tcp non-syn"
 		}
-		if f.matches4.match(q) {
+		if f.matches4.match(q, f.srcIPHasCap) {
 			return Accept, "tcp ok"
 		}
 	case ipproto.UDP, ipproto.SCTP:
-		t := flowtrack.Tuple{Proto: q.IPProto, Src: q.Src, Dst: q.Dst}
+		t := flowtrack.MakeTuple(q.IPProto, q.Src, q.Dst)
 
 		f.state.mu.Lock()
 		_, ok := f.state.lru.Get(t)
@@ -378,16 +500,16 @@ func (f *Filter) runIn4(q *packet.Parsed) (r Response, why string) {
 		if ok {
 			return Accept, "cached"
 		}
-		if f.matches4.match(q) {
+		if f.matches4.match(q, f.srcIPHasCap) {
 			return Accept, "ok"
 		}
 	case ipproto.TSMP:
 		return Accept, "tsmp ok"
 	default:
 		if f.matches4.matchProtoAndIPsOnlyIfAllPorts(q) {
-			return Accept, "otherproto ok"
+			return Accept, "other-portless ok"
 		}
-		return Drop, "Unknown proto"
+		return Drop, unknownProtoString(q.IPProto)
 	}
 	return Drop, "no rules matched"
 }
@@ -396,7 +518,7 @@ func (f *Filter) runIn6(q *packet.Parsed) (r Response, why string) {
 	// A compromised peer could try to send us packets for
 	// destinations we didn't explicitly advertise. This check is to
 	// prevent that.
-	if !f.local.Contains(q.Dst.IP()) {
+	if !f.local6(q.Dst.Addr()) {
 		return Drop, "destination not allowed"
 	}
 
@@ -409,7 +531,7 @@ func (f *Filter) runIn6(q *packet.Parsed) (r Response, why string) {
 			//  related to an existing ICMP-Echo, TCP, or UDP
 			//  session.
 			return Accept, "icmp response ok"
-		} else if f.matches6.matchIPsOnly(q) {
+		} else if f.matches6.matchIPsOnly(q, f.srcIPHasCap) {
 			// If any port is open to an IP, allow ICMP to it.
 			return Accept, "icmp ok"
 		}
@@ -425,11 +547,11 @@ func (f *Filter) runIn6(q *packet.Parsed) (r Response, why string) {
 		if q.IPProto == ipproto.TCP && !q.IsTCPSyn() {
 			return Accept, "tcp non-syn"
 		}
-		if f.matches6.match(q) {
+		if f.matches6.match(q, f.srcIPHasCap) {
 			return Accept, "tcp ok"
 		}
 	case ipproto.UDP, ipproto.SCTP:
-		t := flowtrack.Tuple{Proto: q.IPProto, Src: q.Src, Dst: q.Dst}
+		t := flowtrack.MakeTuple(q.IPProto, q.Src, q.Dst)
 
 		f.state.mu.Lock()
 		_, ok := f.state.lru.Get(t)
@@ -438,16 +560,16 @@ func (f *Filter) runIn6(q *packet.Parsed) (r Response, why string) {
 		if ok {
 			return Accept, "cached"
 		}
-		if f.matches6.match(q) {
+		if f.matches6.match(q, f.srcIPHasCap) {
 			return Accept, "ok"
 		}
 	case ipproto.TSMP:
 		return Accept, "tsmp ok"
 	default:
 		if f.matches6.matchProtoAndIPsOnlyIfAllPorts(q) {
-			return Accept, "otherproto ok"
+			return Accept, "other-portless ok"
 		}
-		return Drop, "Unknown proto"
+		return Drop, unknownProtoString(q.IPProto)
 	}
 	return Drop, "no rules matched"
 }
@@ -456,18 +578,15 @@ func (f *Filter) runIn6(q *packet.Parsed) (r Response, why string) {
 func (f *Filter) runOut(q *packet.Parsed) (r Response, why string) {
 	switch q.IPProto {
 	case ipproto.UDP, ipproto.SCTP:
-		tuple := flowtrack.Tuple{
-			Proto: q.IPProto,
-			Src:   q.Dst, Dst: q.Src, // src/dst reversed
-		}
+		tuple := flowtrack.MakeTuple(q.IPProto, q.Dst, q.Src) // src/dst reversed
 		f.state.mu.Lock()
-		f.state.lru.Add(tuple, nil)
+		f.state.lru.Add(tuple, struct{}{})
 		f.state.mu.Unlock()
 	}
 	return Accept, "ok out"
 }
 
-// direction is whether a packet was flowing in to this machine, or
+// direction is whether a packet was flowing into this machine, or
 // flowing out.
 type direction int
 
@@ -501,21 +620,16 @@ func (f *Filter) pre(q *packet.Parsed, rf RunFlags, dir direction) Response {
 		return Drop
 	}
 
-	if q.Dst.IP().IsMulticast() {
+	if q.Dst.Addr().IsMulticast() {
 		f.logRateLimit(rf, q, dir, Drop, "multicast")
 		return Drop
 	}
-	if q.Dst.IP().IsLinkLocalUnicast() && q.Dst.IP() != gcpDNSAddr {
+	if q.Dst.Addr().IsLinkLocalUnicast() && q.Dst.Addr() != gcpDNSAddr {
 		f.logRateLimit(rf, q, dir, Drop, "link-local-unicast")
 		return Drop
 	}
 
-	switch q.IPProto {
-	case ipproto.Unknown:
-		// Unknown packets are dangerous; always drop them.
-		f.logRateLimit(rf, q, dir, Drop, "unknown")
-		return Drop
-	case ipproto.Fragment:
+	if q.IPProto == ipproto.Fragment {
 		// Fragments after the first always need to be passed through.
 		// Very small fragments are considered Junk by Parsed.
 		f.logRateLimit(rf, q, dir, Accept, "fragment")
@@ -527,7 +641,13 @@ func (f *Filter) pre(q *packet.Parsed, rf RunFlags, dir direction) Response {
 
 // loggingAllowed reports whether p can appear in logs at all.
 func (f *Filter) loggingAllowed(p *packet.Parsed) bool {
-	return f.logIPs.Contains(p.Src.IP()) && f.logIPs.Contains(p.Dst.IP())
+	switch p.IPVersion {
+	case 4:
+		return f.logIPs4(p.Src.Addr()) && f.logIPs4(p.Dst.Addr())
+	case 6:
+		return f.logIPs6(p.Src.Addr()) && f.logIPs6(p.Dst.Addr())
+	}
+	return false
 }
 
 // omitDropLogging reports whether packet p, which has already been
@@ -539,5 +659,5 @@ func omitDropLogging(p *packet.Parsed, dir direction) bool {
 		return false
 	}
 
-	return p.Dst.IP().IsMulticast() || (p.Dst.IP().IsLinkLocalUnicast() && p.Dst.IP() != gcpDNSAddr) || p.IPProto == ipproto.IGMP
+	return p.Dst.Addr().IsMulticast() || (p.Dst.Addr().IsLinkLocalUnicast() && p.Dst.Addr() != gcpDNSAddr) || p.IPProto == ipproto.IGMP
 }

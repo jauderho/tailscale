@@ -1,17 +1,15 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package vms
 
 import (
 	_ "embed"
+	"encoding/json"
 	"log"
 
 	"github.com/tailscale/hujson"
 )
-
-// go:generate go run ./gen
 
 type Distro struct {
 	Name           string // amazon-linux
@@ -20,6 +18,7 @@ type Distro struct {
 	MemoryMegs     int    // VM memory in megabytes
 	PackageManager string // yum/apt/dnf/zypper
 	InitSystem     string // systemd/openrc
+	HostGenerated  bool   // generated image rather than downloaded
 }
 
 func (d *Distro) InstallPre() string {
@@ -52,10 +51,12 @@ var distroData string
 
 var Distros []Distro = func() []Distro {
 	var result []Distro
-	err := hujson.Unmarshal([]byte(distroData), &result)
+	b, err := hujson.Standardize([]byte(distroData))
 	if err != nil {
 		log.Fatalf("error decoding distros: %v", err)
 	}
-
+	if err := json.Unmarshal(b, &result); err != nil {
+		log.Fatalf("error decoding distros: %v", err)
+	}
 	return result
 }()

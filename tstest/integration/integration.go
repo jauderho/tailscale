@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package integration contains Tailscale integration tests.
 //
@@ -14,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -29,17 +27,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
 	"go4.org/mem"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
-	"tailscale.com/logtail"
 	"tailscale.com/net/stun/stuntest"
-	"tailscale.com/smallzstd"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
+	"tailscale.com/util/zstdframe"
 	"tailscale.com/version"
 )
 
@@ -88,7 +85,7 @@ var (
 // buildTestBinaries builds tailscale and tailscaled.
 // It returns the dir containing the binaries.
 func buildTestBinaries() (string, error) {
-	bindir, err := ioutil.TempDir("", "")
+	bindir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return "", err
 	}
@@ -119,7 +116,11 @@ func build(outDir string, targets ...string) error {
 		// Fallback slow path for cross-compiled binaries.
 		for _, target := range targets {
 			outFile := filepath.Join(outDir, path.Base(target)+exe())
-			cmd := exec.Command(goBin, "build", "-o", outFile, target)
+			cmd := exec.Command(goBin, "build", "-o", outFile)
+			if version.IsRace() {
+				cmd.Args = append(cmd.Args, "-race")
+			}
+			cmd.Args = append(cmd.Args, target)
 			cmd.Env = append(os.Environ(), "GOARCH="+runtime.GOARCH)
 			if errOut, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("failed to build %v with %v: %v, %s", target, goBin, err, errOut)
@@ -131,16 +132,41 @@ func build(outDir string, targets ...string) error {
 }
 
 func findGo() (string, error) {
-	goBin := filepath.Join(runtime.GOROOT(), "bin", "go"+exe())
-	if fi, err := os.Stat(goBin); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("failed to find go at %v", goBin)
+	// Go 1.19 attempted to be helpful by prepending $PATH with GOROOT/bin based
+	// on the executed go binary when invoked using `go test` or `go generate`,
+	// however, this doesn't cover cases when run otherwise, such as via `go run`.
+	// runtime.GOROOT() may often be empty these days, so the safe thing to do
+	// here is, in order:
+	// 1. Look for a go binary in $PATH[0].
+	// 2. Look for a go binary in runtime.GOROOT()/bin if runtime.GOROOT() is non-empty.
+	// 3. Look for a go binary in $PATH.
+
+	// For tests we want to run as root on GitHub actions, we run with -exec=sudo,
+	// but that results in this test running with a different PATH and picking the
+	// wrong Go. So hard code the GitHub Actions case.
+	if os.Getuid() == 0 && os.Getenv("GITHUB_ACTIONS") == "true" {
+		const sudoGithubGo = "/home/runner/.cache/tailscale-go/bin/go"
+		if _, err := os.Stat(sudoGithubGo); err == nil {
+			return sudoGithubGo, nil
 		}
-		return "", fmt.Errorf("looking for go binary: %v", err)
-	} else if !fi.Mode().IsRegular() {
-		return "", fmt.Errorf("%v is unexpected %v", goBin, fi.Mode())
 	}
-	return goBin, nil
+
+	paths := strings.FieldsFunc(os.Getenv("PATH"), func(r rune) bool { return os.IsPathSeparator(uint8(r)) })
+	if len(paths) > 0 {
+		candidate := filepath.Join(paths[0], "go"+exe())
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, err
+		}
+	}
+
+	if runtime.GOROOT() != "" {
+		candidate := filepath.Join(runtime.GOROOT(), "bin", "go"+exe())
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, err
+		}
+	}
+
+	return exec.LookPath("go")
 }
 
 func exe() string {
@@ -164,6 +190,7 @@ func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *
 	}
 
 	httpsrv := httptest.NewUnstartedServer(derphttp.Handler(d))
+	httpsrv.Listener.Close()
 	httpsrv.Listener = ln
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
 	httpsrv.Config.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
@@ -270,25 +297,24 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// collectionName := pathPaths[0]
-	privID, err := logtail.ParsePrivateID(pathParts[1])
+	privID, err := logid.ParsePrivateID(pathParts[1])
 	if err != nil {
 		log.Printf("bad log ID: %q: %v", r.URL.Path, err)
 	}
 
-	var body io.Reader = r.Body
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("http.Request.Body.Read: %v", err)
+		return
+	}
 	if r.Header.Get("Content-Encoding") == "zstd" {
-		var err error
-		var dec *zstd.Decoder
-		dec, err = smallzstd.NewDecoder(body)
+		bodyBytes, err = zstdframe.AppendDecode(nil, bodyBytes)
 		if err != nil {
-			log.Printf("bad caught zstd: %v", err)
+			log.Printf("zstdframe.AppendDecode: %v", err)
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		defer dec.Close()
-		body = dec
 	}
-	bodyBytes, _ := ioutil.ReadAll(body)
 
 	type Entry struct {
 		Logtail struct {

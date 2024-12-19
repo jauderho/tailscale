@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package mono
 
@@ -34,16 +33,31 @@ func TestUnmarshalZero(t *testing.T) {
 	}
 }
 
+func TestJSONRoundtrip(t *testing.T) {
+	want := Now()
+	b, err := want.MarshalJSON()
+	if err != nil {
+		t.Errorf("MarshalJSON error: %v", err)
+	}
+	var got Time
+	if err := got.UnmarshalJSON(b); err != nil {
+		t.Errorf("UnmarshalJSON error: %v", err)
+	}
+	if got != want {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 func BenchmarkMonoNow(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		Now()
 	}
 }
 
 func BenchmarkTimeNow(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		time.Now()
 	}
 }

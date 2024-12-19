@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -10,32 +9,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/sys/windows"
-	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-	"inet.af/netaddr"
+	"tailscale.com/health"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/dns"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
 )
 
 type winRouter struct {
-	logf                func(fmt string, args ...interface{})
-	linkMon             *monitor.Mon // may be nil
+	logf                func(fmt string, args ...any)
+	netMon              *netmon.Monitor // may be nil
+	health              *health.Tracker
 	nativeTun           *tun.NativeTun
 	routeChangeCallback *winipcfg.RouteChangeCallback
 	firewall            *firewallTweaker
 }
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
 	nativeTun := tundev.(*tun.NativeTun)
 	luid := winipcfg.LUID(nativeTun.LUID())
 	guid, err := luid.GUID()
@@ -45,7 +48,8 @@ func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mo
 
 	return &winRouter{
 		logf:      logf,
-		linkMon:   linkMon,
+		netMon:    netMon,
+		health:    health,
 		nativeTun: nativeTun,
 		firewall: &firewallTweaker{
 			logf:    logger.WithPrefix(logf, "firewall: "),
@@ -79,7 +83,7 @@ func (r *winRouter) Set(cfg *Config) error {
 	}
 	r.firewall.set(localAddrs, cfg.Routes, cfg.LocalRoutes)
 
-	err := configureInterface(cfg, r.nativeTun)
+	err := configureInterface(cfg, r.nativeTun, r.health)
 	if err != nil {
 		r.logf("ConfigureInterface: %v", err)
 		return err
@@ -93,13 +97,20 @@ func (r *winRouter) Set(cfg *Config) error {
 	return nil
 }
 
-func hasDefaultRoute(routes []netaddr.IPPrefix) bool {
+func hasDefaultRoute(routes []netip.Prefix) bool {
 	for _, route := range routes {
 		if route.Bits() == 0 {
 			return true
 		}
 	}
 	return false
+}
+
+// UpdateMagicsockPort implements the Router interface. This implementation
+// does nothing and returns nil because this router does not currently need
+// to know what the magicsock UDP port is.
+func (r *winRouter) UpdateMagicsockPort(_ uint16, _ string) error {
+	return nil
 }
 
 func (r *winRouter) Close() error {
@@ -112,7 +123,7 @@ func (r *winRouter) Close() error {
 	return nil
 }
 
-func cleanup(logf logger.Logf, interfaceName string) {
+func cleanUp(logf logger.Logf, interfaceName string) {
 	// Nothing to do here.
 }
 
@@ -120,7 +131,7 @@ func cleanup(logf logger.Logf, interfaceName string) {
 // but it can be REALLY SLOW to change the Windows firewall for reasons not understood.
 // Like 4 minutes slow. But usually it's tens of milliseconds.
 // See https://github.com/tailscale/tailscale/issues/785.
-// So this tracks the desired state and runs the actual adjusting code asynchrounsly.
+// So this tracks the desired state and runs the actual adjusting code asynchronously.
 type firewallTweaker struct {
 	logf    logger.Logf
 	tunGUID windows.GUID
@@ -132,8 +143,8 @@ type firewallTweaker struct {
 	wantLocal   []string // next value we want, or "" to delete the firewall rule
 	lastLocal   []string // last set value, if known
 
-	localRoutes     []netaddr.IPPrefix
-	lastLocalRoutes []netaddr.IPPrefix
+	localRoutes     []netip.Prefix
+	lastLocalRoutes []netip.Prefix
 
 	wantKillswitch bool
 	lastKillswitch bool
@@ -148,6 +159,13 @@ type firewallTweaker struct {
 	// stop makes fwProc exit when closed.
 	fwProcWriter  io.WriteCloser
 	fwProcEncoder *json.Encoder
+
+	// The path to the 'netsh.exe' binary, populated during the first call
+	// to runFirewall.
+	//
+	// not protected by mu; netshPath is only mutated inside netshPathOnce
+	netshPathOnce sync.Once
+	netshPath     string
 }
 
 func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
@@ -156,7 +174,7 @@ func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
 // Empty slices remove firewall rules.
 //
 // set takes ownership of cidrs, but not routes.
-func (ft *firewallTweaker) set(cidrs []string, routes, localRoutes []netaddr.IPPrefix) {
+func (ft *firewallTweaker) set(cidrs []string, routes, localRoutes []netip.Prefix) {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
 
@@ -178,11 +196,46 @@ func (ft *firewallTweaker) set(cidrs []string, routes, localRoutes []netaddr.IPP
 	go ft.doAsyncSet()
 }
 
+// getNetshPath returns the path that should be used to execute netsh.
+//
+// We've seen a report from a customer that we're triggering the "cannot run
+// executable found relative to current directory" protection that was added to
+// prevent running possibly attacker-controlled binaries. To mitigate this,
+// first try looking up the path to netsh.exe in the System32 directory
+// explicitly, and then fall back to the prior behaviour of passing "netsh" to
+// os/exec.Command.
+func (ft *firewallTweaker) getNetshPath() string {
+	ft.netshPathOnce.Do(func() {
+		// The default value is the old approach: just run "netsh" and
+		// let os/exec resolve that into a full path.
+		ft.netshPath = "netsh"
+
+		path, err := windows.KnownFolderPath(windows.FOLDERID_System, 0)
+		if err != nil {
+			ft.logf("getNetshPath: error getting FOLDERID_System: %v", err)
+			return
+		}
+
+		expath := filepath.Join(path, "netsh.exe")
+		if _, err := os.Stat(expath); err == nil {
+			ft.netshPath = expath
+			return
+		} else if !os.IsNotExist(err) {
+			ft.logf("getNetshPath: error checking for existence of %q: %v", expath, err)
+		}
+
+		// Keep default
+	})
+	return ft.netshPath
+}
+
 func (ft *firewallTweaker) runFirewall(args ...string) (time.Duration, error) {
 	t0 := time.Now()
 	args = append([]string{"advfirewall", "firewall"}, args...)
-	cmd := exec.Command("netsh", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd := exec.Command(ft.getNetshPath(), args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.DETACHED_PROCESS,
+	}
 	b, err := cmd.CombinedOutput()
 	if err != nil {
 		err = fmt.Errorf("%w: %v", err, string(b))
@@ -197,7 +250,7 @@ func (ft *firewallTweaker) doAsyncSet() {
 	ft.mu.Lock()
 	for { // invariant: ft.mu must be locked when beginning this block
 		val := ft.wantLocal
-		if ft.known && strsEqual(ft.lastLocal, val) && ft.wantKillswitch == ft.lastKillswitch && routesEqual(ft.localRoutes, ft.lastLocalRoutes) {
+		if ft.known && slices.Equal(ft.lastLocal, val) && ft.wantKillswitch == ft.lastKillswitch && slices.Equal(ft.localRoutes, ft.lastLocalRoutes) {
 			ft.running = false
 			ft.logf("ending netsh goroutine")
 			ft.mu.Unlock()
@@ -236,7 +289,7 @@ func (ft *firewallTweaker) doAsyncSet() {
 // process to dial out as it pleases.
 //
 // Must only be invoked from doAsyncSet.
-func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, procRule bool, allowedRoutes []netaddr.IPPrefix) error {
+func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, procRule bool, allowedRoutes []netip.Prefix) error {
 	if clear {
 		ft.logf("clearing Tailscale-In firewall rules...")
 		// We ignore the error here, because netsh returns an error for
@@ -281,7 +334,7 @@ func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, pr
 	for _, cidr := range local {
 		ft.logf("adding Tailscale-In rule to allow %v ...", cidr)
 		var d time.Duration
-		d, err := ft.runFirewall("add", "rule", "name=Tailscale-In", "dir=in", "action=allow", "localip="+cidr, "profile=private", "enable=yes")
+		d, err := ft.runFirewall("add", "rule", "name=Tailscale-In", "dir=in", "action=allow", "localip="+cidr, "profile=private,domain", "enable=yes")
 		if err != nil {
 			ft.logf("error adding Tailscale-In rule to allow %v: %v", cidr, err)
 			return err
@@ -305,6 +358,9 @@ func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, pr
 			return err
 		}
 		proc := exec.Command(exe, "/firewall", ft.tunGUID.String())
+		proc.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: windows.DETACHED_PROCESS,
+		}
 		in, err := proc.StdinPipe()
 		if err != nil {
 			return err
@@ -341,29 +397,4 @@ func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, pr
 	// firewall to let the local routes through. The set of routes is passed
 	// in via stdin encoded in json.
 	return ft.fwProcEncoder.Encode(allowedRoutes)
-}
-
-func routesEqual(a, b []netaddr.IPPrefix) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	// Routes are pre-sorted.
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func strsEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

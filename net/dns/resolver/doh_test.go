@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -11,6 +10,7 @@ import (
 	"testing"
 
 	"golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/net/dns/publicdns"
 )
 
 var testDoH = flag.Bool("test-doh", false, "do real DoH tests against the network")
@@ -40,17 +40,16 @@ func TestDoH(t *testing.T) {
 	if !*testDoH {
 		t.Skip("skipping manual test without --test-doh flag")
 	}
-	if len(knownDoH) == 0 {
+	prefixes := publicdns.KnownDoHPrefixes()
+	if len(prefixes) == 0 {
 		t.Fatal("no known DoH")
 	}
 
-	f := &forwarder{
-		dohSem: make(chan struct{}, 10),
-	}
+	f := &forwarder{}
 
-	for ip := range knownDoH {
-		t.Run(ip.String(), func(t *testing.T) {
-			urlBase, c, ok := f.getKnownDoHClient(ip)
+	for _, urlBase := range prefixes {
+		t.Run(urlBase, func(t *testing.T) {
+			c, ok := f.getKnownDoHClientForProvider(urlBase)
 			if !ok {
 				t.Fatal("expected DoH")
 			}
@@ -85,13 +84,15 @@ func TestDoH(t *testing.T) {
 }
 
 func TestDoHV6Fallback(t *testing.T) {
-	for ip, base := range knownDoH {
-		if ip.Is4() {
-			ip6, ok := dohV6(base)
-			if !ok {
-				t.Errorf("no v6 DoH known for %v", ip)
-			} else if !ip6.Is6() {
-				t.Errorf("dohV6(%q) returned non-v6 address %v", base, ip6)
+	for _, base := range publicdns.KnownDoHPrefixes() {
+		for _, ip := range publicdns.DoHIPsOfBase(base) {
+			if ip.Is4() {
+				ip6, ok := publicdns.DoHV6(base)
+				if !ok {
+					t.Errorf("no v6 DoH known for %v", ip)
+				} else if !ip6.Is6() {
+					t.Errorf("dohV6(%q) returned non-v6 address %v", base, ip6)
+				}
 			}
 		}
 	}

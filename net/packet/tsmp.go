@@ -1,11 +1,10 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // TSMP is our ICMP-like "Tailscale Message Protocol" for signaling
 // Tailscale-specific messages between nodes. It uses IP protocol 99
 // (reserved for "any private encryption scheme") within
-// Wireguard's normal encryption between peers and never hits the host
+// WireGuard's normal encryption between peers and never hits the host
 // network stack.
 
 package packet
@@ -14,8 +13,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 
-	"inet.af/netaddr"
 	"tailscale.com/net/flowtrack"
 	"tailscale.com/types/ipproto"
 )
@@ -25,21 +24,21 @@ import (
 // TCP RST, this includes a reason.
 //
 // On the wire, after the IP header, it's currently 7 or 8 bytes:
-//     * '!'
-//     * IPProto byte (IANA protocol number: TCP or UDP)
-//     * 'A' or 'S' (RejectedDueToACLs, RejectedDueToShieldsUp)
-//     * srcPort big endian uint16
-//     * dstPort big endian uint16
-//     * [optional] byte of flag bits:
-//          lowest bit (0x1): MaybeBroken
+//   - '!'
+//   - IPProto byte (IANA protocol number: TCP or UDP)
+//   - 'A' or 'S' (RejectedDueToACLs, RejectedDueToShieldsUp)
+//   - srcPort big endian uint16
+//   - dstPort big endian uint16
+//   - [optional] byte of flag bits:
+//     lowest bit (0x1): MaybeBroken
 //
 // In the future it might also accept 16 byte IP flow src/dst IPs
 // after the header, if they're different than the IP-level ones.
 type TailscaleRejectedHeader struct {
-	IPSrc  netaddr.IP            // IPv4 or IPv6 header's src IP
-	IPDst  netaddr.IP            // IPv4 or IPv6 header's dst IP
-	Src    netaddr.IPPort        // rejected flow's src
-	Dst    netaddr.IPPort        // rejected flow's dst
+	IPSrc  netip.Addr            // IPv4 or IPv6 header's src IP
+	IPDst  netip.Addr            // IPv4 or IPv6 header's dst IP
+	Src    netip.AddrPort        // rejected flow's src
+	Dst    netip.AddrPort        // rejected flow's dst
 	Proto  ipproto.Proto         // proto that was rejected (TCP or UDP)
 	Reason TailscaleRejectReason // why the connection was rejected
 
@@ -58,7 +57,7 @@ type TailscaleRejectedHeader struct {
 const rejectFlagBitMaybeBroken = 0x1
 
 func (rh TailscaleRejectedHeader) Flow() flowtrack.Tuple {
-	return flowtrack.Tuple{Proto: rh.Proto, Src: rh.Src, Dst: rh.Dst}
+	return flowtrack.MakeTuple(rh.Proto, rh.Src, rh.Dst)
 }
 
 func (rh TailscaleRejectedHeader) String() string {
@@ -143,7 +142,7 @@ func (h TailscaleRejectedHeader) Marshal(buf []byte) error {
 	if len(buf) > maxPacketLength {
 		return errLargePacket
 	}
-	if h.Src.IP().Is4() {
+	if h.Src.Addr().Is4() {
 		iph := IP4Header{
 			IPProto: ipproto.TSMP,
 			Src:     h.IPSrc,
@@ -151,7 +150,7 @@ func (h TailscaleRejectedHeader) Marshal(buf []byte) error {
 		}
 		iph.Marshal(buf)
 		buf = buf[ip4HeaderLength:]
-	} else if h.Src.IP().Is6() {
+	} else if h.Src.Addr().Is6() {
 		iph := IP6Header{
 			IPProto: ipproto.TSMP,
 			Src:     h.IPSrc,
@@ -190,10 +189,10 @@ func (pp *Parsed) AsTailscaleRejectedHeader() (h TailscaleRejectedHeader, ok boo
 	h = TailscaleRejectedHeader{
 		Proto:  ipproto.Proto(p[1]),
 		Reason: TailscaleRejectReason(p[2]),
-		IPSrc:  pp.Src.IP(),
-		IPDst:  pp.Dst.IP(),
-		Src:    netaddr.IPPortFrom(pp.Dst.IP(), binary.BigEndian.Uint16(p[3:5])),
-		Dst:    netaddr.IPPortFrom(pp.Src.IP(), binary.BigEndian.Uint16(p[5:7])),
+		IPSrc:  pp.Src.Addr(),
+		IPDst:  pp.Dst.Addr(),
+		Src:    netip.AddrPortFrom(pp.Dst.Addr(), binary.BigEndian.Uint16(p[3:5])),
+		Dst:    netip.AddrPortFrom(pp.Src.Addr(), binary.BigEndian.Uint16(p[5:7])),
 	}
 	if len(p) > 7 {
 		flags := p[7]
@@ -205,8 +204,8 @@ func (pp *Parsed) AsTailscaleRejectedHeader() (h TailscaleRejectedHeader, ok boo
 // TSMPPingRequest is a TSMP message that's like an ICMP ping request.
 //
 // On the wire, after the IP header, it's currently 9 bytes:
-//     * 'p' (TSMPTypePing)
-//     * 8 opaque ping bytes to copy back in the response
+//   - 'p' (TSMPTypePing)
+//   - 8 opaque ping bytes to copy back in the response
 type TSMPPingRequest struct {
 	Data [8]byte
 }

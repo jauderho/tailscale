@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !windows
-// +build !windows
+//go:build !windows && !plan9
 
 package vms
 
@@ -23,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -49,6 +48,26 @@ func (vm *vmInstance) running() bool {
 	}
 }
 
+func (vm *vmInstance) waitStartup(t *testing.T) {
+	t.Helper()
+	for range 100 {
+		if vm.running() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !vm.running() {
+		t.Fatal("vm not running")
+	}
+}
+
+func (h *Harness) makeImage(t *testing.T, d Distro, cdir string) string {
+	if !strings.HasPrefix(d.Name, "nixos") {
+		t.Fatal("image generation for non-nixos is not implemented")
+	}
+	return h.makeNixOSImage(t, d, cdir)
+}
+
 // mkVM makes a KVM-accelerated virtual machine and prepares it for introduction
 // to the testcontrol server. The function it returns is for killing the virtual
 // machine when it is time for it to die.
@@ -67,7 +86,14 @@ func (h *Harness) mkVM(t *testing.T, n int, d Distro, sshKey, hostURL, tdir stri
 		t.Fatal(err)
 	}
 
-	mkLayeredQcow(t, tdir, d, fetchDistro(t, d))
+	var qcowPath string
+	if d.HostGenerated {
+		qcowPath = h.makeImage(t, d, cdir)
+	} else {
+		qcowPath = fetchDistro(t, d)
+	}
+
+	mkLayeredQcow(t, tdir, d, qcowPath)
 	mkSeed(t, d, sshKey, hostURL, tdir, port)
 
 	driveArg := fmt.Sprintf("file=%s,if=virtio", filepath.Join(tdir, d.Name+".qcow2"))

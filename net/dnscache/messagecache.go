@@ -1,10 +1,10 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dnscache
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -60,10 +60,7 @@ func (c *MessageCache) Flush() {
 // pruneLocked prunes down the cache size to the configured (or
 // default) max size.
 func (c *MessageCache) pruneLocked() {
-	max := c.cacheSizeSet
-	if max == 0 {
-		max = 500
-	}
+	max := cmp.Or(c.cacheSizeSet, 500)
 	for c.cache.Len() > max {
 		c.cache.RemoveOldest()
 	}
@@ -99,11 +96,11 @@ type msgResource struct {
 }
 
 // ErrCacheMiss is a sentinel error returned by MessageCache.ReplyFromCache
-// when the request can not be satisified from cache.
+// when the request can not be satisfied from cache.
 var ErrCacheMiss = errors.New("cache miss")
 
 var parserPool = &sync.Pool{
-	New: func() interface{} { return new(dnsmessage.Parser) },
+	New: func() any { return new(dnsmessage.Parser) },
 }
 
 // ReplyFromCache writes a DNS reply to w for the provided DNS query message,
@@ -264,7 +261,7 @@ func asciiLowerName(n dnsmessage.Name) dnsmessage.Name {
 }
 
 // packDNSResponse builds a DNS response for the given question and
-// transaction ID. The response resource records will have have the
+// transaction ID. The response resource records will have the
 // same provided TTL.
 func packDNSResponse(q msgQ, txID uint16, ttl uint32, answers []msgResource) ([]byte, error) {
 	var baseMem []byte // TODO: guess a max size based on looping over answers?

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -24,8 +23,8 @@ func init() {
 		} else if n > 10000 {
 			n = 10000
 		}
-		fl, ok := fwdLogAtomic.Load().(*fwdLog)
-		if !ok || n != len(fl.ent) {
+		fl := fwdLogAtomic.Load()
+		if fl == nil || n != len(fl.ent) {
 			fl = &fwdLog{ent: make([]fwdLogEntry, n)}
 			fwdLogAtomic.Store(fl)
 		}
@@ -33,7 +32,7 @@ func init() {
 	}))
 }
 
-var fwdLogAtomic atomic.Value // of *fwdLog
+var fwdLogAtomic atomic.Pointer[fwdLog]
 
 type fwdLog struct {
 	mu  sync.Mutex
@@ -68,7 +67,7 @@ func (fl *fwdLog) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "<html><h1>DNS forwards</h1>")
 	now := time.Now()
-	for i := 0; i < len(fl.ent); i++ {
+	for i := range len(fl.ent) {
 		ent := fl.ent[(i+fl.pos)%len(fl.ent)]
 		if ent.Domain == "" {
 			continue

@@ -1,23 +1,22 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package netstat returns the local machine's network connection table.
 package netstat
 
 import (
 	"errors"
+	"net/netip"
 	"runtime"
-
-	"inet.af/netaddr"
 )
 
 var ErrNotImplemented = errors.New("not implemented for GOOS=" + runtime.GOOS)
 
 type Entry struct {
-	Local, Remote netaddr.IPPort
+	Local, Remote netip.AddrPort
 	Pid           int
 	State         string // TODO: type?
+	OSMetadata    OSMetadata
 }
 
 // Table contains local machine's TCP connection entries.

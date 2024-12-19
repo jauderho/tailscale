@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -25,6 +24,11 @@ func (r fakeRouter) Up() error {
 
 func (r fakeRouter) Set(cfg *Config) error {
 	r.logf("[v1] warning: fakeRouter.Set: not implemented.")
+	return nil
+}
+
+func (r fakeRouter) UpdateMagicsockPort(_ uint16, _ string) error {
+	r.logf("[v1] warning: fakeRouter.UpdateMagicsockPort: not implemented.")
 	return nil
 }
 

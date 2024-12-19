@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package store provides various implementation of ipn.StateStore.
 package store
@@ -9,7 +8,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +19,7 @@ import (
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/paths"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/mak"
 )
 
 // Provider returns a StateStore for the provided path.
@@ -29,13 +28,13 @@ type Provider func(logf logger.Logf, arg string) (ipn.StateStore, error)
 
 var regOnce sync.Once
 
-var registerAvailableExternalStores func()
+var registerAvailableExternalStores []func()
 
 func registerDefaultStores() {
 	Register("mem:", mem.New)
 
-	if registerAvailableExternalStores != nil {
-		registerAvailableExternalStores()
+	for _, f := range registerAvailableExternalStores {
+		f()
 	}
 }
 
@@ -48,13 +47,13 @@ var knownStores map[string]Provider
 //
 // By default the following stores are registered:
 //
-//   * if the string begins with "mem:", the suffix
+//   - if the string begins with "mem:", the suffix
 //     is ignored and an in-memory store is used.
-//   * (Linux-only) if the string begins with "arn:",
+//   - (Linux-only) if the string begins with "arn:",
 //     the suffix an AWS ARN for an SSM.
-//   * (Linux-only) if the string begins with "kube:",
+//   - (Linux-only) if the string begins with "kube:",
 //     the suffix is a Kubernetes secret name
-//   * In all other cases, the path is treated as a filepath.
+//   - In all other cases, the path is treated as a filepath.
 func New(logf logger.Logf, path string) (ipn.StateStore, error) {
 	regOnce.Do(registerDefaultStores)
 	for prefix, sf := range knownStores {
@@ -82,10 +81,7 @@ func Register(prefix string, fn Provider) {
 	if _, ok := knownStores[prefix]; ok {
 		panic(fmt.Sprintf("%q already registered", prefix))
 	}
-	if knownStores == nil {
-		knownStores = make(map[string]Provider)
-	}
-	knownStores[prefix] = fn
+	mak.Set(&knownStores, prefix, fn)
 }
 
 // TryWindowsAppDataMigration attempts to copy the Windows state file
@@ -130,7 +126,7 @@ func NewFileStore(logf logger.Logf, path string) (ipn.StateStore, error) {
 		return nil, fmt.Errorf("creating state directory: %w", err)
 	}
 
-	bs, err := ioutil.ReadFile(path)
+	bs, err := os.ReadFile(path)
 
 	// Treat an empty file as a missing file.
 	// (https://github.com/tailscale/tailscale/issues/895#issuecomment-723255589)
@@ -183,7 +179,7 @@ func (s *FileStore) WriteState(id ipn.StateKey, bs []byte) error {
 	if bytes.Equal(s.cache[id], bs) {
 		return nil
 	}
-	s.cache[id] = append([]byte(nil), bs...)
+	s.cache[id] = bytes.Clone(bs)
 	bs, err := json.MarshalIndent(s.cache, "", "  ")
 	if err != nil {
 		return err

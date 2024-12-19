@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tstime
 
@@ -15,7 +14,7 @@ func TestRandomDurationBetween(t *testing.T) {
 	}
 	const min = 1 * time.Second
 	const max = 10 * time.Second
-	for i := 0; i < 500; i++ {
+	for range 500 {
 		if got := RandomDurationBetween(min, max); got < min || got >= max {
 			t.Fatalf("%v (%d) out of range", got, got)
 		}

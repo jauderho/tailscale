@@ -1,70 +1,32 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
 import (
-	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	_ "embed"
-	"encoding/json"
-	"encoding/xml"
 	"flag"
 	"fmt"
-	"html/template"
-	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/cgi"
-	"net/url"
+	"net/netip"
 	"os"
-	"os/exec"
-	"runtime"
+	"os/signal"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"inet.af/netaddr"
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/web"
 	"tailscale.com/ipn"
-	"tailscale.com/tailcfg"
-	"tailscale.com/types/preftype"
-	"tailscale.com/util/groupmember"
-	"tailscale.com/version/distro"
 )
-
-//go:embed web.html
-var webHTML string
-
-//go:embed web.css
-var webCSS string
-
-//go:embed auth-redirect.html
-var authenticationRedirectHTML string
-
-var tmpl *template.Template
-
-func init() {
-	tmpl = template.Must(template.New("web.html").Parse(webHTML))
-	template.Must(tmpl.New("web.css").Parse(webCSS))
-}
-
-type tmplData struct {
-	Profile           tailcfg.UserProfile
-	SynologyUser      string
-	Status            string
-	DeviceName        string
-	IP                string
-	AdvertiseExitNode bool
-	AdvertiseRoutes   string
-}
 
 var webCmd = &ffcli.Command{
 	Name:       "web",
-	ShortUsage: "web [flags]",
+	ShortUsage: "tailscale web [flags]",
 	ShortHelp:  "Run a web server for controlling Tailscale",
 
 	LongHelp: strings.TrimSpace(`
@@ -79,14 +41,18 @@ Tailscale, as opposed to a CLI or a native app.
 		webf := newFlagSet("web")
 		webf.StringVar(&webArgs.listen, "listen", "localhost:8088", "listen address; use port 0 for automatic")
 		webf.BoolVar(&webArgs.cgi, "cgi", false, "run as CGI script")
+		webf.StringVar(&webArgs.prefix, "prefix", "", "URL prefix added to requests (for cgi or reverse proxies)")
+		webf.BoolVar(&webArgs.readonly, "readonly", false, "run web UI in read-only mode")
 		return webf
 	})(),
 	Exec: runWeb,
 }
 
 var webArgs struct {
-	listen string
-	cgi    bool
+	listen   string
+	cgi      bool
+	prefix   string
+	readonly bool
 }
 
 func tlsConfigFromEnvironment() *tls.Config {
@@ -113,379 +79,94 @@ func tlsConfigFromEnvironment() *tls.Config {
 }
 
 func runWeb(ctx context.Context, args []string) error {
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
+	defer cancel()
+
 	if len(args) > 0 {
 		return fmt.Errorf("too many non-flag arguments: %q", args)
 	}
 
-	if webArgs.cgi {
-		if err := cgi.Serve(http.HandlerFunc(webHandler)); err != nil {
-			log.Printf("tailscale.cgi: %v", err)
-			return err
-		}
-		return nil
+	var selfIP netip.Addr
+	st, err := localClient.StatusWithoutPeers(ctx)
+	if err == nil && st.Self != nil && len(st.Self.TailscaleIPs) > 0 {
+		selfIP = st.Self.TailscaleIPs[0]
 	}
 
-	tlsConfig := tlsConfigFromEnvironment()
-	if tlsConfig != nil {
+	var existingWebClient bool
+	if prefs, err := localClient.GetPrefs(ctx); err == nil {
+		existingWebClient = prefs.RunWebClient
+	}
+	var startedManagementClient bool // we started the management client
+	if !existingWebClient && !webArgs.readonly {
+		// Also start full client in tailscaled.
+		log.Printf("starting tailscaled web client at http://%s\n", netip.AddrPortFrom(selfIP, web.ListenPort))
+		if err := setRunWebClient(ctx, true); err != nil {
+			return fmt.Errorf("starting web client in tailscaled: %w", err)
+		}
+		startedManagementClient = true
+	}
+
+	opts := web.ServerOpts{
+		Mode:        web.LoginServerMode,
+		CGIMode:     webArgs.cgi,
+		PathPrefix:  webArgs.prefix,
+		LocalClient: &localClient,
+	}
+	if webArgs.readonly {
+		opts.Mode = web.ReadOnlyServerMode
+	}
+	webServer, err := web.NewServer(opts)
+	if err != nil {
+		log.Printf("tailscale.web: %v", err)
+		return err
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Shutdown the server.
+			webServer.Shutdown()
+			if !webArgs.cgi && startedManagementClient {
+				log.Println("stopping tailscaled web client")
+				// When not in cgi mode, shut down the tailscaled
+				// web client on cli termination if we started it.
+				if err := setRunWebClient(context.Background(), false); err != nil {
+					log.Printf("stopping tailscaled web client: %v", err)
+				}
+			}
+		}
+		os.Exit(0)
+	}()
+
+	if webArgs.cgi {
+		if err := cgi.Serve(webServer); err != nil {
+			log.Printf("tailscale.cgi: %v", err)
+		}
+		return nil
+	} else if tlsConfig := tlsConfigFromEnvironment(); tlsConfig != nil {
 		server := &http.Server{
 			Addr:      webArgs.listen,
 			TLSConfig: tlsConfig,
-			Handler:   http.HandlerFunc(webHandler),
+			Handler:   webServer,
 		}
-
-		log.Printf("web server runNIng on: https://%s", server.Addr)
+		defer server.Shutdown(ctx)
+		log.Printf("web server running on: https://%s", server.Addr)
 		return server.ListenAndServeTLS("", "")
 	} else {
 		log.Printf("web server running on: %s", urlOfListenAddr(webArgs.listen))
-		return http.ListenAndServe(webArgs.listen, http.HandlerFunc(webHandler))
+		return http.ListenAndServe(webArgs.listen, webServer)
 	}
+}
+
+func setRunWebClient(ctx context.Context, val bool) error {
+	_, err := localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:           ipn.Prefs{RunWebClient: val},
+		RunWebClientSet: true,
+	})
+	return err
 }
 
 // urlOfListenAddr parses a given listen address into a formatted URL
 func urlOfListenAddr(addr string) string {
 	host, port, _ := net.SplitHostPort(addr)
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	return fmt.Sprintf("http://%s", net.JoinHostPort(host, port))
-}
-
-// authorize returns the name of the user accessing the web UI after verifying
-// whether the user has access to the web UI. The function will write the
-// error to the provided http.ResponseWriter.
-// Note: This is different from a tailscale user, and is typically the local
-// user on the node.
-func authorize(w http.ResponseWriter, r *http.Request) (string, error) {
-	switch distro.Get() {
-	case distro.Synology:
-		user, err := synoAuthn()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return "", err
-		}
-		if err := authorizeSynology(user); err != nil {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return "", err
-		}
-		return user, nil
-	case distro.QNAP:
-		user, resp, err := qnapAuthn(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return "", err
-		}
-		if resp.IsAdmin == 0 {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return "", err
-		}
-		return user, nil
-	}
-	return "", nil
-}
-
-// authorizeSynology checks whether the provided user has access to the web UI
-// by consulting the membership of the "administrators" group.
-func authorizeSynology(name string) error {
-	yes, err := groupmember.IsMemberOfGroup("administrators", name)
-	if err != nil {
-		return err
-	}
-	if !yes {
-		return fmt.Errorf("not a member of administrators group")
-	}
-	return nil
-}
-
-type qnapAuthResponse struct {
-	AuthPassed int    `xml:"authPassed"`
-	IsAdmin    int    `xml:"isAdmin"`
-	AuthSID    string `xml:"authSid"`
-	ErrorValue int    `xml:"errorValue"`
-}
-
-func qnapAuthn(r *http.Request) (string, *qnapAuthResponse, error) {
-	user, err := r.Cookie("NAS_USER")
-	if err != nil {
-		return "", nil, err
-	}
-	token, err := r.Cookie("qtoken")
-	if err != nil {
-		return "", nil, err
-	}
-	query := url.Values{
-		"qtoken": []string{token.Value},
-		"user":   []string{user.Value},
-	}
-	u := url.URL{
-		Scheme:   r.URL.Scheme,
-		Host:     r.URL.Host,
-		Path:     "/cgi-bin/authLogin.cgi",
-		RawQuery: query.Encode(),
-	}
-	resp, err := http.Get(u.String())
-	if err != nil {
-		return "", nil, err
-	}
-	defer resp.Body.Close()
-	out, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", nil, err
-	}
-	authResp := &qnapAuthResponse{}
-	if err := xml.Unmarshal(out, authResp); err != nil {
-		return "", nil, err
-	}
-	if authResp.AuthPassed == 0 {
-		return "", nil, fmt.Errorf("not authenticated")
-	}
-	return user.Value, authResp, nil
-}
-
-func synoAuthn() (string, error) {
-	cmd := exec.Command("/usr/syno/synoman/webman/modules/authenticate.cgi")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("auth: %v: %s", err, out)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func authRedirect(w http.ResponseWriter, r *http.Request) bool {
-	if distro.Get() == distro.Synology {
-		return synoTokenRedirect(w, r)
-	}
-	return false
-}
-
-func synoTokenRedirect(w http.ResponseWriter, r *http.Request) bool {
-	if r.Header.Get("X-Syno-Token") != "" {
-		return false
-	}
-	if r.URL.Query().Get("SynoToken") != "" {
-		return false
-	}
-	if r.Method == "POST" && r.FormValue("SynoToken") != "" {
-		return false
-	}
-	// We need a SynoToken for authenticate.cgi.
-	// So we tell the client to get one.
-	serverURL := r.URL.Scheme + "://" + r.URL.Host
-	synoTokenRedirectHTML.Execute(w, serverURL)
-	return true
-}
-
-var synoTokenRedirectHTML = template.Must(template.New("redirect").Parse(`<html><body>
-Redirecting with session token...
-<script>
-var serverURL = {{ . }};
-var req = new XMLHttpRequest();
-req.overrideMimeType("application/json");
-req.open("GET", serverURL + "/webman/login.cgi", true);
-req.onload = function() {
-	var jsonResponse = JSON.parse(req.responseText);
-	var token = jsonResponse["SynoToken"];
-	document.location.href = serverURL + "/webman/3rdparty/Tailscale/?SynoToken=" + token;
-};
-req.send(null);
-</script>
-</body></html>
-`))
-
-func webHandler(w http.ResponseWriter, r *http.Request) {
-	if authRedirect(w, r) {
-		return
-	}
-
-	user, err := authorize(w, r)
-	if err != nil {
-		return
-	}
-
-	if r.URL.Path == "/redirect" || r.URL.Path == "/redirect/" {
-		w.Write([]byte(authenticationRedirectHTML))
-		return
-	}
-
-	if r.Method == "POST" {
-		defer r.Body.Close()
-		var postData struct {
-			AdvertiseRoutes   string
-			AdvertiseExitNode bool
-			Reauthenticate    bool
-		}
-		type mi map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&postData); err != nil {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(mi{"error": err.Error()})
-			return
-		}
-		prefs, err := tailscale.GetPrefs(r.Context())
-		if err != nil && !postData.Reauthenticate {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(mi{"error": err.Error()})
-			return
-		} else {
-			routes, err := calcAdvertiseRoutes(postData.AdvertiseRoutes, postData.AdvertiseExitNode)
-			if err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(mi{"error": err.Error()})
-				return
-			}
-			prefs.AdvertiseRoutes = routes
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		url, err := tailscaleUp(r.Context(), prefs, postData.Reauthenticate)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(mi{"error": err.Error()})
-			return
-		}
-		if url != "" {
-			json.NewEncoder(w).Encode(mi{"url": url})
-		} else {
-			io.WriteString(w, "{}")
-		}
-		return
-	}
-
-	st, err := tailscale.Status(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	prefs, err := tailscale.GetPrefs(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	profile := st.User[st.Self.UserID]
-	deviceName := strings.Split(st.Self.DNSName, ".")[0]
-	data := tmplData{
-		SynologyUser: user,
-		Profile:      profile,
-		Status:       st.BackendState,
-		DeviceName:   deviceName,
-	}
-	exitNodeRouteV4 := netaddr.MustParseIPPrefix("0.0.0.0/0")
-	exitNodeRouteV6 := netaddr.MustParseIPPrefix("::/0")
-	for _, r := range prefs.AdvertiseRoutes {
-		if r == exitNodeRouteV4 || r == exitNodeRouteV6 {
-			data.AdvertiseExitNode = true
-		} else {
-			if data.AdvertiseRoutes != "" {
-				data.AdvertiseRoutes += ","
-			}
-			data.AdvertiseRoutes += r.String()
-		}
-	}
-	if len(st.TailscaleIPs) != 0 {
-		data.IP = st.TailscaleIPs[0].String()
-	}
-
-	buf := new(bytes.Buffer)
-	if err := tmpl.Execute(buf, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.Write(buf.Bytes())
-}
-
-// TODO(crawshaw): some of this is very similar to the code in 'tailscale up', can we share anything?
-func tailscaleUp(ctx context.Context, prefs *ipn.Prefs, forceReauth bool) (authURL string, retErr error) {
-	if prefs == nil {
-		prefs = ipn.NewPrefs()
-		prefs.ControlURL = ipn.DefaultControlURL
-		prefs.WantRunning = true
-		prefs.CorpDNS = true
-		prefs.AllowSingleHosts = true
-		prefs.ForceDaemon = (runtime.GOOS == "windows")
-	}
-
-	if distro.Get() == distro.Synology {
-		prefs.NetfilterMode = preftype.NetfilterOff
-	}
-
-	st, err := tailscale.Status(ctx)
-	if err != nil {
-		return "", fmt.Errorf("can't fetch status: %v", err)
-	}
-	origAuthURL := st.AuthURL
-
-	// printAuthURL reports whether we should print out the
-	// provided auth URL from an IPN notify.
-	printAuthURL := func(url string) bool {
-		return url != origAuthURL
-	}
-
-	c, bc, pumpCtx, cancel := connect(ctx)
-	defer cancel()
-
-	gotEngineUpdate := make(chan bool, 1) // gets value upon an engine update
-	go pump(pumpCtx, bc, c)
-
-	bc.SetNotifyCallback(func(n ipn.Notify) {
-		if n.Engine != nil {
-			select {
-			case gotEngineUpdate <- true:
-			default:
-			}
-		}
-		if n.ErrMessage != nil {
-			msg := *n.ErrMessage
-			if msg == ipn.ErrMsgPermissionDenied {
-				switch runtime.GOOS {
-				case "windows":
-					msg += " (Tailscale service in use by other user?)"
-				default:
-					msg += " (try 'sudo tailscale up [...]')"
-				}
-			}
-			retErr = fmt.Errorf("backend error: %v", msg)
-			cancel()
-		} else if url := n.BrowseToURL; url != nil && printAuthURL(*url) {
-			authURL = *url
-			cancel()
-		}
-		if !forceReauth && n.Prefs != nil {
-			p1, p2 := *n.Prefs, *prefs
-			p1.Persist = nil
-			p2.Persist = nil
-			if p1.Equals(&p2) {
-				cancel()
-			}
-		}
-	})
-	// Wait for backend client to be connected so we know
-	// we're subscribed to updates. Otherwise we can miss
-	// an update upon its transition to running. Do so by causing some traffic
-	// back to the bus that we then wait on.
-	bc.RequestEngineStatus()
-	select {
-	case <-gotEngineUpdate:
-	case <-pumpCtx.Done():
-		return authURL, pumpCtx.Err()
-	}
-
-	bc.SetPrefs(prefs)
-
-	bc.Start(ipn.Options{
-		StateKey: ipn.GlobalDaemonStateKey,
-	})
-	if forceReauth {
-		bc.StartLoginInteractive()
-	}
-
-	<-pumpCtx.Done() // wait for authURL or complete failure
-	if authURL == "" && retErr == nil {
-		if !forceReauth {
-			return "", nil // no auth URL is fine
-		}
-		retErr = pumpCtx.Err()
-	}
-	if authURL == "" && retErr == nil {
-		return "", fmt.Errorf("login failed with no backend error message")
-	}
-	return authURL, retErr
+	return fmt.Sprintf("http://%s", net.JoinHostPort(cmp.Or(host, "127.0.0.1"), port))
 }

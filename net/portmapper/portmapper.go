@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package portmapper is a UDP port mapping client. It currently allows for mapping over
 // NAT-PMP, UPnP, and PCP.
@@ -14,28 +13,59 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go4.org/mem"
-	"inet.af/netaddr"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/control/controlknobs"
+	"tailscale.com/envknob"
+	"tailscale.com/net/netaddr"
 	"tailscale.com/net/neterror"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/sockstats"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/nettype"
 	"tailscale.com/util/clientmetric"
 )
 
-// Debug knobs for "tailscaled debug --portmap".
-var (
+var disablePortMapperEnv = envknob.RegisterBool("TS_DISABLE_PORTMAPPER")
+
+// DebugKnobs contains debug configuration that can be provided when creating a
+// Client. The zero value is valid for use.
+type DebugKnobs struct {
+	// VerboseLogs tells the Client to print additional debug information
+	// to its logger.
 	VerboseLogs bool
 
-	// Disable* disables a specific service from mapping.
+	// LogHTTP tells the Client to print the raw HTTP logs (from UPnP) to
+	// its logger. This is useful when debugging buggy UPnP
+	// implementations.
+	LogHTTP bool
 
+	// Disable* disables a specific service from mapping.
 	DisableUPnP bool
 	DisablePMP  bool
 	DisablePCP  bool
-)
+
+	// DisableAll, if non-nil, is a func that reports whether all port
+	// mapping attempts should be disabled.
+	DisableAll func() bool
+}
+
+func (k *DebugKnobs) disableAll() bool {
+	if disablePortMapperEnv() {
+		return true
+	}
+	if k.DisableAll != nil {
+		return k.DisableAll()
+	}
+	return false
+}
 
 // References:
 //
@@ -55,8 +85,11 @@ const trustServiceStillAvailableDuration = 10 * time.Minute
 // Client is a port mapping client.
 type Client struct {
 	logf         logger.Logf
-	ipAndGateway func() (gw, ip netaddr.IP, ok bool)
+	netMon       *netmon.Monitor // optional; nil means interfaces will be looked up on-demand
+	controlKnobs *controlknobs.Knobs
+	ipAndGateway func() (gw, ip netip.Addr, ok bool)
 	onChange     func() // or nil
+	debug        DebugKnobs
 	testPxPPort  uint16 // if non-zero, pxpPort to use for tests
 	testUPnPPort uint16 // if non-zero, uPnPPort to use for tests
 
@@ -67,25 +100,34 @@ type Client struct {
 	// off a createMapping goroutine).
 	runningCreate bool
 
-	lastMyIP netaddr.IP
-	lastGW   netaddr.IP
+	lastMyIP netip.Addr
+	lastGW   netip.Addr
 	closed   bool
 
 	lastProbe time.Time
 
-	pmpPubIP     netaddr.IP // non-zero if known
+	// The following PMP fields are populated during Probe
+	pmpPubIP     netip.Addr // non-zero if known
 	pmpPubIPTime time.Time  // time pmpPubIP last verified
 	pmpLastEpoch uint32
 
-	pcpSawTime time.Time // time we last saw PCP was available
+	// The following PCP fields are populated during Probe
+	pcpSawTime   time.Time // time we last saw PCP was available
+	pcpLastEpoch uint32
 
-	uPnPSawTime    time.Time         // time we last saw UPnP was available
-	uPnPMeta       uPnPDiscoResponse // Location header from UPnP UDP discovery response
-	uPnPHTTPClient *http.Client      // netns-configured HTTP client for UPnP; nil until needed
+	uPnPSawTime    time.Time           // time we last saw UPnP was available
+	uPnPMetas      []uPnPDiscoResponse // UPnP UDP discovery responses
+	uPnPHTTPClient *http.Client        // netns-configured HTTP client for UPnP; nil until needed
 
 	localPort uint16
 
 	mapping mapping // non-nil if we have a mapping
+}
+
+func (c *Client) vlogf(format string, args ...any) {
+	if c.debug.VerboseLogs {
+		c.logf(format, args...)
+	}
 }
 
 // mapping represents a created port-mapping over some protocol.  It specifies a lease duration,
@@ -98,12 +140,17 @@ type mapping interface {
 	// but can be called asynchronously. Release should be idempotent, and thus even if called
 	// multiple times should not cause additional side-effects.
 	Release(context.Context)
-	// goodUntil will return the lease time that the mapping is valid for.
+	// GoodUntil will return the lease time that the mapping is valid for.
 	GoodUntil() time.Time
-	// renewAfter returns the earliest time that the mapping should be renewed.
+	// RenewAfter returns the earliest time that the mapping should be renewed.
 	RenewAfter() time.Time
-	// externalIPPort indicates what port the mapping can be reached from on the outside.
-	External() netaddr.IPPort
+	// External indicates what port the mapping can be reached from on the outside.
+	External() netip.AddrPort
+	// MappingType returns a descriptive string for this type of mapping.
+	MappingType() string
+	// MappingDebug returns a debug string for this mapping, for use when
+	// printing verbose logs.
+	MappingDebug() string
 }
 
 // HaveMapping reports whether we have a current valid mapping.
@@ -118,9 +165,9 @@ func (c *Client) HaveMapping() bool {
 // All fields are immutable once created.
 type pmpMapping struct {
 	c          *Client
-	gw         netaddr.IPPort
-	external   netaddr.IPPort
-	internal   netaddr.IPPort
+	gw         netip.AddrPort
+	external   netip.AddrPort
+	internal   netip.AddrPort
 	renewAfter time.Time // the time at which we want to renew the mapping
 	goodUntil  time.Time // the mapping's total lifetime
 	epoch      uint32
@@ -128,12 +175,20 @@ type pmpMapping struct {
 
 // externalValid reports whether m.external is valid, with both its IP and Port populated.
 func (m *pmpMapping) externalValid() bool {
-	return !m.external.IP().IsZero() && m.external.Port() != 0
+	return m.external.Addr().IsValid() && m.external.Port() != 0
 }
 
+func (p *pmpMapping) MappingType() string      { return "pmp" }
 func (p *pmpMapping) GoodUntil() time.Time     { return p.goodUntil }
 func (p *pmpMapping) RenewAfter() time.Time    { return p.renewAfter }
-func (p *pmpMapping) External() netaddr.IPPort { return p.external }
+func (p *pmpMapping) External() netip.AddrPort { return p.external }
+
+func (p *pmpMapping) MappingDebug() string {
+	return fmt.Sprintf("pmpMapping{gw:%v, external:%v, internal:%v, renewAfter:%d, goodUntil:%d, epoch:%v}",
+		p.gw, p.external, p.internal,
+		p.renewAfter.Unix(), p.goodUntil.Unix(),
+		p.epoch)
+}
 
 // Release does a best effort fire-and-forget release of the PMP mapping m.
 func (m *pmpMapping) Release(ctx context.Context) {
@@ -143,26 +198,43 @@ func (m *pmpMapping) Release(ctx context.Context) {
 	}
 	defer uc.Close()
 	pkt := buildPMPRequestMappingPacket(m.internal.Port(), m.external.Port(), pmpMapLifetimeDelete)
-	uc.WriteTo(pkt, m.gw.UDPAddr())
+	uc.WriteToUDPAddrPort(pkt, m.gw)
 }
 
 // NewClient returns a new portmapping client.
 //
-// The optional onChange argument specifies a func to run in a new
-// goroutine whenever the port mapping status has changed. If nil,
-// it doesn't make a callback.
-func NewClient(logf logger.Logf, onChange func()) *Client {
-	return &Client{
-		logf:         logf,
-		ipAndGateway: interfaces.LikelyHomeRouterIP,
-		onChange:     onChange,
+// The netMon parameter is required.
+//
+// The debug argument allows configuring the behaviour of the portmapper for
+// debugging; if nil, a sensible set of defaults will be used.
+//
+// The controlKnobs, if non-nil, specifies the control knobs from the control
+// plane that might disable portmapping.
+//
+// The optional onChange argument specifies a func to run in a new goroutine
+// whenever the port mapping status has changed. If nil, it doesn't make a
+// callback.
+func NewClient(logf logger.Logf, netMon *netmon.Monitor, debug *DebugKnobs, controlKnobs *controlknobs.Knobs, onChange func()) *Client {
+	if netMon == nil {
+		panic("nil netMon")
 	}
+	ret := &Client{
+		logf:         logf,
+		netMon:       netMon,
+		ipAndGateway: netmon.LikelyHomeRouterIP, // TODO(bradfitz): move this to method on netMon
+		onChange:     onChange,
+		controlKnobs: controlKnobs,
+	}
+	if debug != nil {
+		ret.debug = *debug
+	}
+	return ret
 }
 
 // SetGatewayLookupFunc set the func that returns the machine's default gateway IP, and
 // the primary IP address for that gateway. It must be called before the client is used.
 // If not called, interfaces.LikelyHomeRouterIP is used.
-func (c *Client) SetGatewayLookupFunc(f func() (gw, myIP netaddr.IP, ok bool)) {
+func (c *Client) SetGatewayLookupFunc(f func() (gw, myIP netip.Addr, ok bool)) {
 	c.ipAndGateway = f
 }
 
@@ -201,11 +273,11 @@ func (c *Client) SetLocalPort(localPort uint16) {
 	c.invalidateMappingsLocked(true)
 }
 
-func (c *Client) gatewayAndSelfIP() (gw, myIP netaddr.IP, ok bool) {
+func (c *Client) gatewayAndSelfIP() (gw, myIP netip.Addr, ok bool) {
 	gw, myIP, ok = c.ipAndGateway()
 	if !ok {
-		gw = netaddr.IP{}
-		myIP = netaddr.IP{}
+		gw = netip.Addr{}
+		myIP = netip.Addr{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -236,7 +308,9 @@ func (c *Client) upnpPort() uint16 {
 	return upnpDefaultPort
 }
 
-func (c *Client) listenPacket(ctx context.Context, network, addr string) (net.PacketConn, error) {
+func (c *Client) listenPacket(ctx context.Context, network, addr string) (nettype.PacketConn, error) {
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelPortmapperClient, c.logf)
+
 	// When running under testing conditions, we bind the IGD server
 	// to localhost, and may be running in an environment where our
 	// netns code would decide that binding the portmapper client
@@ -251,9 +325,17 @@ func (c *Client) listenPacket(ctx context.Context, network, addr string) (net.Pa
 	// so we don't care.
 	if c.testPxPPort != 0 || c.testUPnPPort != 0 {
 		var lc net.ListenConfig
-		return lc.ListenPacket(ctx, network, addr)
+		pc, err := lc.ListenPacket(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return pc.(*net.UDPConn), nil
 	}
-	return netns.Listener(c.logf).ListenPacket(ctx, network, addr)
+	pc, err := netns.Listener(c.logf, c.netMon).ListenPacket(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return pc.(*net.UDPConn), nil
 }
 
 func (c *Client) invalidateMappingsLocked(releaseOld bool) {
@@ -263,11 +345,16 @@ func (c *Client) invalidateMappingsLocked(releaseOld bool) {
 		}
 		c.mapping = nil
 	}
-	c.pmpPubIP = netaddr.IP{}
+
+	c.pmpPubIP = netip.Addr{}
 	c.pmpPubIPTime = time.Time{}
+	c.pmpLastEpoch = 0
+
 	c.pcpSawTime = time.Time{}
+	c.pcpLastEpoch = 0
+
 	c.uPnPSawTime = time.Time{}
-	c.uPnPMeta = uPnPDiscoResponse{}
+	c.uPnPMetas = nil
 }
 
 func (c *Client) sawPMPRecently() bool {
@@ -277,7 +364,7 @@ func (c *Client) sawPMPRecently() bool {
 }
 
 func (c *Client) sawPMPRecentlyLocked() bool {
-	return !c.pmpPubIP.IsZero() && c.pmpPubIPTime.After(time.Now().Add(-trustServiceStillAvailableDuration))
+	return c.pmpPubIP.IsValid() && c.pmpPubIPTime.After(time.Now().Add(-trustServiceStillAvailableDuration))
 }
 
 func (c *Client) sawPCPRecently() bool {
@@ -333,13 +420,15 @@ func IsNoMappingError(err error) bool {
 var (
 	ErrNoPortMappingServices = errors.New("no port mapping services were found")
 	ErrGatewayRange          = errors.New("skipping portmap; gateway range likely lacks support")
+	ErrGatewayIPv6           = errors.New("skipping portmap; no IPv6 support for portmapping")
+	ErrPortMappingDisabled   = errors.New("port mapping is disabled")
 )
 
 // GetCachedMappingOrStartCreatingOne quickly returns with our current cached portmapping, if any.
 // If there's not one, it starts up a background goroutine to create one.
 // If the background goroutine ends up creating one, the onChange hook registered with the
 // NewClient constructor (if any) will fire.
-func (c *Client) GetCachedMappingOrStartCreatingOne() (external netaddr.IPPort, ok bool) {
+func (c *Client) GetCachedMappingOrStartCreatingOne() (external netip.AddrPort, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -355,7 +444,7 @@ func (c *Client) GetCachedMappingOrStartCreatingOne() (external netaddr.IPPort, 
 	}
 
 	c.maybeStartMappingLocked()
-	return netaddr.IPPort{}, false
+	return netip.AddrPort{}, false
 }
 
 // maybeStartMappingLocked starts a createMapping goroutine up, if one isn't already running.
@@ -386,47 +475,92 @@ func (c *Client) createMapping() {
 }
 
 // wildcardIP is used when the previous external IP is not known for PCP port mapping.
-var wildcardIP = netaddr.MustParseIP("0.0.0.0")
+var wildcardIP = netip.MustParseAddr("0.0.0.0")
 
 // createOrGetMapping either creates a new mapping or returns a cached
 // valid one.
 //
 // If no mapping is available, the error will be of type
 // NoMappingError; see IsNoMappingError.
-func (c *Client) createOrGetMapping(ctx context.Context) (external netaddr.IPPort, err error) {
-	if DisableUPnP && DisablePCP && DisablePMP {
-		return netaddr.IPPort{}, NoMappingError{ErrNoPortMappingServices}
+func (c *Client) createOrGetMapping(ctx context.Context) (external netip.AddrPort, err error) {
+	if c.debug.disableAll() {
+		return netip.AddrPort{}, NoMappingError{ErrPortMappingDisabled}
+	}
+	if c.debug.DisableUPnP && c.debug.DisablePCP && c.debug.DisablePMP {
+		return netip.AddrPort{}, NoMappingError{ErrNoPortMappingServices}
 	}
 	gw, myIP, ok := c.gatewayAndSelfIP()
 	if !ok {
-		return netaddr.IPPort{}, NoMappingError{ErrGatewayRange}
+		return netip.AddrPort{}, NoMappingError{ErrGatewayRange}
 	}
+	if gw.Is6() {
+		return netip.AddrPort{}, NoMappingError{ErrGatewayIPv6}
+	}
+
+	now := time.Now()
+
+	// Log what kind of portmap we obtained
+	reusedExisting := false
+	defer func() {
+		if err != nil {
+			return
+		}
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		portmapType := "none"
+		if c.mapping != nil {
+			portmapType = c.mapping.MappingType()
+		}
+		if reusedExisting {
+			portmapType = "existing-" + portmapType
+		}
+
+		if c.mapping == nil {
+			c.logf("[unexpected] no error but no stored mapping: now=%d external=%v type=%s",
+				now.Unix(), external, portmapType)
+			return
+		}
+
+		// Print the internal details of each mapping if we're being verbose.
+		if c.debug.VerboseLogs {
+			c.logf("successfully obtained mapping: now=%d external=%v type=%s mapping=%s",
+				now.Unix(), external, portmapType, c.mapping.MappingDebug())
+			return
+		}
+
+		c.logf("[v1] successfully obtained mapping: now=%d external=%v type=%s goodUntil=%d renewAfter=%d",
+			now.Unix(), external, portmapType,
+			c.mapping.GoodUntil().Unix(), c.mapping.RenewAfter().Unix())
+	}()
 
 	c.mu.Lock()
 	localPort := c.localPort
-	internalAddr := netaddr.IPPortFrom(myIP, localPort)
+	internalAddr := netip.AddrPortFrom(myIP, localPort)
 
 	// prevPort is the port we had most previously, if any. We try
 	// to ask for the same port. 0 means to give us any port.
 	var prevPort uint16
 
 	// Do we have an existing mapping that's valid?
-	now := time.Now()
 	if m := c.mapping; m != nil {
 		if now.Before(m.RenewAfter()) {
 			defer c.mu.Unlock()
+			reusedExisting = true
 			return m.External(), nil
 		}
 		// The mapping might still be valid, so just try to renew it.
 		prevPort = m.External().Port()
 	}
 
-	if DisablePCP && DisablePMP {
+	if c.debug.DisablePCP && c.debug.DisablePMP {
 		c.mu.Unlock()
 		if external, ok := c.getUPnPPortMapping(ctx, gw, internalAddr, prevPort); ok {
 			return external, nil
 		}
-		return netaddr.IPPort{}, NoMappingError{ErrNoPortMappingServices}
+		c.vlogf("fallback to UPnP due to PCP and PMP being disabled failed")
+		return netip.AddrPort{}, NoMappingError{ErrNoPortMappingServices}
 	}
 
 	// If we just did a Probe (e.g. via netchecker) but didn't
@@ -443,11 +577,11 @@ func (c *Client) createOrGetMapping(ctx context.Context) (external netaddr.IPPor
 	// construct it upon receiving that packet.
 	m := &pmpMapping{
 		c:        c,
-		gw:       netaddr.IPPortFrom(gw, c.pxpPort()),
+		gw:       netip.AddrPortFrom(gw, c.pxpPort()),
 		internal: internalAddr,
 	}
 	if haveRecentPMP {
-		m.external = m.external.WithIP(c.pmpPubIP)
+		m.external = netip.AddrPortFrom(c.pmpPubIP, m.external.Port())
 	}
 	if c.lastProbe.After(now.Add(-5*time.Second)) && !haveRecentPMP && !haveRecentPCP {
 		c.mu.Unlock()
@@ -455,71 +589,70 @@ func (c *Client) createOrGetMapping(ctx context.Context) (external netaddr.IPPor
 		if external, ok := c.getUPnPPortMapping(ctx, gw, internalAddr, prevPort); ok {
 			return external, nil
 		}
-		return netaddr.IPPort{}, NoMappingError{ErrNoPortMappingServices}
+		c.vlogf("fallback to UPnP due to no PCP and PMP failed")
+		return netip.AddrPort{}, NoMappingError{ErrNoPortMappingServices}
 	}
 	c.mu.Unlock()
 
 	uc, err := c.listenPacket(ctx, "udp4", ":0")
 	if err != nil {
-		return netaddr.IPPort{}, err
+		return netip.AddrPort{}, err
 	}
 	defer uc.Close()
 
 	uc.SetReadDeadline(time.Now().Add(portMapServiceTimeout))
 	defer closeCloserOnContextDone(ctx, uc)()
 
-	pxpAddr := netaddr.IPPortFrom(gw, c.pxpPort())
-	pxpAddru := pxpAddr.UDPAddr()
+	pxpAddr := netip.AddrPortFrom(gw, c.pxpPort())
 
-	preferPCP := !DisablePCP && (DisablePMP || (!haveRecentPMP && haveRecentPCP))
+	preferPCP := !c.debug.DisablePCP && (c.debug.DisablePMP || (!haveRecentPMP && haveRecentPCP))
 
 	// Create a mapping, defaulting to PMP unless only PCP was seen recently.
 	if preferPCP {
 		// TODO replace wildcardIP here with previous external if known.
 		// Only do PCP mapping in the case when PMP did not appear to be available recently.
 		pkt := buildPCPRequestMappingPacket(myIP, localPort, prevPort, pcpMapLifetimeSec, wildcardIP)
-		if _, err := uc.WriteTo(pkt, pxpAddru); err != nil {
+		if _, err := uc.WriteToUDPAddrPort(pkt, pxpAddr); err != nil {
 			if neterror.TreatAsLostUDP(err) {
 				err = NoMappingError{ErrNoPortMappingServices}
 			}
-			return netaddr.IPPort{}, err
+			return netip.AddrPort{}, err
 		}
 	} else {
 		// Ask for our external address if needed.
-		if m.external.IP().IsZero() {
-			if _, err := uc.WriteTo(pmpReqExternalAddrPacket, pxpAddru); err != nil {
+		if !m.external.Addr().IsValid() {
+			if _, err := uc.WriteToUDPAddrPort(pmpReqExternalAddrPacket, pxpAddr); err != nil {
 				if neterror.TreatAsLostUDP(err) {
 					err = NoMappingError{ErrNoPortMappingServices}
 				}
-				return netaddr.IPPort{}, err
+				return netip.AddrPort{}, err
 			}
 		}
 
 		pkt := buildPMPRequestMappingPacket(localPort, prevPort, pmpMapLifetimeSec)
-		if _, err := uc.WriteTo(pkt, pxpAddru); err != nil {
+		if _, err := uc.WriteToUDPAddrPort(pkt, pxpAddr); err != nil {
 			if neterror.TreatAsLostUDP(err) {
 				err = NoMappingError{ErrNoPortMappingServices}
 			}
-			return netaddr.IPPort{}, err
+			return netip.AddrPort{}, err
 		}
 	}
 
 	res := make([]byte, 1500)
 	for {
-		n, srci, err := uc.ReadFrom(res)
+		n, src, err := uc.ReadFromUDPAddrPort(res)
 		if err != nil {
 			if ctx.Err() == context.Canceled {
-				return netaddr.IPPort{}, err
+				return netip.AddrPort{}, err
 			}
 			// fallback to UPnP portmapping
 			if mapping, ok := c.getUPnPPortMapping(ctx, gw, internalAddr, prevPort); ok {
 				return mapping, nil
 			}
-			return netaddr.IPPort{}, NoMappingError{ErrNoPortMappingServices}
+			return netip.AddrPort{}, NoMappingError{ErrNoPortMappingServices}
 		}
-		srcu := srci.(*net.UDPAddr)
-		src, ok := netaddr.FromStdAddr(srcu.IP, srcu.Port, srcu.Zone)
-		if !ok {
+		src = netaddr.Unmap(src)
+		if !src.IsValid() {
 			continue
 		}
 		if src == pxpAddr {
@@ -532,13 +665,13 @@ func (c *Client) createOrGetMapping(ctx context.Context) (external netaddr.IPPor
 					continue
 				}
 				if pres.ResultCode != 0 {
-					return netaddr.IPPort{}, NoMappingError{fmt.Errorf("PMP response Op=0x%x,Res=0x%x", pres.OpCode, pres.ResultCode)}
+					return netip.AddrPort{}, NoMappingError{fmt.Errorf("PMP response Op=0x%x,Res=0x%x", pres.OpCode, pres.ResultCode)}
 				}
 				if pres.OpCode == pmpOpReply|pmpOpMapPublicAddr {
-					m.external = m.external.WithIP(pres.PublicAddr)
+					m.external = netip.AddrPortFrom(pres.PublicAddr, m.external.Port())
 				}
 				if pres.OpCode == pmpOpReply|pmpOpMapUDP {
-					m.external = m.external.WithPort(pres.ExternalPort)
+					m.external = netip.AddrPortFrom(m.external.Addr(), pres.ExternalPort)
 					d := time.Duration(pres.MappingValidSeconds) * time.Second
 					now := time.Now()
 					m.goodUntil = now.Add(d)
@@ -550,18 +683,18 @@ func (c *Client) createOrGetMapping(ctx context.Context) (external netaddr.IPPor
 				if err != nil {
 					c.logf("failed to get PCP mapping: %v", err)
 					// PCP should only have a single packet response
-					return netaddr.IPPort{}, NoMappingError{ErrNoPortMappingServices}
+					return netip.AddrPort{}, NoMappingError{ErrNoPortMappingServices}
 				}
 				pcpMapping.c = c
 				pcpMapping.internal = m.internal
-				pcpMapping.gw = netaddr.IPPortFrom(gw, c.pxpPort())
+				pcpMapping.gw = netip.AddrPortFrom(gw, c.pxpPort())
 				c.mu.Lock()
 				defer c.mu.Unlock()
 				c.mapping = pcpMapping
 				return pcpMapping.external, nil
 			default:
 				c.logf("unknown PMP/PCP version number: %d %v", version, res[:n])
-				return netaddr.IPPort{}, NoMappingError{ErrNoPortMappingServices}
+				return netip.AddrPort{}, NoMappingError{ErrNoPortMappingServices}
 			}
 		}
 
@@ -574,7 +707,7 @@ func (c *Client) createOrGetMapping(ctx context.Context) (external netaddr.IPPor
 	}
 }
 
-//go:generate go run tailscale.com/cmd/addlicense -year 2021 -file pmpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pmpResultCode -trimprefix=pmpCode
+//go:generate go run tailscale.com/cmd/addlicense -file pmpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pmpResultCode -trimprefix=pmpCode
 
 type pmpResultCode uint16
 
@@ -619,7 +752,7 @@ type pmpResponse struct {
 	ExternalPort        uint16
 
 	// For public addr ops:
-	PublicAddr netaddr.IP
+	PublicAddr netip.Addr
 }
 
 func parsePMPResponse(pkt []byte) (res pmpResponse, ok bool) {
@@ -648,6 +781,10 @@ func parsePMPResponse(pkt []byte) (res pmpResponse, ok bool) {
 			return res, false
 		}
 		res.PublicAddr = netaddr.IPv4(pkt[8], pkt[9], pkt[10], pkt[11])
+		if res.PublicAddr.IsUnspecified() {
+			// Zero it out so it's not Valid and used accidentally elsewhere.
+			res.PublicAddr = netip.Addr{}
+		}
 	}
 
 	return res, true
@@ -666,6 +803,9 @@ type ProbeResult struct {
 // the returned result might be server from the Client's cache, without
 // sending any network traffic.
 func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
+	if c.debug.disableAll() {
+		return res, ErrPortMappingDisabled
+	}
 	gw, myIP, ok := c.gatewayAndSelfIP()
 	if !ok {
 		return res, ErrGatewayRange
@@ -688,28 +828,28 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 	defer cancel()
 	defer closeCloserOnContextDone(ctx, uc)()
 
-	pxpAddr := netaddr.IPPortFrom(gw, c.pxpPort()).UDPAddr()
-	upnpAddr := netaddr.IPPortFrom(gw, c.upnpPort()).UDPAddr()
-	upnpMulticastAddr := netaddr.IPPortFrom(netaddr.IPv4(239, 255, 255, 250), c.upnpPort()).UDPAddr()
+	pxpAddr := netip.AddrPortFrom(gw, c.pxpPort())
+	upnpAddr := netip.AddrPortFrom(gw, c.upnpPort())
+	upnpMulticastAddr := netip.AddrPortFrom(netaddr.IPv4(239, 255, 255, 250), c.upnpPort())
 
 	// Don't send probes to services that we recently learned (for
 	// the same gw/myIP) are available. See
 	// https://github.com/tailscale/tailscale/issues/1001
 	if c.sawPMPRecently() {
 		res.PMP = true
-	} else if !DisablePMP {
+	} else if !c.debug.DisablePMP {
 		metricPMPSent.Add(1)
-		uc.WriteTo(pmpReqExternalAddrPacket, pxpAddr)
+		uc.WriteToUDPAddrPort(pmpReqExternalAddrPacket, pxpAddr)
 	}
 	if c.sawPCPRecently() {
 		res.PCP = true
-	} else if !DisablePCP {
+	} else if !c.debug.DisablePCP {
 		metricPCPSent.Add(1)
-		uc.WriteTo(pcpAnnounceRequest(myIP), pxpAddr)
+		uc.WriteToUDPAddrPort(pcpAnnounceRequest(myIP), pxpAddr)
 	}
 	if c.sawUPnPRecently() {
 		res.UPnP = true
-	} else if !DisableUPnP {
+	} else if !c.debug.DisableUPnP {
 		// Strictly speaking, you discover UPnP services by sending an
 		// SSDP query (which uPnPPacket is) to udp/1900 on the SSDP
 		// multicast address, and then get a flood of responses back
@@ -749,59 +889,145 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 		// See https://github.com/tailscale/tailscale/issues/3197 for
 		// an example of a device that strictly implements UPnP, and
 		// only responds to multicast queries.
+		//
+		// Then we send a discovery packet looking for
+		// urn:schemas-upnp-org:device:InternetGatewayDevice:1 specifically, not
+		// just ssdp:all, because there appear to be devices which only send
+		// their first descriptor (like urn:schemas-wifialliance-org:device:WFADevice:1)
+		// in response to ssdp:all. https://github.com/tailscale/tailscale/issues/3557
 		metricUPnPSent.Add(1)
-		uc.WriteTo(uPnPPacket, upnpAddr)
-		uc.WriteTo(uPnPPacket, upnpMulticastAddr)
+		uc.WriteToUDPAddrPort(uPnPPacket, upnpAddr)
+		uc.WriteToUDPAddrPort(uPnPPacket, upnpMulticastAddr)
+		uc.WriteToUDPAddrPort(uPnPIGDPacket, upnpMulticastAddr)
 	}
 
+	// We can see multiple UPnP responses from LANs with multiple
+	// UPnP-capable routers. Rather than randomly picking whichever arrives
+	// first, let's collect all UPnP responses and choose at the end.
+	//
+	// We do this by starting a 50ms timer from when the first UDP packet
+	// is received, and waiting at least that long for more UPnP responses
+	// to arrive before returning (as long as the first packet is seen
+	// within the first 200ms of the context creation, which is likely in
+	// the common case).
+	//
+	// This 50ms timer is distinct from the context timeout; it is used to
+	// delay an early return in the case where we see all three portmapping
+	// responses (PCP, PMP, UPnP), whereas the context timeout causes the
+	// loop to exit regardless of what portmapping responses we've seen.
+	//
+	// We use an atomic value to signal that the timer has finished.
+	var (
+		upnpTimer     *time.Timer
+		upnpTimerDone atomic.Bool
+	)
+	defer func() {
+		if upnpTimer != nil {
+			upnpTimer.Stop()
+		}
+	}()
+
+	// Store all returned UPnP responses until we're done, at which point
+	// we select from all available options.
+	var upnpResponses []uPnPDiscoResponse
+	defer func() {
+		if !res.UPnP || len(upnpResponses) == 0 {
+			// Either we didn't discover any UPnP responses or
+			// c.sawUPnPRecently() is true; don't change anything.
+			return
+		}
+
+		// Deduplicate and sort responses
+		upnpResponses = processUPnPResponses(upnpResponses)
+
+		c.mu.Lock()
+		c.uPnPSawTime = time.Now()
+		if !slices.Equal(c.uPnPMetas, upnpResponses) {
+			c.logf("UPnP meta changed: %+v", upnpResponses)
+			c.uPnPMetas = upnpResponses
+			metricUPnPUpdatedMeta.Add(1)
+		}
+		c.mu.Unlock()
+	}()
+
+	// This is the main loop that receives UDP packets and parses them into
+	// PCP, PMP, or UPnP responses, updates our ProbeResult, and stores
+	// data for use in GetCachedMappingOrStartCreatingOne.
 	buf := make([]byte, 1500)
 	pcpHeard := false // true when we get any PCP response
 	for {
 		if pcpHeard && res.PMP && res.UPnP {
-			// Nothing more to discover.
-			return res, nil
+			if upnpTimerDone.Load() {
+				// Nothing more to discover.
+				return res, nil
+			}
+
+			// UPnP timer still running; fall through and keep
+			// receiving packets.
 		}
-		n, addr, err := uc.ReadFrom(buf)
+		n, src, err := uc.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
 				err = nil
 			}
 			return res, err
 		}
-		ip, ok := netaddr.FromStdIP(addr.(*net.UDPAddr).IP)
-		if !ok {
-			continue
+		// Start timer after we get the first response.
+		if upnpTimer == nil {
+			upnpTimer = time.AfterFunc(50*time.Millisecond, func() { upnpTimerDone.Store(true) })
 		}
-		port := uint16(addr.(*net.UDPAddr).Port)
+
+		ip := src.Addr().Unmap()
+
+		handleUPnPResponse := func() {
+			metricUPnPResponse.Add(1)
+
+			if ip != gw {
+				// https://github.com/tailscale/tailscale/issues/5502
+				c.logf("UPnP discovery response from %v, but gateway IP is %v", ip, gw)
+			}
+			meta, err := parseUPnPDiscoResponse(buf[:n])
+			if err != nil {
+				metricUPnPParseErr.Add(1)
+				c.logf("unrecognized UPnP discovery response; ignoring: %v", err)
+				return
+			}
+			metricUPnPOK.Add(1)
+			c.logf("[v1] UPnP reply %+v, %q", meta, buf[:n])
+
+			// Store the UPnP response for later selection
+			res.UPnP = true
+			if len(upnpResponses) > 10 {
+				c.logf("too many UPnP responses: skipping")
+			} else {
+				upnpResponses = append(upnpResponses, meta)
+			}
+		}
+
+		port := src.Port()
 		switch port {
 		case c.upnpPort():
-			metricUPnPResponse.Add(1)
-			if ip == gw && mem.Contains(mem.B(buf[:n]), mem.S(":InternetGatewayDevice:")) {
-				meta, err := parseUPnPDiscoResponse(buf[:n])
-				if err != nil {
-					metricUPnPParseErr.Add(1)
-					c.logf("unrecognized UPnP discovery response; ignoring: %v", err)
-					continue
-				}
-				metricUPnPOK.Add(1)
-				c.logf("[v1] UPnP reply %+v, %q", meta, buf[:n])
-				res.UPnP = true
-				c.mu.Lock()
-				c.uPnPSawTime = time.Now()
-				if c.uPnPMeta != meta {
-					c.logf("UPnP meta changed: %+v", meta)
-					c.uPnPMeta = meta
-					metricUPnPUpdatedMeta.Add(1)
-				}
-				c.mu.Unlock()
+			if mem.Contains(mem.B(buf[:n]), mem.S(":InternetGatewayDevice:")) {
+				handleUPnPResponse()
 			}
+
+		default:
+			// https://github.com/tailscale/tailscale/issues/7377
+			if mem.Contains(mem.B(buf[:n]), mem.S(":InternetGatewayDevice:")) {
+				c.logf("UPnP discovery response from non-UPnP port %d", port)
+				metricUPnPResponseAlternatePort.Add(1)
+				handleUPnPResponse()
+			}
+
 		case c.pxpPort(): // same value for PMP and PCP
 			metricPXPResponse.Add(1)
 			if pres, ok := parsePCPResponse(buf[:n]); ok {
 				if pres.OpCode == pcpOpReply|pcpOpAnnounce {
 					pcpHeard = true
 					c.mu.Lock()
+					c.maybeInvalidatePCPMappingLocked(pres.Epoch) // must be before we write to c.pcp*
 					c.pcpSawTime = time.Now()
+					c.pcpLastEpoch = pres.Epoch
 					c.mu.Unlock()
 					switch pres.ResultCode {
 					case pcpCodeOK:
@@ -839,6 +1065,7 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 					c.logf("[v1] Got PMP response; IP: %v, epoch: %v", pres.PublicAddr, pres.SecondsSinceEpoch)
 					res.PMP = true
 					c.mu.Lock()
+					c.maybeInvalidatePMPMappingLocked(pres.SecondsSinceEpoch) // must be before we write to c.pmp*
 					c.pmpPubIP = pres.PublicAddr
 					c.pmpPubIPTime = time.Now()
 					c.pmpLastEpoch = pres.SecondsSinceEpoch
@@ -864,6 +1091,57 @@ func (c *Client) Probe(ctx context.Context) (res ProbeResult, err error) {
 	}
 }
 
+func (c *Client) maybeInvalidatePMPMappingLocked(epoch uint32) {
+	if epoch == 0 || c.mapping == nil {
+		return
+	}
+	m, ok := c.mapping.(*pmpMapping)
+	if !ok {
+		return
+	}
+
+	if epoch >= m.epoch {
+		// Epoch increased, which is fine.
+		//
+		// TODO: we should more closely follow RFC6887 § 8.5 which also
+		// requires us to check the current time and the time that this
+		// epoch was received at.
+		return
+	}
+
+	// Epoch decreased, so invalidate the mapping and clear PMP fields.
+	c.logf("invalidating PMP mappings since returned epoch %d < stored epoch %d", epoch, m.epoch)
+	c.mapping = nil
+	c.pmpPubIP = netip.Addr{}
+	c.pmpPubIPTime = time.Time{}
+	c.pmpLastEpoch = 0
+}
+
+func (c *Client) maybeInvalidatePCPMappingLocked(epoch uint32) {
+	if epoch == 0 || c.mapping == nil {
+		return
+	}
+	m, ok := c.mapping.(*pcpMapping)
+	if !ok {
+		return
+	}
+
+	if epoch >= m.epoch {
+		// Epoch increased, which is fine.
+		//
+		// TODO: we should more closely follow RFC6887 § 8.5 which also
+		// requires us to check the current time and the time that this
+		// epoch was received at.
+		return
+	}
+
+	// Epoch decreased, so invalidate the mapping and clear PCP fields.
+	c.logf("invalidating PCP mappings since returned epoch %d < stored epoch %d", epoch, m.epoch)
+	c.mapping = nil
+	c.pcpSawTime = time.Time{}
+	c.pcpLastEpoch = 0
+}
+
 var pmpReqExternalAddrPacket = []byte{pmpVersion, pmpOpMapPublicAddr} // 0, 0
 
 const (
@@ -874,6 +1152,15 @@ const (
 var uPnPPacket = []byte("M-SEARCH * HTTP/1.1\r\n" +
 	"HOST: 239.255.255.250:1900\r\n" +
 	"ST: ssdp:all\r\n" +
+	"MAN: \"ssdp:discover\"\r\n" +
+	"MX: 2\r\n\r\n")
+
+// Send a discovery frame for InternetGatewayDevice, since some devices respond
+// to ssdp:all with only their first descriptor (which is often not IGD).
+// https://github.com/tailscale/tailscale/issues/3557
+var uPnPIGDPacket = []byte("M-SEARCH * HTTP/1.1\r\n" +
+	"HOST: 239.255.255.250:1900\r\n" +
+	"ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n" +
 	"MAN: \"ssdp:discover\"\r\n" +
 	"MX: 2\r\n\r\n")
 
@@ -905,7 +1192,7 @@ var (
 	metricPMPSent = clientmetric.NewCounter("portmap_pmp_sent")
 
 	// metricPMPOK counts the number of times
-	// we received a succesful PMP response.
+	// we received a successful PMP response.
 	metricPMPOK = clientmetric.NewCounter("portmap_pmp_ok")
 
 	// metricPMPUnhandledOpcode counts the number of times
@@ -937,6 +1224,38 @@ var (
 	// metricUPnPResponse counts the number of times we received a UPnP response.
 	metricUPnPResponse = clientmetric.NewCounter("portmap_upnp_response")
 
+	// metricUPnPResponseAlternatePort counts the number of times we
+	// received a UPnP response from a port other than the UPnP port.
+	metricUPnPResponseAlternatePort = clientmetric.NewCounter("portmap_upnp_response_alternate_port")
+
+	// metricUPnPSelectLegacy counts the number of times that a legacy
+	// service was found in a UPnP response.
+	metricUPnPSelectLegacy = clientmetric.NewCounter("portmap_upnp_select_legacy")
+
+	// metricUPnPSelectSingle counts the number of times that only a single
+	// UPnP device was available in selectBestService.
+	metricUPnPSelectSingle = clientmetric.NewCounter("portmap_upnp_select_single")
+
+	// metricUPnPSelectMultiple counts the number of times that we need to
+	// select from among multiple UPnP devices in selectBestService.
+	metricUPnPSelectMultiple = clientmetric.NewCounter("portmap_upnp_select_multiple")
+
+	// metricUPnPSelectExternalPublic counts the number of times that
+	// selectBestService picked a UPnP device with an external public IP.
+	metricUPnPSelectExternalPublic = clientmetric.NewCounter("portmap_upnp_select_external_public")
+
+	// metricUPnPSelectExternalPrivate counts the number of times that
+	// selectBestService picked a UPnP device with an external private IP.
+	metricUPnPSelectExternalPrivate = clientmetric.NewCounter("portmap_upnp_select_external_private")
+
+	// metricUPnPSelectUp counts the number of times that selectBestService
+	// picked a UPnP device that was up but with no external IP.
+	metricUPnPSelectUp = clientmetric.NewCounter("portmap_upnp_select_up")
+
+	// metricUPnPSelectNone counts the number of times that selectBestService
+	// picked a UPnP device that is not up.
+	metricUPnPSelectNone = clientmetric.NewCounter("portmap_upnp_select_none")
+
 	// metricUPnPParseErr counts the number of times we failed to parse a UPnP response.
 	metricUPnPParseErr = clientmetric.NewCounter("portmap_upnp_parse_err")
 
@@ -947,3 +1266,24 @@ var (
 	// we received a UPnP response with a new meta.
 	metricUPnPUpdatedMeta = clientmetric.NewCounter("portmap_upnp_updated_meta")
 )
+
+// UPnP error metric that's keyed by code; lazily registered on first read
+var (
+	metricUPnPErrorsByCode syncs.Map[int, *clientmetric.Metric]
+)
+
+func getUPnPErrorsMetric(code int) *clientmetric.Metric {
+	mm, _ := metricUPnPErrorsByCode.LoadOrInit(code, func() *clientmetric.Metric {
+		// Metric names cannot contain a hyphen, so we handle negative
+		// numbers by prefixing the name with a "minus_".
+		var codeStr string
+		if code < 0 {
+			codeStr = fmt.Sprintf("portmap_upnp_errors_with_code_minus_%d", -code)
+		} else {
+			codeStr = fmt.Sprintf("portmap_upnp_errors_with_code_%d", code)
+		}
+
+		return clientmetric.NewCounter(codeStr)
+	})
+	return mm
+}

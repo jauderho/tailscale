@@ -1,14 +1,13 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
 import (
 	"encoding/binary"
 	"errors"
+	"net/netip"
 
-	"inet.af/netaddr"
 	"tailscale.com/types/ipproto"
 )
 
@@ -19,8 +18,8 @@ const ip4HeaderLength = 20
 type IP4Header struct {
 	IPProto ipproto.Proto
 	IPID    uint16
-	Src     netaddr.IP
-	Dst     netaddr.IP
+	Src     netip.Addr
+	Dst     netip.Addr
 }
 
 // Len implements Header.

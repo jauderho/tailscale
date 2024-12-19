@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package router
 
@@ -8,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"os/exec"
 
-	"golang.zx2c4.com/wireguard/tun"
-	"inet.af/netaddr"
+	"github.com/tailscale/wireguard-go/tun"
+	"go4.org/netipx"
+	"tailscale.com/health"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
-	"tailscale.com/wgengine/monitor"
+	"tailscale.com/util/set"
 )
 
 // For now this router only supports the WireGuard userspace implementation.
@@ -22,14 +24,14 @@ import (
 
 type openbsdRouter struct {
 	logf    logger.Logf
-	linkMon *monitor.Mon
+	netMon  *netmon.Monitor
 	tunname string
-	local4  netaddr.IPPrefix
-	local6  netaddr.IPPrefix
-	routes  map[netaddr.IPPrefix]struct{}
+	local4  netip.Prefix
+	local6  netip.Prefix
+	routes  set.Set[netip.Prefix]
 }
 
-func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mon) (Router, error) {
+func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (Router, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err
@@ -37,7 +39,7 @@ func newUserspaceRouter(logf logger.Logf, tundev tun.Device, linkMon *monitor.Mo
 
 	return &openbsdRouter{
 		logf:    logf,
-		linkMon: linkMon,
+		netMon:  netMon,
 		tunname: tunname,
 	}, nil
 }
@@ -58,8 +60,8 @@ func (r *openbsdRouter) Up() error {
 	return nil
 }
 
-func inet(p netaddr.IPPrefix) string {
-	if p.IP().Is6() {
+func inet(p netip.Prefix) string {
+	if p.Addr().Is6() {
 		return "inet6"
 	}
 	return "inet"
@@ -76,14 +78,14 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 	}
 	numIPv4 := 0
 	numIPv6 := 0
-	localAddr4 := netaddr.IPPrefix{}
-	localAddr6 := netaddr.IPPrefix{}
+	localAddr4 := netip.Prefix{}
+	localAddr6 := netip.Prefix{}
 	for _, addr := range cfg.LocalAddrs {
-		if addr.IP().Is4() {
+		if addr.Addr().Is4() {
 			numIPv4++
 			localAddr4 = addr
 		}
-		if addr.IP().Is6() {
+		if addr.Addr().Is6() {
 			numIPv6++
 			localAddr6 = addr
 		}
@@ -95,7 +97,7 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 	var errq error
 
 	if localAddr4 != r.local4 {
-		if !r.local4.IsZero() {
+		if r.local4.IsValid() {
 			addrdel := []string{"ifconfig", r.tunname,
 				"inet", r.local4.String(), "-alias"}
 			out, err := cmd(addrdel...).CombinedOutput()
@@ -108,7 +110,7 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 
 			routedel := []string{"route", "-q", "-n",
 				"del", "-inet", r.local4.String(),
-				"-iface", r.local4.IP().String()}
+				"-iface", r.local4.Addr().String()}
 			if out, err := cmd(routedel...).CombinedOutput(); err != nil {
 				r.logf("route del failed: %v: %v\n%s", routedel, err, out)
 				if errq == nil {
@@ -117,7 +119,7 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 			}
 		}
 
-		if !localAddr4.IsZero() {
+		if localAddr4.IsValid() {
 			addradd := []string{"ifconfig", r.tunname,
 				"inet", localAddr4.String(), "alias"}
 			out, err := cmd(addradd...).CombinedOutput()
@@ -130,7 +132,7 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 
 			routeadd := []string{"route", "-q", "-n",
 				"add", "-inet", localAddr4.String(),
-				"-iface", localAddr4.IP().String()}
+				"-iface", localAddr4.Addr().String()}
 			if out, err := cmd(routeadd...).CombinedOutput(); err != nil {
 				r.logf("route add failed: %v: %v\n%s", routeadd, err, out)
 				if errq == nil {
@@ -140,15 +142,15 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 		}
 	}
 
-	if !localAddr6.IsZero() {
+	if localAddr6.IsValid() {
 		// in https://github.com/tailscale/tailscale/issues/1307 we made
 		// FreeBSD use a /48 for IPv6 addresses, which is nice because we
 		// don't need to additionally add routing entries. Do that here too.
-		localAddr6 = netaddr.IPPrefixFrom(localAddr6.IP(), 48)
+		localAddr6 = netip.PrefixFrom(localAddr6.Addr(), 48)
 	}
 
 	if localAddr6 != r.local6 {
-		if !r.local6.IsZero() {
+		if r.local6.IsValid() {
 			addrdel := []string{"ifconfig", r.tunname,
 				"inet6", r.local6.String(), "delete"}
 			out, err := cmd(addrdel...).CombinedOutput()
@@ -160,7 +162,7 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 			}
 		}
 
-		if !localAddr6.IsZero() {
+		if localAddr6.IsValid() {
 			addradd := []string{"ifconfig", r.tunname,
 				"inet6", localAddr6.String()}
 			out, err := cmd(addradd...).CombinedOutput()
@@ -173,18 +175,18 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 		}
 	}
 
-	newRoutes := make(map[netaddr.IPPrefix]struct{})
+	newRoutes := set.Set[netip.Prefix]{}
 	for _, route := range cfg.Routes {
-		newRoutes[route] = struct{}{}
+		newRoutes.Add(route)
 	}
 	for route := range r.routes {
 		if _, keep := newRoutes[route]; !keep {
-			net := route.IPNet()
+			net := netipx.PrefixIPNet(route)
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits())
-			dst := localAddr4.IP().String()
-			if route.IP().Is6() {
-				dst = localAddr6.IP().String()
+			dst := localAddr4.Addr().String()
+			if route.Addr().Is6() {
+				dst = localAddr6.Addr().String()
 			}
 			routedel := []string{"route", "-q", "-n",
 				"del", "-" + inet(route), nstr,
@@ -200,12 +202,12 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 	}
 	for route := range newRoutes {
 		if _, exists := r.routes[route]; !exists {
-			net := route.IPNet()
+			net := netipx.PrefixIPNet(route)
 			nip := net.IP.Mask(net.Mask)
 			nstr := fmt.Sprintf("%v/%d", nip, route.Bits())
-			dst := localAddr4.IP().String()
-			if route.IP().Is6() {
-				dst = localAddr6.IP().String()
+			dst := localAddr4.Addr().String()
+			if route.Addr().Is6() {
+				dst = localAddr6.Addr().String()
 			}
 			routeadd := []string{"route", "-q", "-n",
 				"add", "-" + inet(route), nstr,
@@ -227,12 +229,19 @@ func (r *openbsdRouter) Set(cfg *Config) error {
 	return errq
 }
 
-func (r *openbsdRouter) Close() error {
-	cleanup(r.logf, r.tunname)
+// UpdateMagicsockPort implements the Router interface. This implementation
+// does nothing and returns nil because this router does not currently need
+// to know what the magicsock UDP port is.
+func (r *openbsdRouter) UpdateMagicsockPort(_ uint16, _ string) error {
 	return nil
 }
 
-func cleanup(logf logger.Logf, interfaceName string) {
+func (r *openbsdRouter) Close() error {
+	cleanUp(r.logf, r.tunname)
+	return nil
+}
+
+func cleanUp(logf logger.Logf, interfaceName string) {
 	out, err := cmd("ifconfig", interfaceName, "down").CombinedOutput()
 	if err != nil {
 		logf("ifconfig down: %v\n%s", err, out)

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -9,16 +8,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/netip"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"inet.af/netaddr"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
 )
 
 var ipCmd = &ffcli.Command{
 	Name:       "ip",
-	ShortUsage: "ip [-1] [-4] [-6] [peer hostname or ip address]",
+	ShortUsage: "tailscale ip [-1] [-4] [-6] [peer hostname or ip address]",
 	ShortHelp:  "Show Tailscale IP addresses",
 	LongHelp:   "Show Tailscale IP addresses for peer. Peer defaults to the current machine.",
 	Exec:       runIP,
@@ -59,7 +57,7 @@ func runIP(ctx context.Context, args []string) error {
 	if !v4 && !v6 {
 		v4, v6 = true, true
 	}
-	st, err := tailscale.Status(ctx)
+	st, err := localClient.Status(ctx)
 	if err != nil {
 		return err
 	}
@@ -101,7 +99,7 @@ func runIP(ctx context.Context, args []string) error {
 }
 
 func peerMatchingIP(st *ipnstate.Status, ipStr string) (ps *ipnstate.PeerStatus, ok bool) {
-	ip, err := netaddr.ParseIP(ipStr)
+	ip, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		return
 	}

@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux || js
-// +build linux js
+//go:build js || ((linux || darwin) && ts_debug_websockets)
 
 package derphttp
 
@@ -12,9 +10,11 @@ import (
 	"log"
 	"net"
 
-	"nhooyr.io/websocket"
-	"tailscale.com/derp/wsconn"
+	"github.com/coder/websocket"
+	"tailscale.com/net/wsconn"
 )
+
+const canWebsockets = true
 
 func init() {
 	dialWebsocketFunc = dialWebsocket
@@ -29,5 +29,6 @@ func dialWebsocket(ctx context.Context, urlStr string) (net.Conn, error) {
 		return nil, err
 	}
 	log.Printf("websocket: connected to %v", urlStr)
-	return wsconn.New(c), nil
+	netConn := wsconn.NetConn(context.Background(), c, websocket.MessageBinary, urlStr)
+	return netConn, nil
 }

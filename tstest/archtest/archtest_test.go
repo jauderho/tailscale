@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package archtest
 
@@ -14,9 +13,9 @@ import (
 // tests netstack's AlignedAtomicInt64.
 func TestAlignedAtomicInt64(t *testing.T) {
 	type T struct {
-		A atomicbitops.AlignedAtomicInt64
-		x int32
-		B atomicbitops.AlignedAtomicInt64
+		A atomicbitops.Int64
+		_ int32
+		B atomicbitops.Int64
 	}
 
 	t.Logf("I am %v/%v\n", runtime.GOOS, runtime.GOARCH)

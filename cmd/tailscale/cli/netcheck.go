@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -10,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"sort"
@@ -18,18 +16,19 @@ import (
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/portmapper"
+	"tailscale.com/net/tlsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 )
 
 var netcheckCmd = &ffcli.Command{
 	Name:       "netcheck",
-	ShortUsage: "netcheck",
+	ShortUsage: "tailscale netcheck",
 	ShortHelp:  "Print an analysis of local network conditions",
 	Exec:       runNetcheck,
 	FlagSet: (func() *flag.FlagSet {
@@ -48,9 +47,21 @@ var netcheckArgs struct {
 }
 
 func runNetcheck(ctx context.Context, args []string) error {
+	logf := logger.WithPrefix(log.Printf, "portmap: ")
+	netMon, err := netmon.New(logf)
+	if err != nil {
+		return err
+	}
+
+	// Ensure that we close the portmapper after running a netcheck; this
+	// will release any port mappings created.
+	pm := portmapper.NewClient(logf, netMon, nil, nil, nil)
+	defer pm.Close()
+
 	c := &netcheck.Client{
-		UDPBindAddr: envknob.String("TS_DEBUG_NETCHECK_UDP_BIND"),
-		PortMapper:  portmapper.NewClient(logger.WithPrefix(log.Printf, "portmap: "), nil),
+		NetMon:      netMon,
+		PortMapper:  pm,
+		UseDNSCache: false, // always resolve, don't cache
 	}
 	if netcheckArgs.verbose {
 		c.Logf = logger.WithPrefix(log.Printf, "netcheck: ")
@@ -63,20 +74,29 @@ func runNetcheck(ctx context.Context, args []string) error {
 		fmt.Fprintln(Stderr, "# Warning: this JSON format is not yet considered a stable interface")
 	}
 
-	dm, err := tailscale.CurrentDERPMap(ctx)
+	if err := c.Standalone(ctx, envknob.String("TS_DEBUG_NETCHECK_UDP_BIND")); err != nil {
+		fmt.Fprintln(Stderr, "netcheck: UDP test failure:", err)
+	}
+
+	dm, err := localClient.CurrentDERPMap(ctx)
 	noRegions := dm != nil && len(dm.Regions) == 0
 	if noRegions {
 		log.Printf("No DERP map from tailscaled; using default.")
 	}
 	if err != nil || noRegions {
-		dm, err = prodDERPMap(ctx, http.DefaultClient)
+		hc := &http.Client{
+			Transport: tlsdial.NewTransport(),
+			Timeout:   10 * time.Second,
+		}
+		dm, err = prodDERPMap(ctx, hc)
 		if err != nil {
+			log.Println("Failed to fetch a DERP map, so netcheck cannot continue. Check your Internet connection.")
 			return err
 		}
 	}
 	for {
 		t0 := time.Now()
-		report, err := c.GetReport(ctx, dm)
+		report, err := c.GetReport(ctx, dm, nil)
 		d := time.Since(t0)
 		if netcheckArgs.verbose {
 			c.Logf("GetReport took %v; err=%v", d.Round(time.Millisecond), err)
@@ -99,7 +119,6 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	var err error
 	switch netcheckArgs.format {
 	case "":
-		break
 	case "json":
 		j, err = json.MarshalIndent(report, "", "\t")
 	case "json-line":
@@ -117,22 +136,27 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	}
 
 	printf("\nReport:\n")
+	printf("\t* Time: %v\n", report.Now.Format(time.RFC3339Nano))
 	printf("\t* UDP: %v\n", report.UDP)
-	if report.GlobalV4 != "" {
-		printf("\t* IPv4: yes, %v\n", report.GlobalV4)
+	if report.GlobalV4.IsValid() {
+		printf("\t* IPv4: yes, %s\n", report.GlobalV4)
 	} else {
 		printf("\t* IPv4: (no addr found)\n")
 	}
-	if report.GlobalV6 != "" {
-		printf("\t* IPv6: yes, %v\n", report.GlobalV6)
+	if report.GlobalV6.IsValid() {
+		printf("\t* IPv6: yes, %s\n", report.GlobalV6)
 	} else if report.IPv6 {
 		printf("\t* IPv6: (no addr found)\n")
+	} else if report.OSHasIPv6 {
+		printf("\t* IPv6: no, but OS has support\n")
 	} else {
-		printf("\t* IPv6: no\n")
+		printf("\t* IPv6: no, unavailable in OS\n")
 	}
 	printf("\t* MappingVariesByDestIP: %v\n", report.MappingVariesByDestIP)
-	printf("\t* HairPinning: %v\n", report.HairPinning)
 	printf("\t* PortMapping: %v\n", portMapping(report))
+	if report.CaptivePortal != "" {
+		printf("\t* CaptivePortal: %v\n", report.CaptivePortal)
+	}
 
 	// When DERP latency checking failed,
 	// magicsock will try to pick the DERP server that
@@ -140,7 +164,11 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	if len(report.RegionLatency) == 0 {
 		printf("\t* Nearest DERP: unknown (no response to latency probes)\n")
 	} else {
-		printf("\t* Nearest DERP: %v\n", dm.Regions[report.PreferredDERP].RegionName)
+		if report.PreferredDERP != 0 {
+			printf("\t* Nearest DERP: %v\n", dm.Regions[report.PreferredDERP].RegionName)
+		} else {
+			printf("\t* Nearest DERP: [none]\n")
+		}
 		printf("\t* DERP latency:\n")
 		var rids []int
 		for rid := range dm.Regions {
@@ -192,6 +220,7 @@ func portMapping(r *netcheck.Report) string {
 }
 
 func prodDERPMap(ctx context.Context, httpc *http.Client) (*tailcfg.DERPMap, error) {
+	log.Printf("attempting to fetch a DERPMap from %s", ipn.DefaultControlURL)
 	req, err := http.NewRequestWithContext(ctx, "GET", ipn.DefaultControlURL+"/derpmap/default", nil)
 	if err != nil {
 		return nil, fmt.Errorf("create prodDERPMap request: %w", err)
@@ -201,7 +230,7 @@ func prodDERPMap(ctx context.Context, httpc *http.Client) (*tailcfg.DERPMap, err
 		return nil, fmt.Errorf("fetch prodDERPMap failed: %w", err)
 	}
 	defer res.Body.Close()
-	b, err := ioutil.ReadAll(io.LimitReader(res.Body, 1<<20))
+	b, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("fetch prodDERPMap failed: %w", err)
 	}

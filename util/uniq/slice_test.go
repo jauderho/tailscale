@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package uniq_test
 
@@ -12,24 +11,25 @@ import (
 	"tailscale.com/util/uniq"
 )
 
-func TestModifySlice(t *testing.T) {
+func runTests(t *testing.T, cb func(*[]uint32)) {
 	tests := []struct {
-		in   []int
-		want []int
+		// Use uint32 to be different from an int-typed slice index
+		in   []uint32
+		want []uint32
 	}{
-		{in: []int{0, 1, 2}, want: []int{0, 1, 2}},
-		{in: []int{0, 1, 2, 2}, want: []int{0, 1, 2}},
-		{in: []int{0, 0, 1, 2}, want: []int{0, 1, 2}},
-		{in: []int{0, 1, 0, 2}, want: []int{0, 1, 0, 2}},
-		{in: []int{0}, want: []int{0}},
-		{in: []int{0, 0}, want: []int{0}},
-		{in: []int{}, want: []int{}},
+		{in: []uint32{0, 1, 2}, want: []uint32{0, 1, 2}},
+		{in: []uint32{0, 1, 2, 2}, want: []uint32{0, 1, 2}},
+		{in: []uint32{0, 0, 1, 2}, want: []uint32{0, 1, 2}},
+		{in: []uint32{0, 1, 0, 2}, want: []uint32{0, 1, 0, 2}},
+		{in: []uint32{0}, want: []uint32{0}},
+		{in: []uint32{0, 0}, want: []uint32{0}},
+		{in: []uint32{}, want: []uint32{}},
 	}
 
 	for _, test := range tests {
-		in := make([]int, len(test.in))
+		in := make([]uint32, len(test.in))
 		copy(in, test.in)
-		uniq.ModifySlice(&test.in, func(i, j int) bool { return test.in[i] == test.in[j] })
+		cb(&test.in)
 		if !reflect.DeepEqual(test.in, test.want) {
 			t.Errorf("uniq.Slice(%v) = %v, want %v", in, test.in, test.want)
 		}
@@ -41,6 +41,20 @@ func TestModifySlice(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestModifySlice(t *testing.T) {
+	runTests(t, func(slice *[]uint32) {
+		uniq.ModifySlice(slice)
+	})
+}
+
+func TestModifySliceFunc(t *testing.T) {
+	runTests(t, func(slice *[]uint32) {
+		uniq.ModifySliceFunc(slice, func(i, j uint32) bool {
+			return i == j
+		})
+	})
 }
 
 func Benchmark(b *testing.B) {
@@ -80,9 +94,9 @@ func benchmark(b *testing.B, size int64, reset func(s []byte)) {
 	b.SetBytes(size)
 	s := make([]byte, size)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		s = s[:size]
 		reset(s)
-		uniq.ModifySlice(&s, func(i, j int) bool { return s[i] == s[j] })
+		uniq.ModifySlice(&s)
 	}
 }

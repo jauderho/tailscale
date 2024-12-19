@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -9,6 +8,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -20,6 +20,11 @@ var unsafeHostnameCharacters = regexp.MustCompile(`[^a-zA-Z0-9-\.]`)
 
 type certProvider interface {
 	// TLSConfig creates a new TLS config suitable for net/http.Server servers.
+	//
+	// The returned Config must have a GetCertificate function set and that
+	// function must return a unique *tls.Certificate for each call. The
+	// returned *tls.Certificate will be mutated by the caller to append to the
+	// (*tls.Certificate).Certificate field.
 	TLSConfig() *tls.Config
 	// HTTPHandler handle ACME related request, if any.
 	HTTPHandler(fallback http.Handler) http.Handler
@@ -49,8 +54,9 @@ func certProviderByCertMode(mode, dir, hostname string) (certProvider, error) {
 }
 
 type manualCertManager struct {
-	cert     *tls.Certificate
-	hostname string
+	cert       *tls.Certificate
+	hostname   string // hostname or IP address of server
+	noHostname bool   // whether hostname is an IP address
 }
 
 // NewManualCertManager returns a cert provider which read certificate by given hostname on create.
@@ -70,24 +76,34 @@ func NewManualCertManager(certdir, hostname string) (certProvider, error) {
 	if err := x509Cert.VerifyHostname(hostname); err != nil {
 		return nil, fmt.Errorf("cert invalid for hostname %q: %w", hostname, err)
 	}
-	return &manualCertManager{cert: &cert, hostname: hostname}, nil
+	return &manualCertManager{
+		cert:       &cert,
+		hostname:   hostname,
+		noHostname: net.ParseIP(hostname) != nil,
+	}, nil
 }
 
 func (m *manualCertManager) TLSConfig() *tls.Config {
 	return &tls.Config{
 		Certificates: nil,
 		NextProtos: []string{
-			"h2", "http/1.1", // enable HTTP/2
+			"http/1.1",
 		},
 		GetCertificate: m.getCertificate,
 	}
 }
 
 func (m *manualCertManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	if hi.ServerName != m.hostname {
+	if hi.ServerName != m.hostname && !m.noHostname {
 		return nil, fmt.Errorf("cert mismatch with hostname: %q", hi.ServerName)
 	}
-	return m.cert, nil
+
+	// Return a shallow copy of the cert so the caller can append to its
+	// Certificate field.
+	certCopy := new(tls.Certificate)
+	*certCopy = *m.cert
+	certCopy.Certificate = certCopy.Certificate[:len(certCopy.Certificate):len(certCopy.Certificate)]
+	return certCopy, nil
 }
 
 func (m *manualCertManager) HTTPHandler(fallback http.Handler) http.Handler {

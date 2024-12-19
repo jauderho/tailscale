@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -54,6 +53,11 @@ func (k *ControlPrivate) UnmarshalJSON(bs []byte) error {
 // box value.
 func (k ControlPrivate) SealTo(p MachinePublic, cleartext []byte) (ciphertext []byte) {
 	return k.mkey.SealTo(p, cleartext)
+}
+
+// SharedKey returns the precomputed Nacl box shared key between k and p.
+func (k ControlPrivate) SharedKey(p MachinePublic) MachinePrecomputedSharedKey {
+	return k.mkey.SharedKey(p)
 }
 
 // OpenFrom opens the NaCl box ciphertext, which must be a value

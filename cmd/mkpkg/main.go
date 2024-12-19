@@ -1,85 +1,95 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // mkpkg builds the Tailscale rpm and deb packages.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
-	"github.com/goreleaser/nfpm"
-	_ "github.com/goreleaser/nfpm/deb"
-	_ "github.com/goreleaser/nfpm/rpm"
-	"github.com/pborman/getopt"
+	"github.com/goreleaser/nfpm/v2"
+	_ "github.com/goreleaser/nfpm/v2/deb"
+	"github.com/goreleaser/nfpm/v2/files"
+	_ "github.com/goreleaser/nfpm/v2/rpm"
 )
 
 // parseFiles parses a comma-separated list of colon-separated pairs
-// into a map of filePathOnDisk -> filePathInPackage.
-func parseFiles(s string) (map[string]string, error) {
-	ret := map[string]string{}
+// into files.Contents format.
+func parseFiles(s string, typ string) (files.Contents, error) {
 	if len(s) == 0 {
-		return ret, nil
+		return nil, nil
 	}
+	var contents files.Contents
 	for _, f := range strings.Split(s, ",") {
 		fs := strings.Split(f, ":")
 		if len(fs) != 2 {
 			return nil, fmt.Errorf("unparseable file field %q", f)
 		}
-		ret[fs[0]] = fs[1]
+		contents = append(contents, &files.Content{Type: files.TypeFile, Source: fs[0], Destination: fs[1]})
 	}
-	return ret, nil
+	return contents, nil
 }
 
-func parseEmptyDirs(s string) []string {
+func parseEmptyDirs(s string) files.Contents {
 	// strings.Split("", ",") would return []string{""}, which is not suitable:
 	// this would create an empty dir record with path "", breaking the package
 	if s == "" {
 		return nil
 	}
-	return strings.Split(s, ",")
+	var contents files.Contents
+	for _, d := range strings.Split(s, ",") {
+		contents = append(contents, &files.Content{Type: files.TypeDir, Destination: d})
+	}
+	return contents
 }
 
 func main() {
-	out := getopt.StringLong("out", 'o', "", "output file to write")
-	goarch := getopt.StringLong("arch", 'a', "amd64", "GOARCH this package is for")
-	pkgType := getopt.StringLong("type", 't', "deb", "type of package to build (deb or rpm)")
-	files := getopt.StringLong("files", 'F', "", "comma-separated list of files in src:dst form")
-	configFiles := getopt.StringLong("configs", 'C', "", "like --files, but for files marked as user-editable config files")
-	emptyDirs := getopt.StringLong("emptydirs", 'E', "", "comma-separated list of empty directories")
-	version := getopt.StringLong("version", 0, "0.0.0", "version of the package")
-	postinst := getopt.StringLong("postinst", 0, "", "debian postinst script path")
-	prerm := getopt.StringLong("prerm", 0, "", "debian prerm script path")
-	postrm := getopt.StringLong("postrm", 0, "", "debian postrm script path")
-	replaces := getopt.StringLong("replaces", 0, "", "package which this package replaces, if any")
-	depends := getopt.StringLong("depends", 0, "", "comma-separated list of packages this package depends on")
-	getopt.Parse()
+	out := flag.String("out", "", "output file to write")
+	name := flag.String("name", "tailscale", "package name")
+	description := flag.String("description", "The easiest, most secure, cross platform way to use WireGuard + oauth2 + 2FA/SSO", "package description")
+	goarch := flag.String("arch", "amd64", "GOARCH this package is for")
+	pkgType := flag.String("type", "deb", "type of package to build (deb or rpm)")
+	regularFiles := flag.String("files", "", "comma-separated list of files in src:dst form")
+	configFiles := flag.String("configs", "", "like --files, but for files marked as user-editable config files")
+	emptyDirs := flag.String("emptydirs", "", "comma-separated list of empty directories")
+	version := flag.String("version", "0.0.0", "version of the package")
+	postinst := flag.String("postinst", "", "debian postinst script path")
+	prerm := flag.String("prerm", "", "debian prerm script path")
+	postrm := flag.String("postrm", "", "debian postrm script path")
+	replaces := flag.String("replaces", "", "package which this package replaces, if any")
+	depends := flag.String("depends", "", "comma-separated list of packages this package depends on")
+	recommends := flag.String("recommends", "", "comma-separated list of packages this package recommends")
+	flag.Parse()
 
-	filesMap, err := parseFiles(*files)
+	filesList, err := parseFiles(*regularFiles, files.TypeFile)
 	if err != nil {
 		log.Fatalf("Parsing --files: %v", err)
 	}
-	configsMap, err := parseFiles(*configFiles)
+	configsList, err := parseFiles(*configFiles, files.TypeConfig)
 	if err != nil {
 		log.Fatalf("Parsing --configs: %v", err)
 	}
 	emptyDirList := parseEmptyDirs(*emptyDirs)
+	contents := append(filesList, append(configsList, emptyDirList...)...)
+	contents, err = files.PrepareForPackager(contents, 0, *pkgType, false)
+	if err != nil {
+		log.Fatalf("Building package contents: %v", err)
+	}
 	info := nfpm.WithDefaults(&nfpm.Info{
-		Name:        "tailscale",
+		Name:        *name,
 		Arch:        *goarch,
 		Platform:    "linux",
 		Version:     *version,
 		Maintainer:  "Tailscale Inc <info@tailscale.com>",
-		Description: "The easiest, most secure, cross platform way to use WireGuard + oauth2 + 2FA/SSO",
+		Description: *description,
 		Homepage:    "https://www.tailscale.com",
 		License:     "MIT",
 		Overridables: nfpm.Overridables{
-			EmptyFolders: emptyDirList,
-			Files:        filesMap,
-			ConfigFiles:  configsMap,
+			Contents: contents,
 			Scripts: nfpm.Scripts{
 				PostInstall: *postinst,
 				PreRemove:   *prerm,
@@ -90,6 +100,9 @@ func main() {
 
 	if len(*depends) != 0 {
 		info.Overridables.Depends = strings.Split(*depends, ",")
+	}
+	if len(*recommends) != 0 {
+		info.Overridables.Recommends = strings.Split(*recommends, ",")
 	}
 	if *replaces != "" {
 		info.Overridables.Replaces = []string{*replaces}

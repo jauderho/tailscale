@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package opt defines optional types.
 package opt
@@ -10,10 +9,20 @@ import (
 	"strconv"
 )
 
-// Bool represents an optional boolean to be JSON-encoded.
-// The string can be empty (for unknown or unspecified), or
-// "true" or "false".
+// Bool represents an optional boolean to be JSON-encoded.  The string
+// is either "true", "false", or the empty string to mean unset.
+//
+// As a special case, the underlying string may also be the string
+// "unset" as as a synonym for the empty string. This lets the
+// explicit unset value be exchanged over an encoding/json "omitempty"
+// field without it being dropped.
 type Bool string
+
+// NewBool constructs a new Bool value equal to b. The returned Bool is set,
+// unless Set("") or Clear() methods are called.
+func NewBool(b bool) Bool {
+	return Bool(strconv.FormatBool(b))
+}
 
 func (b *Bool) Set(v bool) {
 	*b = Bool(strconv.FormatBool(v))
@@ -22,15 +31,18 @@ func (b *Bool) Set(v bool) {
 func (b *Bool) Clear() { *b = "" }
 
 func (b Bool) Get() (v bool, ok bool) {
-	if b == "" {
-		return
+	switch b {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
 	}
-	v, err := strconv.ParseBool(string(b))
-	return v, err == nil
 }
 
 // Scan implements database/sql.Scanner.
-func (b *Bool) Scan(src interface{}) error {
+func (b *Bool) Scan(src any) error {
 	if src == nil {
 		*b = ""
 		return nil
@@ -74,28 +86,48 @@ func (b Bool) MarshalJSON() ([]byte, error) {
 		return trueBytes, nil
 	case "false":
 		return falseBytes, nil
-	case "":
+	case "", "unset":
 		return nullBytes, nil
 	}
 	return nil, fmt.Errorf("invalid opt.Bool value %q", string(b))
 }
 
 func (b *Bool) UnmarshalJSON(j []byte) error {
-	// Note: written with a bunch of ifs instead of a switch
-	// because I'm sure the Go compiler optimizes away these
-	// []byte->string allocations in an == comparison, but I'm too
-	// lazy to check whether that's true in a switch also.
-	if string(j) == "true" {
+	switch string(j) {
+	case "true":
 		*b = "true"
-		return nil
-	}
-	if string(j) == "false" {
+	case "false":
 		*b = "false"
-		return nil
+	case "null":
+		*b = "unset"
+	default:
+		return fmt.Errorf("invalid opt.Bool value %q", j)
 	}
-	if string(j) == "null" {
-		*b = ""
-		return nil
+	return nil
+}
+
+// BoolFlag is a wrapper for Bool that implements [flag.Value].
+type BoolFlag struct {
+	*Bool
+}
+
+// Set the value of b, using any value supported by [strconv.ParseBool].
+func (b *BoolFlag) Set(s string) error {
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("invalid opt.Bool value %q", j)
+	b.Bool.Set(v)
+	return nil
+}
+
+// String returns "true" or "false" if the value is set, or an empty string otherwise.
+func (b *BoolFlag) String() string {
+	if b == nil || b.Bool == nil {
+		return ""
+	}
+	if v, ok := b.Bool.Get(); ok {
+		return strconv.FormatBool(v)
+	}
+	return ""
 }

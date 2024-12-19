@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package metrics
 
@@ -11,6 +10,18 @@ import (
 
 	"tailscale.com/tstest"
 )
+
+func TestLabelMap(t *testing.T) {
+	var m LabelMap
+	m.GetIncrFunc("foo")(1)
+	m.GetIncrFunc("bar")(2)
+	if g, w := m.Get("foo").Value(), int64(1); g != w {
+		t.Errorf("foo = %v; want %v", g, w)
+	}
+	if g, w := m.Get("bar").Value(), int64(2); g != w {
+		t.Errorf("bar = %v; want %v", g, w)
+	}
+}
 
 func TestCurrentFileDescriptors(t *testing.T) {
 	if runtime.GOOS != "linux" {
@@ -30,7 +41,7 @@ func TestCurrentFileDescriptors(t *testing.T) {
 
 	// Open some FDs.
 	const extra = 10
-	for i := 0; i < extra; i++ {
+	for i := range extra {
 		f, err := os.Open("/proc/self/stat")
 		if err != nil {
 			t.Fatal(err)
@@ -47,7 +58,7 @@ func TestCurrentFileDescriptors(t *testing.T) {
 
 func BenchmarkCurrentFileDescriptors(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_ = CurrentFDs()
 	}
 }

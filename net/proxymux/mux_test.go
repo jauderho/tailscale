@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package proxymux
 
@@ -139,8 +138,8 @@ func mkWorld(t *testing.T) (ret *world) {
 	}
 	go httpProxy.Serve(ret.httpListener)
 
-	socksProxy := socks5.Server{}
-	go socksProxy.Serve(ret.socksListener)
+	ret.socksProxy = &socks5.Server{}
+	go ret.socksProxy.Serve(ret.socksListener)
 
 	ret.httpClient = &http.Client{
 		Transport: &http.Transport{

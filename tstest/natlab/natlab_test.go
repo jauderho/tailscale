@@ -1,24 +1,24 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package natlab
 
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/netip"
 	"testing"
 	"time"
 
-	"inet.af/netaddr"
 	"tailscale.com/tstest"
 )
 
 func TestAllocIPs(t *testing.T) {
 	n := NewInternet()
-	saw := map[netaddr.IP]bool{}
-	for i := 0; i < 255; i++ {
-		for _, f := range []func(*Interface) netaddr.IP{n.allocIPv4, n.allocIPv6} {
+	saw := map[netip.Addr]bool{}
+	for range 255 {
+		for _, f := range []func(*Interface) netip.Addr{n.allocIPv4, n.allocIPv6} {
 			ip := f(nil)
 			if saw[ip] {
 				t.Fatalf("got duplicate %v", ip)
@@ -49,8 +49,8 @@ func TestSendPacket(t *testing.T) {
 	ifFoo := foo.Attach("eth0", internet)
 	ifBar := bar.Attach("enp0s1", internet)
 
-	fooAddr := netaddr.IPPortFrom(ifFoo.V4(), 123)
-	barAddr := netaddr.IPPortFrom(ifBar.V4(), 456)
+	fooAddr := netip.AddrPortFrom(ifFoo.V4(), 123)
+	barAddr := netip.AddrPortFrom(ifBar.V4(), 456)
 
 	ctx := context.Background()
 	fooPC, err := foo.ListenPacket(ctx, "udp4", fooAddr.String())
@@ -63,7 +63,7 @@ func TestSendPacket(t *testing.T) {
 	}
 
 	const msg = "some message"
-	if _, err := fooPC.WriteTo([]byte(msg), barAddr.UDPAddr()); err != nil {
+	if _, err := fooPC.WriteTo([]byte(msg), net.UDPAddrFromAddrPort(barAddr)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,16 +111,16 @@ func TestMultiNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	clientAddr := netaddr.IPPortFrom(ifClient.V4(), 123)
-	natLANAddr := netaddr.IPPortFrom(ifNATLAN.V4(), 456)
-	natWANAddr := netaddr.IPPortFrom(ifNATWAN.V4(), 456)
-	serverAddr := netaddr.IPPortFrom(ifServer.V4(), 789)
+	clientAddr := netip.AddrPortFrom(ifClient.V4(), 123)
+	natLANAddr := netip.AddrPortFrom(ifNATLAN.V4(), 456)
+	natWANAddr := netip.AddrPortFrom(ifNATWAN.V4(), 456)
+	serverAddr := netip.AddrPortFrom(ifServer.V4(), 789)
 
 	const msg1, msg2 = "hello", "world"
-	if _, err := natPC.WriteTo([]byte(msg1), clientAddr.UDPAddr()); err != nil {
+	if _, err := natPC.WriteTo([]byte(msg1), net.UDPAddrFromAddrPort(clientAddr)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := natPC.WriteTo([]byte(msg2), serverAddr.UDPAddr()); err != nil {
+	if _, err := natPC.WriteTo([]byte(msg2), net.UDPAddrFromAddrPort(serverAddr)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -149,13 +149,13 @@ func TestMultiNetwork(t *testing.T) {
 }
 
 type trivialNAT struct {
-	clientIP     netaddr.IP
+	clientIP     netip.Addr
 	lanIf, wanIf *Interface
 }
 
 func (n *trivialNAT) HandleIn(p *Packet, iface *Interface) *Packet {
-	if iface == n.wanIf && p.Dst.IP() == n.wanIf.V4() {
-		p.Dst = p.Dst.WithIP(n.clientIP)
+	if iface == n.wanIf && p.Dst.Addr() == n.wanIf.V4() {
+		p.Dst = netip.AddrPortFrom(n.clientIP, p.Dst.Port())
 	}
 	return p
 }
@@ -167,13 +167,13 @@ func (n trivialNAT) HandleOut(p *Packet, iface *Interface) *Packet {
 func (n *trivialNAT) HandleForward(p *Packet, iif, oif *Interface) *Packet {
 	// Outbound from LAN -> apply NAT, continue
 	if iif == n.lanIf && oif == n.wanIf {
-		if p.Src.IP() == n.clientIP {
-			p.Src = p.Src.WithIP(n.wanIf.V4())
+		if p.Src.Addr() == n.clientIP {
+			p.Src = netip.AddrPortFrom(n.wanIf.V4(), p.Src.Port())
 		}
 		return p
 	}
 	// Return traffic to LAN, allow if right dst.
-	if iif == n.wanIf && oif == n.lanIf && p.Dst.IP() == n.clientIP {
+	if iif == n.wanIf && oif == n.lanIf && p.Dst.Addr() == n.clientIP {
 		return p
 	}
 	// Else drop.
@@ -216,8 +216,8 @@ func TestPacketHandler(t *testing.T) {
 	}
 
 	const msg = "some message"
-	serverAddr := netaddr.IPPortFrom(ifServer.V4(), 456)
-	if _, err := clientPC.WriteTo([]byte(msg), serverAddr.UDPAddr()); err != nil {
+	serverAddr := netip.AddrPortFrom(ifServer.V4(), 456)
+	if _, err := clientPC.WriteTo([]byte(msg), net.UDPAddrFromAddrPort(serverAddr)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -230,7 +230,7 @@ func TestPacketHandler(t *testing.T) {
 	if string(buf) != msg {
 		t.Errorf("read %q; want %q", buf, msg)
 	}
-	mappedAddr := netaddr.IPPortFrom(ifNATWAN.V4(), 123)
+	mappedAddr := netip.AddrPortFrom(ifNATWAN.V4(), 123)
 	if addr.String() != mappedAddr.String() {
 		t.Errorf("addr = %q; want %q", addr, mappedAddr)
 	}
@@ -316,7 +316,7 @@ func TestFirewall(t *testing.T) {
 
 type fwTest struct {
 	iif, oif *Interface
-	src, dst netaddr.IPPort
+	src, dst netip.AddrPort
 	ok       bool
 }
 
@@ -339,8 +339,8 @@ func testFirewall(t *testing.T, f *Firewall, tests []fwTest) {
 	}
 }
 
-func ipp(str string) netaddr.IPPort {
-	ipp, err := netaddr.ParseIPPort(str)
+func ipp(str string) netip.AddrPort {
+	ipp, err := netip.ParseAddrPort(str)
 	if err != nil {
 		panic(err)
 	}
@@ -453,7 +453,7 @@ func TestNAT(t *testing.T) {
 }
 
 type natTest struct {
-	src, dst       netaddr.IPPort
+	src, dst       netip.AddrPort
 	wantNewMapping bool
 }
 
@@ -461,7 +461,7 @@ func testNAT(t *testing.T, n *SNAT44, lanIf, wanIf *Interface, tests []natTest) 
 	clock := &tstest.Clock{}
 	n.TimeNow = clock.Now
 
-	mappings := map[netaddr.IPPort]bool{}
+	mappings := map[netip.AddrPort]bool{}
 	for _, test := range tests {
 		clock.Advance(time.Second)
 		p := &Packet{

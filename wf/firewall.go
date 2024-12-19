@@ -1,27 +1,30 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build windows
-// +build windows
 
+// Package wf controls the Windows Filtering Platform to change Windows firewall rules.
 package wf
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 
+	"github.com/tailscale/wf"
 	"golang.org/x/sys/windows"
-	"inet.af/netaddr"
-	"inet.af/wf"
+	"tailscale.com/net/netaddr"
 )
 
 // Known addresses.
 var (
-	linkLocalRange           = netaddr.MustParseIPPrefix("ff80::/10")
-	linkLocalDHCPMulticast   = netaddr.MustParseIP("ff02::1:2")
-	siteLocalDHCPMulticast   = netaddr.MustParseIP("ff05::1:3")
-	linkLocalRouterMulticast = netaddr.MustParseIP("ff02::2")
+	linkLocalRange           = netip.MustParsePrefix("ff80::/10")
+	linkLocalDHCPMulticast   = netip.MustParseAddr("ff02::1:2")
+	siteLocalDHCPMulticast   = netip.MustParseAddr("ff05::1:3")
+	linkLocalRouterMulticast = netip.MustParseAddr("ff02::2")
+
+	linkLocalMulticastIPv4Range = netip.MustParsePrefix("224.0.0.0/24")
+	linkLocalMulticastIPv6Range = netip.MustParsePrefix("ff02::/16")
 )
 
 type direction int
@@ -84,10 +87,10 @@ type Firewall struct {
 	sublayerID wf.SublayerID
 	session    *wf.Session
 
-	permittedRoutes map[netaddr.IPPrefix][]*wf.Rule
+	permittedRoutes map[netip.Prefix][]*wf.Rule
 }
 
-// New returns a new Firewall for the provdied interface ID.
+// New returns a new Firewall for the provided interface ID.
 func New(luid uint64) (*Firewall, error) {
 	session, err := wf.New(&wf.Options{
 		Name:    "Tailscale firewall",
@@ -124,7 +127,7 @@ func New(luid uint64) (*Firewall, error) {
 		session:         session,
 		providerID:      providerID,
 		sublayerID:      sublayerID,
-		permittedRoutes: make(map[netaddr.IPPrefix][]*wf.Rule),
+		permittedRoutes: make(map[netip.Prefix][]*wf.Rule),
 	}
 	if err := f.enable(); err != nil {
 		return nil, err
@@ -187,16 +190,16 @@ func (f *Firewall) enable() error {
 // UpdatedPermittedRoutes adds rules to allow incoming and outgoing connections
 // from the provided prefixes. It will also remove rules for routes that were
 // previously added but have been removed.
-func (f *Firewall) UpdatePermittedRoutes(newRoutes []netaddr.IPPrefix) error {
-	var routesToAdd []netaddr.IPPrefix
-	routeMap := make(map[netaddr.IPPrefix]bool)
+func (f *Firewall) UpdatePermittedRoutes(newRoutes []netip.Prefix) error {
+	var routesToAdd []netip.Prefix
+	routeMap := make(map[netip.Prefix]bool)
 	for _, r := range newRoutes {
 		routeMap[r] = true
 		if _, ok := f.permittedRoutes[r]; !ok {
 			routesToAdd = append(routesToAdd, r)
 		}
 	}
-	var routesToRemove []netaddr.IPPrefix
+	var routesToRemove []netip.Prefix
 	for r := range f.permittedRoutes {
 		if !routeMap[r] {
 			routesToRemove = append(routesToRemove, r)
@@ -219,18 +222,70 @@ func (f *Firewall) UpdatePermittedRoutes(newRoutes []netaddr.IPPrefix) error {
 			},
 		}
 		var p protocol
-		if r.IP().Is4() {
+		if r.Addr().Is4() {
 			p = protocolV4
 		} else {
 			p = protocolV6
 		}
-		rules, err := f.addRules("local route", weightKnownTraffic, conditions, wf.ActionPermit, p, directionBoth)
+		name := "local route - " + r.String()
+		rules, err := f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionBoth)
 		if err != nil {
 			return err
 		}
+
+		name = "link-local multicast - " + r.String()
+		conditions = matchLinkLocalMulticast(r, false)
+		multicastRules, err := f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionOutbound)
+		if err != nil {
+			return err
+		}
+		rules = append(rules, multicastRules...)
+
+		conditions = matchLinkLocalMulticast(r, true)
+		multicastRules, err = f.addRules(name, weightKnownTraffic, conditions, wf.ActionPermit, p, directionInbound)
+		if err != nil {
+			return err
+		}
+		rules = append(rules, multicastRules...)
+
 		f.permittedRoutes[r] = rules
 	}
 	return nil
+}
+
+// matchLinkLocalMulticast returns a list of conditions that match
+// outbound or inbound link-local multicast traffic to or from the
+// specified network.
+func matchLinkLocalMulticast(pfx netip.Prefix, inbound bool) []*wf.Match {
+	var linkLocalMulticastRange netip.Prefix
+	if pfx.Addr().Is4() {
+		linkLocalMulticastRange = linkLocalMulticastIPv4Range
+	} else {
+		linkLocalMulticastRange = linkLocalMulticastIPv6Range
+	}
+	var localAddr, remoteAddr netip.Prefix
+	if inbound {
+		localAddr, remoteAddr = linkLocalMulticastRange, pfx
+	} else {
+		localAddr, remoteAddr = pfx, linkLocalMulticastRange
+	}
+	return []*wf.Match{
+		{
+			Field: wf.FieldIPProtocol,
+			Op:    wf.MatchTypeEqual,
+			Value: wf.IPProtoUDP,
+		},
+		{
+			Field: wf.FieldIPLocalAddress,
+			Op:    wf.MatchTypeEqual,
+			Value: localAddr,
+		},
+		{
+			Field: wf.FieldIPRemoteAddress,
+			Op:    wf.MatchTypeEqual,
+			Value: remoteAddr,
+		},
+	}
 }
 
 func (f *Firewall) newRule(name string, w weight, layer wf.LayerID, conditions []*wf.Match, action wf.Action) (*wf.Rule, error) {
@@ -276,7 +331,7 @@ func (f *Firewall) permitNDP(w weight) error {
 	fieldICMPType := wf.FieldIPLocalPort
 	fieldICMPCode := wf.FieldIPRemotePort
 
-	var icmpConditions = func(t, c uint16, remoteAddress interface{}) []*wf.Match {
+	var icmpConditions = func(t, c uint16, remoteAddress any) []*wf.Match {
 		conditions := []*wf.Match{
 			{
 				Field: wf.FieldIPProtocol,
@@ -359,7 +414,7 @@ func (f *Firewall) permitNDP(w weight) error {
 }
 
 func (f *Firewall) permitDHCPv6(w weight) error {
-	var dhcpConditions = func(remoteAddrs ...interface{}) []*wf.Match {
+	var dhcpConditions = func(remoteAddrs ...any) []*wf.Match {
 		conditions := []*wf.Match{
 			{
 				Field: wf.FieldIPProtocol,
@@ -403,7 +458,7 @@ func (f *Firewall) permitDHCPv6(w weight) error {
 }
 
 func (f *Firewall) permitDHCPv4(w weight) error {
-	var dhcpConditions = func(remoteAddrs ...interface{}) []*wf.Match {
+	var dhcpConditions = func(remoteAddrs ...any) []*wf.Match {
 		conditions := []*wf.Match{
 			{
 				Field: wf.FieldIPProtocol,

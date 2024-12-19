@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tsdial
 
@@ -9,10 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
-	"inet.af/netaddr"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/dnsname"
 )
@@ -21,8 +20,13 @@ import (
 // It must not be mutated once created.
 //
 // Example keys are "foo.domain.tld.beta.tailscale.net" and "foo",
-// both without trailing dots.
-type dnsMap map[string]netaddr.IP
+// both without trailing dots, and both always lowercase.
+type dnsMap map[string]netip.Addr
+
+// canonMapKey canonicalizes its input s to be a dnsMap map key.
+func canonMapKey(s string) string {
+	return strings.ToLower(strings.TrimSuffix(s, "."))
+}
 
 func dnsMapFromNetworkMap(nm *netmap.NetworkMap) dnsMap {
 	if nm == nil {
@@ -31,30 +35,31 @@ func dnsMapFromNetworkMap(nm *netmap.NetworkMap) dnsMap {
 	ret := make(dnsMap)
 	suffix := nm.MagicDNSSuffix()
 	have4 := false
-	if nm.Name != "" && len(nm.Addresses) > 0 {
-		ip := nm.Addresses[0].IP()
-		ret[strings.TrimRight(nm.Name, ".")] = ip
+	addrs := nm.GetAddresses()
+	if nm.Name != "" && addrs.Len() > 0 {
+		ip := addrs.At(0).Addr()
+		ret[canonMapKey(nm.Name)] = ip
 		if dnsname.HasSuffix(nm.Name, suffix) {
-			ret[dnsname.TrimSuffix(nm.Name, suffix)] = ip
+			ret[canonMapKey(dnsname.TrimSuffix(nm.Name, suffix))] = ip
 		}
-		for _, a := range nm.Addresses {
-			if a.IP().Is4() {
+		for _, p := range addrs.All() {
+			if p.Addr().Is4() {
 				have4 = true
 			}
 		}
 	}
 	for _, p := range nm.Peers {
-		if p.Name == "" {
+		if p.Name() == "" {
 			continue
 		}
-		for _, a := range p.Addresses {
-			ip := a.IP()
+		for _, pfx := range p.Addresses().All() {
+			ip := pfx.Addr()
 			if ip.Is4() && !have4 {
 				continue
 			}
-			ret[strings.TrimRight(p.Name, ".")] = ip
-			if dnsname.HasSuffix(p.Name, suffix) {
-				ret[dnsname.TrimSuffix(p.Name, suffix)] = ip
+			ret[canonMapKey(p.Name())] = ip
+			if dnsname.HasSuffix(p.Name(), suffix) {
+				ret[canonMapKey(dnsname.TrimSuffix(p.Name(), suffix))] = ip
 			}
 			break
 		}
@@ -63,11 +68,11 @@ func dnsMapFromNetworkMap(nm *netmap.NetworkMap) dnsMap {
 		if rec.Type != "" {
 			continue
 		}
-		ip, err := netaddr.ParseIP(rec.Value)
+		ip, err := netip.ParseAddr(rec.Value)
 		if err != nil {
 			continue
 		}
-		ret[strings.TrimRight(rec.Name, ".")] = ip
+		ret[canonMapKey(rec.Name)] = ip
 	}
 	return ret
 }
@@ -92,24 +97,24 @@ func splitHostPort(addr string) (host string, port uint16, err error) {
 //
 // The error is [exactly] errUnresolved if the addr is a name that isn't known
 // in the map.
-func (m dnsMap) resolveMemory(ctx context.Context, network, addr string) (_ netaddr.IPPort, err error) {
+func (m dnsMap) resolveMemory(ctx context.Context, network, addr string) (_ netip.AddrPort, err error) {
 	host, port, err := splitHostPort(addr)
 	if err != nil {
 		// addr malformed or invalid port.
-		return netaddr.IPPort{}, err
+		return netip.AddrPort{}, err
 	}
-	if ip, err := netaddr.ParseIP(host); err == nil {
+	if ip, err := netip.ParseAddr(host); err == nil {
 		// addr was literal ip:port.
-		return netaddr.IPPortFrom(ip, port), nil
+		return netip.AddrPortFrom(ip, port), nil
 	}
 
 	// Host is not an IP, so assume it's a DNS name.
 
 	// Try MagicDNS first, otherwise a real DNS lookup.
-	ip := m[host]
-	if !ip.IsZero() {
-		return netaddr.IPPortFrom(ip, port), nil
+	ip := m[canonMapKey(host)]
+	if ip.IsValid() {
+		return netip.AddrPortFrom(ip, port), nil
 	}
 
-	return netaddr.IPPort{}, errUnresolved
+	return netip.AddrPort{}, errUnresolved
 }

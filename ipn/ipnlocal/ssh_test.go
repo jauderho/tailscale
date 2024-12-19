@@ -1,21 +1,25 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux
-// +build linux
+//go:build linux || (darwin && !ios)
 
 package ipnlocal
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	"tailscale.com/health"
+	"tailscale.com/ipn/store/mem"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/must"
 )
 
 func TestSSHKeyGen(t *testing.T) {
 	dir := t.TempDir()
 	lb := &LocalBackend{varRoot: dir}
-	keys, err := lb.getTailscaleSSH_HostKeys()
+	keys, err := lb.getTailscaleSSH_HostKeys(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,11 +36,26 @@ func TestSSHKeyGen(t *testing.T) {
 		t.Fatalf("keys = %v; want %v", got, want)
 	}
 
-	keys2, err := lb.getTailscaleSSH_HostKeys()
+	keys2, err := lb.getTailscaleSSH_HostKeys(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(keys, keys2) {
 		t.Errorf("got different keys on second call")
 	}
+}
+
+type fakeSSHServer struct {
+	SSHServer
+}
+
+func TestGetSSHUsernames(t *testing.T) {
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
+	b := &LocalBackend{pm: pm, store: pm.Store()}
+	b.sshServer = fakeSSHServer{}
+	res, err := b.getSSHUsernames(new(tailcfg.C2NSSHUsernamesRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Got: %s", must.Get(json.Marshal(res)))
 }

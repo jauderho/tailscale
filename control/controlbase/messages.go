@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlbase
 
@@ -39,9 +38,9 @@ const (
 // 16b: message tag (authenticates the whole message)
 type initiationMessage [101]byte
 
-func mkInitiationMessage() initiationMessage {
+func mkInitiationMessage(protocolVersion uint16) initiationMessage {
 	var ret initiationMessage
-	binary.BigEndian.PutUint16(ret[:2], uint16(protocolVersion))
+	binary.BigEndian.PutUint16(ret[:2], protocolVersion)
 	ret[2] = msgTypeInitiation
 	binary.BigEndian.PutUint16(ret[3:5], uint16(len(ret.Payload())))
 	return ret

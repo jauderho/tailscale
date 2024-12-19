@@ -6,25 +6,26 @@
 package router
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"log"
-	"net"
-	"runtime"
+	"net/netip"
+	"slices"
 	"sort"
 	"time"
 
-	ole "github.com/go-ole/go-ole"
-	"golang.org/x/sys/windows"
-	"golang.zx2c4.com/wireguard/tun"
-	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-	"inet.af/netaddr"
 	"tailscale.com/health"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/net/tstun"
 	"tailscale.com/util/multierr"
 	"tailscale.com/wgengine/winnet"
+
+	ole "github.com/go-ole/go-ole"
+	"github.com/tailscale/wireguard-go/tun"
+	"go4.org/netipx"
+	"golang.org/x/sys/windows"
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 // monitorDefaultRoutes subscribes to route change events and updates
@@ -110,7 +111,7 @@ func monitorDefaultRoutes(tun *tun.NativeTun) (*winipcfg.RouteChangeCallback, er
 }
 
 func getDefaultRouteMTU() (uint32, error) {
-	mtus, err := interfaces.NonTailscaleMTUs()
+	mtus, err := netmon.NonTailscaleMTUs()
 	if err != nil {
 		return 0, err
 	}
@@ -174,17 +175,9 @@ func setPrivateNetwork(ifcLUID winipcfg.LUID) (bool, error) {
 		return false, fmt.Errorf("ifcLUID.GUID: %v", err)
 	}
 
-	// Lock OS thread when using OLE, which seems to be a requirement
-	// from the Microsoft docs. go-ole doesn't seem to handle it automatically.
-	// https://github.com/tailscale/tailscale/issues/921#issuecomment-727526807
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
+	// aaron: DO NOT call Initialize() or Uninitialize() on c!
+	// We've already handled that process-wide.
 	var c ole.Connection
-	if err := c.Initialize(); err != nil {
-		return false, fmt.Errorf("c.Initialize: %v", err)
-	}
-	defer c.Uninitialize()
 
 	m, err := winnet.NewNetworkListManager(&c)
 	if err != nil {
@@ -218,7 +211,7 @@ func setPrivateNetwork(ifcLUID winipcfg.LUID) (bool, error) {
 			return false, fmt.Errorf("GetCategory: %v", err)
 		}
 
-		if cat != categoryPrivate {
+		if cat != categoryPrivate && cat != categoryDomain {
 			if err := n.SetCategory(categoryPrivate); err != nil {
 				return false, fmt.Errorf("SetCategory: %v", err)
 			}
@@ -243,8 +236,18 @@ func interfaceFromLUID(luid winipcfg.LUID, flags winipcfg.GAAFlags) (*winipcfg.I
 	return nil, fmt.Errorf("interfaceFromLUID: interface with LUID %v not found", luid)
 }
 
-func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
-	const mtu = 0
+var networkCategoryWarnable = health.Register(&health.Warnable{
+	Code:     "set-network-category-failed",
+	Severity: health.SeverityMedium,
+	Title:    "Windows network configuration failed",
+	Text: func(args health.Args) string {
+		return fmt.Sprintf("Failed to set the network category to private on the Tailscale adapter. This may prevent Tailscale from working correctly. Error: %s", args[health.ArgError])
+	},
+	MapDebugFlag: "warn-network-category-unhealthy",
+})
+
+func configureInterface(cfg *Config, tun *tun.NativeTun, ht *health.Tracker) (retErr error) {
+	var mtu = tstun.DefaultTUNMTU()
 	luid := winipcfg.LUID(tun.LUID())
 	iface, err := interfaceFromLUID(luid,
 		// Issue 474: on early boot, when the network is still
@@ -271,12 +274,13 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 		// new interface has come up. Poll periodically until it
 		// does.
 		const tries = 20
-		for i := 0; i < tries; i++ {
+		for i := range tries {
 			found, err := setPrivateNetwork(luid)
-			health.SetNetworkCategoryHealth(err)
 			if err != nil {
+				ht.SetUnhealthy(networkCategoryWarnable, health.Args{health.ArgError: err.Error()})
 				log.Printf("setPrivateNetwork(try=%d): %v", i, err)
 			} else {
+				ht.SetHealthy(networkCategoryWarnable)
 				if found {
 					if i > 0 {
 						log.Printf("setPrivateNetwork(try=%d): success", i)
@@ -316,85 +320,103 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 		ipif6 = nil
 	}
 
-	// Windows requires routes to have a nexthop. For routes such as
-	// ours where the nexthop is meaningless, you're supposed to use
-	// one of the local IP addresses of the interface. Find an IPv4
-	// and IPv6 address we can use for this purpose.
-	var firstGateway4 *net.IP
-	var firstGateway6 *net.IP
-	addresses := make([]*net.IPNet, 0, len(cfg.LocalAddrs))
+	// Windows requires routes to have a nexthop. Routes created using
+	// the interface's local IP address or an unspecified IP address
+	// ("0.0.0.0" or "::") as the nexthop are considered on-link routes.
+	//
+	// Notably, Windows treats on-link subnet routes differently, reserving the last
+	// IP in the range as the broadcast IP and therefore prohibiting TCP connections
+	// to it, resulting in WSA error 10049: "The requested address is not valid in its context."
+	// This does not happen with single-host routes, such as routes to Tailscale IP addresses,
+	// but becomes a problem with advertised subnets when all IPs in the range should be reachable.
+	// See https://github.com/tailscale/support-escalations/issues/57 for details.
+	//
+	// For routes such as ours where the nexthop is meaningless, we can use an
+	// arbitrary nexthop address, such as TailscaleServiceIP, to prevent the
+	// routes from being marked as on-link. We can still create on-link routes
+	// for single-host Tailscale routes, but we shouldn't attempt to create a
+	// route for the interface's own IP.
+	var localAddr4, localAddr6 netip.Addr
+	var gatewayAddr4, gatewayAddr6 netip.Addr
+	addresses := make([]netip.Prefix, 0, len(cfg.LocalAddrs))
 	for _, addr := range cfg.LocalAddrs {
-		if (addr.IP().Is4() && ipif4 == nil) || (addr.IP().Is6() && ipif6 == nil) {
+		if (addr.Addr().Is4() && ipif4 == nil) || (addr.Addr().Is6() && ipif6 == nil) {
 			// Can't program addresses for disabled protocol.
 			continue
 		}
-		ipnet := addr.IPNet()
-		addresses = append(addresses, ipnet)
-		gateway := ipnet.IP
-		if addr.IP().Is4() && firstGateway4 == nil {
-			firstGateway4 = &gateway
-		} else if addr.IP().Is6() && firstGateway6 == nil {
-			firstGateway6 = &gateway
+		addresses = append(addresses, addr)
+		if addr.Addr().Is4() && !gatewayAddr4.IsValid() {
+			localAddr4 = addr.Addr()
+			gatewayAddr4 = tsaddr.TailscaleServiceIP()
+		} else if addr.Addr().Is6() && !gatewayAddr6.IsValid() {
+			localAddr6 = addr.Addr()
+			gatewayAddr6 = tsaddr.TailscaleServiceIPv6()
 		}
 	}
 
-	var routes []winipcfg.RouteData
+	var routes []*routeData
 	foundDefault4 := false
 	foundDefault6 := false
 	for _, route := range cfg.Routes {
-		if (route.IP().Is4() && ipif4 == nil) || (route.IP().Is6() && ipif6 == nil) {
+		if (route.Addr().Is4() && ipif4 == nil) || (route.Addr().Is6() && ipif6 == nil) {
 			// Can't program routes for disabled protocol.
 			continue
 		}
 
-		if route.IP().Is6() && firstGateway6 == nil {
+		if route.Addr().Is6() && !gatewayAddr6.IsValid() {
 			// Windows won't let us set IPv6 routes without having an
 			// IPv6 local address set. However, when we've configured
 			// a default route, we want to forcibly grab IPv6 traffic
 			// even if the v6 overlay network isn't configured. To do
 			// that, we add a dummy local IPv6 address to serve as a
 			// route source.
-			ipnet := &net.IPNet{tsaddr.Tailscale4To6Placeholder().IPAddr().IP, net.CIDRMask(128, 128)}
-			addresses = append(addresses, ipnet)
-			firstGateway6 = &ipnet.IP
-		} else if route.IP().Is4() && firstGateway4 == nil {
+			ip := tsaddr.Tailscale4To6Placeholder()
+			addresses = append(addresses, netip.PrefixFrom(ip, ip.BitLen()))
+			gatewayAddr6 = ip
+		} else if route.Addr().Is4() && !gatewayAddr4.IsValid() {
 			// TODO: do same dummy behavior as v6?
 			return errors.New("due to a Windows limitation, one cannot have interface routes without an interface address")
 		}
 
-		ipn := route.IPNet()
-		var gateway net.IP
-		if route.IP().Is4() {
-			gateway = *firstGateway4
-		} else if route.IP().Is6() {
-			gateway = *firstGateway6
+		var gateway, localAddr netip.Addr
+		if route.Addr().Is4() {
+			localAddr = localAddr4
+			gateway = gatewayAddr4
+		} else if route.Addr().Is6() {
+			localAddr = localAddr6
+			gateway = gatewayAddr6
 		}
-		r := winipcfg.RouteData{
-			Destination: net.IPNet{
-				IP:   ipn.IP.Mask(ipn.Mask),
-				Mask: ipn.Mask,
-			},
-			NextHop: gateway,
-			Metric:  0,
-		}
-		if net.IP.Equal(r.Destination.IP, gateway) {
+
+		switch destAddr := route.Addr().Unmap(); {
+		case destAddr == localAddr:
 			// no need to add a route for the interface's
 			// own IP. The kernel does that for us.
 			// If we try to replace it, we'll fail to
 			// add the route unless NextHop is set, but
 			// then the interface's IP won't be pingable.
 			continue
+		case route.IsSingleIP() && (destAddr == gateway || tsaddr.IsTailscaleIP(destAddr)):
+			// add an on-link route if the destination
+			// is the nexthop itself or a single Tailscale IP.
+			gateway = localAddr
 		}
-		if route.IP().Is4() {
+
+		r := &routeData{
+			RouteData: winipcfg.RouteData{
+				Destination: route,
+				NextHop:     gateway,
+				Metric:      0,
+			},
+		}
+
+		if route.Addr().Is4() {
 			if route.Bits() == 0 {
 				foundDefault4 = true
 			}
-			r.NextHop = *firstGateway4
-		} else if route.IP().Is6() {
+		} else if route.Addr().Is6() {
 			if route.Bits() == 0 {
 				foundDefault6 = true
 			}
-			r.NextHop = *firstGateway6
 		}
 		routes = append(routes, r)
 	}
@@ -404,18 +426,16 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 		return fmt.Errorf("syncAddresses: %w", err)
 	}
 
-	sort.Slice(routes, func(i, j int) bool { return routeLess(&routes[i], &routes[j]) })
+	slices.SortFunc(routes, (*routeData).Compare)
 
-	deduplicatedRoutes := []*winipcfg.RouteData{}
-	for i := 0; i < len(routes); i++ {
+	deduplicatedRoutes := []*routeData{}
+	for i := range len(routes) {
 		// There's only one way to get to a given IP+Mask, so delete
 		// all matches after the first.
-		if i > 0 &&
-			net.IP.Equal(routes[i].Destination.IP, routes[i-1].Destination.IP) &&
-			bytes.Equal(routes[i].Destination.Mask, routes[i-1].Destination.Mask) {
+		if i > 0 && routes[i].Destination == routes[i-1].Destination {
 			continue
 		}
-		deduplicatedRoutes = append(deduplicatedRoutes, &routes[i])
+		deduplicatedRoutes = append(deduplicatedRoutes, routes[i])
 	}
 
 	// Re-read interface after syncAddresses.
@@ -480,77 +500,40 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 	return errAcc
 }
 
-// routeLess reports whether ri should sort before rj.
-// The actual sort order doesn't appear to matter. The caller just
-// wants them sorted to be able to de-dup.
-func routeLess(ri, rj *winipcfg.RouteData) bool {
-	if v := bytes.Compare(ri.Destination.IP, rj.Destination.IP); v != 0 {
-		return v == -1
-	}
-	if v := bytes.Compare(ri.Destination.Mask, rj.Destination.Mask); v != 0 {
-		// Narrower masks first
-		return v == 1
-	}
-	if ri.Metric != rj.Metric {
-		// Lower metrics first
-		return ri.Metric < rj.Metric
-	}
-	if v := bytes.Compare(ri.NextHop, rj.NextHop); v != 0 {
-		// No nexthop before non-empty nexthop.
-		return v == -1
-	}
-	return false
-}
-
-// unwrapIP returns the shortest version of ip.
-func unwrapIP(ip net.IP) net.IP {
-	if ip4 := ip.To4(); ip4 != nil {
-		return ip4
-	}
-	return ip
-}
-
-func v4Mask(m net.IPMask) net.IPMask {
-	if len(m) == 16 {
-		return m[12:]
-	}
-	return m
-}
-
-func netCompare(a, b net.IPNet) int {
-	aip, bip := unwrapIP(a.IP), unwrapIP(b.IP)
-	v := bytes.Compare(aip, bip)
+func netCompare(a, b netip.Prefix) int {
+	aip, bip := a.Addr().Unmap(), b.Addr().Unmap()
+	v := aip.Compare(bip)
 	if v != 0 {
 		return v
 	}
 
-	amask, bmask := a.Mask, b.Mask
-	if len(aip) == 4 {
-		amask = v4Mask(a.Mask)
-		bmask = v4Mask(b.Mask)
+	if a.Bits() == b.Bits() {
+		return 0
 	}
-
 	// narrower first
-	return -bytes.Compare(amask, bmask)
+	if a.Bits() > b.Bits() {
+		return -1
+	}
+	return 1
 }
 
-func sortNets(a []*net.IPNet) {
-	sort.Slice(a, func(i, j int) bool {
-		return netCompare(*a[i], *a[j]) == -1
+func sortNets(s []netip.Prefix) {
+	sort.Slice(s, func(i, j int) bool {
+		return netCompare(s[i], s[j]) == -1
 	})
 }
 
 // deltaNets returns the changes to turn a into b.
-func deltaNets(a, b []*net.IPNet) (add, del []*net.IPNet) {
-	add = make([]*net.IPNet, 0, len(b))
-	del = make([]*net.IPNet, 0, len(a))
+func deltaNets(a, b []netip.Prefix) (add, del []netip.Prefix) {
+	add = make([]netip.Prefix, 0, len(b))
+	del = make([]netip.Prefix, 0, len(a))
 	sortNets(a)
 	sortNets(b)
 
 	i := 0
 	j := 0
 	for i < len(a) && j < len(b) {
-		switch netCompare(*a[i], *b[j]) {
+		switch netCompare(a[i], b[j]) {
 		case -1:
 			// a < b, delete
 			del = append(del, a[i])
@@ -572,35 +555,21 @@ func deltaNets(a, b []*net.IPNet) (add, del []*net.IPNet) {
 	return
 }
 
-func excludeIPv6LinkLocal(in []*net.IPNet) (out []*net.IPNet) {
-	out = in[:0]
-	for _, n := range in {
-		if len(n.IP) == 16 && n.IP.IsLinkLocalUnicast() {
-			continue
-		}
-		out = append(out, n)
-	}
-	return out
+func isIPv6LinkLocal(a netip.Prefix) bool {
+	return a.Addr().Is6() && a.Addr().IsLinkLocalUnicast()
 }
 
-// ipAdapterUnicastAddressToIPNet converts windows.IpAdapterUnicastAddress to net.IPNet.
-func ipAdapterUnicastAddressToIPNet(u *windows.IpAdapterUnicastAddress) *net.IPNet {
-	ip := u.Address.IP()
-	w := 32
-	if ip.To4() == nil {
-		w = 128
-	}
-	return &net.IPNet{
-		IP:   ip,
-		Mask: net.CIDRMask(int(u.OnLinkPrefixLength), w),
-	}
+// ipAdapterUnicastAddressToPrefix converts windows.IpAdapterUnicastAddress to netip.Prefix
+func ipAdapterUnicastAddressToPrefix(u *windows.IpAdapterUnicastAddress) netip.Prefix {
+	ip, _ := netip.AddrFromSlice(u.Address.IP())
+	return netip.PrefixFrom(ip.Unmap(), int(u.OnLinkPrefixLength))
 }
 
 // unicastIPNets returns all unicast net.IPNet for ifc interface.
-func unicastIPNets(ifc *winipcfg.IPAdapterAddresses) []*net.IPNet {
-	nets := make([]*net.IPNet, 0)
+func unicastIPNets(ifc *winipcfg.IPAdapterAddresses) []netip.Prefix {
+	var nets []netip.Prefix
 	for addr := ifc.FirstUnicastAddress; addr != nil; addr = addr.Next {
-		nets = append(nets, ipAdapterUnicastAddressToIPNet(addr))
+		nets = append(nets, ipAdapterUnicastAddressToPrefix(addr))
 	}
 	return nets
 }
@@ -609,74 +578,110 @@ func unicastIPNets(ifc *winipcfg.IPAdapterAddresses) []*net.IPNet {
 // doing the minimum number of AddAddresses & DeleteAddress calls.
 // This avoids the full FlushAddresses.
 //
-// Any IPv6 link-local addresses are not deleted.
-func syncAddresses(ifc *winipcfg.IPAdapterAddresses, want []*net.IPNet) error {
+// Any IPv6 link-local addresses are not deleted out of caution as some
+// configurations may repeatedly re-add them. Link-local addresses are adjusted
+// to set SkipAsSource. SkipAsSource prevents the addresses from being added to
+// DNS locally or remotely and from being picked as a source address for
+// outgoing packets with unspecified sources. See #4647 and
+// https://web.archive.org/web/20200912120956/https://devblogs.microsoft.com/scripting/use-powershell-to-change-ip-behavior-with-skipassource/
+func syncAddresses(ifc *winipcfg.IPAdapterAddresses, want []netip.Prefix) error {
 	var erracc error
 
 	got := unicastIPNets(ifc)
 	add, del := deltaNets(got, want)
-	del = excludeIPv6LinkLocal(del)
+
+	ll := make([]netip.Prefix, 0)
 	for _, a := range del {
-		err := ifc.LUID.DeleteIPAddress(*a)
+		// do not delete link-local addresses, and collect them for later
+		// applying SkipAsSource.
+		if isIPv6LinkLocal(a) {
+			ll = append(ll, a)
+			continue
+		}
+
+		err := ifc.LUID.DeleteIPAddress(a)
 		if err != nil {
-			erracc = fmt.Errorf("deleting IP %q: %w", *a, err)
+			erracc = fmt.Errorf("deleting IP %q: %w", a, err)
 		}
 	}
 
 	for _, a := range add {
-		err := ifc.LUID.AddIPAddress(*a)
+		err := ifc.LUID.AddIPAddress(a)
 		if err != nil {
-			erracc = fmt.Errorf("adding IP %q: %w", *a, err)
+			erracc = fmt.Errorf("adding IP %q: %w", a, err)
+		}
+	}
+
+	for _, a := range ll {
+		mib, err := ifc.LUID.IPAddress(a.Addr())
+		if err != nil {
+			erracc = fmt.Errorf("setting skip-as-source on IP %q: unable to retrieve MIB: %w", a, err)
+			continue
+		}
+		if !mib.SkipAsSource {
+			mib.SkipAsSource = true
+			if err := mib.Set(); err != nil {
+				erracc = fmt.Errorf("setting skip-as-source on IP %q: unable to set MIB: %w", a, err)
+			}
 		}
 	}
 
 	return erracc
 }
 
-func routeDataCompare(a, b *winipcfg.RouteData) int {
-	v := bytes.Compare(a.Destination.IP, b.Destination.IP)
+// routeData wraps winipcfg.RouteData with an additional field that permits
+// caching of the associated MibIPForwardRow2; by keeping it around, we can
+// avoid unnecessary (and slow) lookups of information that we already have.
+type routeData struct {
+	winipcfg.RouteData
+	Row *winipcfg.MibIPforwardRow2
+}
+
+func (rd *routeData) Less(other *routeData) bool {
+	return rd.Compare(other) < 0
+}
+
+func (rd *routeData) Compare(other *routeData) int {
+	v := rd.Destination.Addr().Compare(other.Destination.Addr())
 	if v != 0 {
 		return v
 	}
 
 	// Narrower masks first
-	v = bytes.Compare(a.Destination.Mask, b.Destination.Mask)
-	if v != 0 {
-		return -v
+	b1, b2 := rd.Destination.Bits(), other.Destination.Bits()
+	if b1 != b2 {
+		if b1 > b2 {
+			return -1
+		}
+		return 1
 	}
 
 	// No nexthop before non-empty nexthop
-	v = bytes.Compare(a.NextHop, b.NextHop)
+	v = rd.NextHop.Compare(other.NextHop)
 	if v != 0 {
 		return v
 	}
 
 	// Lower metrics first
-	if a.Metric < b.Metric {
+	if rd.Metric < other.Metric {
 		return -1
-	} else if a.Metric > b.Metric {
+	} else if rd.Metric > other.Metric {
 		return 1
 	}
 
 	return 0
 }
 
-func sortRouteData(a []*winipcfg.RouteData) {
-	sort.Slice(a, func(i, j int) bool {
-		return routeDataCompare(a[i], a[j]) < 0
-	})
-}
-
-func deltaRouteData(a, b []*winipcfg.RouteData) (add, del []*winipcfg.RouteData) {
-	add = make([]*winipcfg.RouteData, 0, len(b))
-	del = make([]*winipcfg.RouteData, 0, len(a))
-	sortRouteData(a)
-	sortRouteData(b)
+func deltaRouteData(a, b []*routeData) (add, del []*routeData) {
+	add = make([]*routeData, 0, len(b))
+	del = make([]*routeData, 0, len(a))
+	slices.SortFunc(a, (*routeData).Compare)
+	slices.SortFunc(b, (*routeData).Compare)
 
 	i := 0
 	j := 0
 	for i < len(a) && j < len(b) {
-		switch routeDataCompare(a[i], b[j]) {
+		switch a[i].Compare(b[j]) {
 		case -1:
 			// a < b, delete
 			del = append(del, a[i])
@@ -713,7 +718,7 @@ func getInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses, family winipcfg.Addres
 	return
 }
 
-func getAllInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses) ([]*winipcfg.RouteData, error) {
+func getAllInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses) ([]*routeData, error) {
 	routes4, err := getInterfaceRoutes(ifc, windows.AF_INET)
 	if err != nil {
 		return nil, err
@@ -724,19 +729,27 @@ func getAllInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses) ([]*winipcfg.RouteD
 		// TODO: what if v6 unavailable?
 		return nil, err
 	}
-	rd := make([]*winipcfg.RouteData, 0, len(routes4)+len(routes6))
+
+	rd := make([]*routeData, 0, len(routes4)+len(routes6))
 	for _, r := range routes4 {
-		rd = append(rd, &winipcfg.RouteData{
-			Destination: r.DestinationPrefix.IPNet(),
-			NextHop:     r.NextHop.IP(),
-			Metric:      r.Metric,
+		rd = append(rd, &routeData{
+			RouteData: winipcfg.RouteData{
+				Destination: r.DestinationPrefix.Prefix(),
+				NextHop:     r.NextHop.Addr(),
+				Metric:      r.Metric,
+			},
+			Row: r,
 		})
 	}
+
 	for _, r := range routes6 {
-		rd = append(rd, &winipcfg.RouteData{
-			Destination: r.DestinationPrefix.IPNet(),
-			NextHop:     r.NextHop.IP(),
-			Metric:      r.Metric,
+		rd = append(rd, &routeData{
+			RouteData: winipcfg.RouteData{
+				Destination: r.DestinationPrefix.Prefix(),
+				NextHop:     r.NextHop.Addr(),
+				Metric:      r.Metric,
+			},
+			Row: r,
 		})
 	}
 	return rd, nil
@@ -744,8 +757,8 @@ func getAllInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses) ([]*winipcfg.RouteD
 
 // filterRoutes removes routes that have been added by Windows and should not
 // be managed by us.
-func filterRoutes(routes []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) []*winipcfg.RouteData {
-	ddm := make(map[netaddr.IPPrefix]bool)
+func filterRoutes(routes []*routeData, dontDelete []netip.Prefix) []*routeData {
+	ddm := make(map[netip.Prefix]bool)
 	for _, dd := range dontDelete {
 		// See issue 1448: we don't want to touch the routes added
 		// by Windows for our interface addresses.
@@ -753,20 +766,20 @@ func filterRoutes(routes []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) [
 	}
 	for _, r := range routes {
 		// We don't want to touch broadcast routes that Windows adds.
-		nr, ok := netaddr.FromStdIPNet(&r.Destination)
-		if !ok {
+		nr := r.Destination
+		if !nr.IsValid() {
 			continue
 		}
 		if nr.IsSingleIP() {
 			continue
 		}
-		lastIP := nr.Range().To()
-		ddm[netaddr.IPPrefixFrom(lastIP, lastIP.BitLen())] = true
+		lastIP := netipx.RangeOfPrefix(nr).To()
+		ddm[netip.PrefixFrom(lastIP, lastIP.BitLen())] = true
 	}
-	filtered := make([]*winipcfg.RouteData, 0, len(routes))
+	filtered := make([]*routeData, 0, len(routes))
 	for _, r := range routes {
-		rr, ok := netaddr.FromStdIPNet(&r.Destination)
-		if ok && ddm[rr] {
+		rr := r.Destination
+		if rr.IsValid() && ddm[rr] {
 			continue
 		}
 		filtered = append(filtered, r)
@@ -778,7 +791,7 @@ func filterRoutes(routes []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) [
 // This avoids a full ifc.FlushRoutes call.
 // dontDelete is a list of interface address routes that the
 // synchronization logic should never delete.
-func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) error {
+func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*routeData, dontDelete []netip.Prefix) error {
 	existingRoutes, err := getAllInterfaceRoutes(ifc)
 	if err != nil {
 		return err
@@ -789,7 +802,15 @@ func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*winipcfg.RouteData, do
 
 	var errs []error
 	for _, a := range del {
-		err := ifc.LUID.DeleteRoute(a.Destination, a.NextHop)
+		var err error
+		if a.Row == nil {
+			// DeleteRoute requires a routing table lookup, so only do that if
+			// a does not already have the row.
+			err = ifc.LUID.DeleteRoute(a.Destination, a.NextHop)
+		} else {
+			// Otherwise, delete the row directly.
+			err = a.Row.Delete()
+		}
 		if err != nil {
 			dstStr := a.Destination.String()
 			if dstStr == "169.254.255.255/32" {

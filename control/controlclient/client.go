@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package controlclient implements the client for the Tailscale
 // control plane.
@@ -11,45 +10,45 @@ package controlclient
 
 import (
 	"context"
-	"net/http"
-	"time"
 
 	"tailscale.com/tailcfg"
 )
 
+// LoginFlags is a bitmask of options to change the behavior of Client.Login
+// and LocalBackend.
 type LoginFlags int
 
 const (
 	LoginDefault     = LoginFlags(0)
 	LoginInteractive = LoginFlags(1 << iota) // force user login and key refresh
 	LoginEphemeral                           // set RegisterRequest.Ephemeral
+
+	// LocalBackendStartKeyOSNeutral instructs NewLocalBackend to start the
+	// LocalBackend without any OS-dependent StateStore StartKey behavior.
+	//
+	// See https://github.com/tailscale/tailscale/issues/6973.
+	LocalBackendStartKeyOSNeutral
 )
 
 // Client represents a client connection to the control server.
 // Currently this is done through a pair of polling https requests in
 // the Auto client, but that might change eventually.
+//
+// The Client must be comparable as it is used by the Observer to detect stale
+// clients.
 type Client interface {
-	// SetStatusFunc provides a callback to call when control sends us
-	// a message.
-	SetStatusFunc(func(Status))
 	// Shutdown closes this session, which should not be used any further
 	// afterwards.
 	Shutdown()
 	// Login begins an interactive or non-interactive login process.
 	// Client will eventually call the Status callback with either a
 	// LoginFinished flag (on success) or an auth URL (if further
-	// interaction is needed).
-	Login(*tailcfg.Oauth2Token, LoginFlags)
-	// StartLogout starts an asynchronous logout process.
-	// When it finishes, the Status callback will be called while
-	// AuthCantContinue()==true.
-	StartLogout()
+	// interaction is needed). It merely sets the process in motion,
+	// and doesn't wait for it to complete.
+	Login(LoginFlags)
 	// Logout starts a synchronous logout process. It doesn't return
 	// until the logout operation has been completed.
 	Logout(context.Context) error
-	// SetExpirySooner sets the node's expiry time via the controlclient,
-	// as long as it's shorter than the current expiry time.
-	SetExpirySooner(context.Context, time.Time) error
 	// SetPaused pauses or unpauses the controlclient activity as much
 	// as possible, without losing its internal state, to minimize
 	// unnecessary network activity.
@@ -73,19 +72,15 @@ type Client interface {
 	// in a separate http request. It has nothing to do with the rest of
 	// the state machine.
 	SetNetInfo(*tailcfg.NetInfo)
+	// SetTKAHead changes the TKA head hash value that will be sent in
+	// subsequent netmap requests.
+	SetTKAHead(headHash string)
 	// UpdateEndpoints changes the Endpoint structure that will be sent
 	// in subsequent node registration requests.
-	// The localPort field is unused except for integration tests in another repo.
 	// TODO: a server-side change would let us simply upload this
 	// in a separate http request. It has nothing to do with the rest of
 	// the state machine.
-	UpdateEndpoints(localPort uint16, endpoints []tailcfg.Endpoint)
-	// SetDNS sends the SetDNSRequest request to the control plane server,
-	// requesting a DNS record be created or updated.
-	SetDNS(context.Context, *tailcfg.SetDNSRequest) error
-	// DoNoiseRequest sends an HTTP request to the control plane
-	// over the Noise transport.
-	DoNoiseRequest(*http.Request) (*http.Response, error)
+	UpdateEndpoints(endpoints []tailcfg.Endpoint)
 }
 
 // UserVisibleError is an error that should be shown to users.

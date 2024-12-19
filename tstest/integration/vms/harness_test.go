@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !windows
-// +build !windows
+//go:build !windows && !plan9
 
 package vms
 
@@ -14,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path"
@@ -25,7 +24,6 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/proxy"
-	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
@@ -42,7 +40,7 @@ type Harness struct {
 	signer         ssh.Signer
 	cs             *testcontrol.Server
 	loginServerURL string
-	testerV4       netaddr.IP
+	testerV4       netip.Addr
 	ipMu           *sync.Mutex
 	ipMap          map[string]ipMapping
 }
@@ -64,7 +62,7 @@ func newHarness(t *testing.T) *Harness {
 			// TODO: this is wrong.
 			// It is also only one of many configurations.
 			// Figure out how to scale it up.
-			Resolvers:    []dnstype.Resolver{{Addr: "100.100.100.100"}, {Addr: "8.8.8.8"}},
+			Resolvers:    []*dnstype.Resolver{{Addr: "100.100.100.100"}, {Addr: "8.8.8.8"}},
 			Domains:      []string{"record"},
 			Proxied:      true,
 			ExtraRecords: []tailcfg.DNSRecord{{Name: "extratest.record", Type: "A", Value: "1.2.3.4"}},
@@ -239,6 +237,6 @@ outer:
 	h.testerV4 = bytes2Netaddr(h.Tailscale(t, "ip", "-4"))
 }
 
-func bytes2Netaddr(inp []byte) netaddr.IP {
-	return netaddr.MustParseIP(string(bytes.TrimSpace(inp)))
+func bytes2Netaddr(inp []byte) netip.Addr {
+	return netip.MustParseAddr(string(bytes.TrimSpace(inp)))
 }

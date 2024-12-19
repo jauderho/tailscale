@@ -1,33 +1,48 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package wgcfg has types and a parser for representing WireGuard config.
 package wgcfg
 
 import (
-	"inet.af/netaddr"
+	"net/netip"
+
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logid"
 )
 
-//go:generate go run tailscale.com/cmd/cloner -type=Config,Peer -output=clone.go
+//go:generate go run tailscale.com/cmd/cloner -type=Config,Peer
 
 // Config is a WireGuard configuration.
 // It only supports the set of things Tailscale uses.
 type Config struct {
 	Name       string
+	NodeID     tailcfg.StableNodeID
 	PrivateKey key.NodePrivate
-	Addresses  []netaddr.IPPrefix
+	Addresses  []netip.Prefix
 	MTU        uint16
-	DNS        []netaddr.IP
+	DNS        []netip.Addr
 	Peers      []Peer
+
+	// NetworkLogging enables network logging.
+	// It is disabled if either ID is the zero value.
+	// LogExitFlowEnabled indicates whether or not exit flows should be logged.
+	NetworkLogging struct {
+		NodeID             logid.PrivateID
+		DomainID           logid.PrivateID
+		LogExitFlowEnabled bool
+	}
 }
 
 type Peer struct {
 	PublicKey           key.NodePublic
 	DiscoKey            key.DiscoPublic // present only so we can handle restarts within wgengine, not passed to WireGuard
-	AllowedIPs          []netaddr.IPPrefix
-	PersistentKeepalive uint16
+	AllowedIPs          []netip.Prefix
+	V4MasqAddr          *netip.Addr // if non-nil, masquerade IPv4 traffic to this peer using this address
+	V6MasqAddr          *netip.Addr // if non-nil, masquerade IPv6 traffic to this peer using this address
+	IsJailed            bool        // if true, this peer is jailed and cannot initiate connections
+	PersistentKeepalive uint16      // in seconds between keep-alives; 0 to disable
 	// wireguard-go's endpoint for this peer. It should always equal Peer.PublicKey.
 	// We represent it explicitly so that we can detect if they diverge and recover.
 	// There is no need to set WGEndpoint explicitly when constructing a Peer by hand.

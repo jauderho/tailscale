@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -88,5 +87,33 @@ func TestMachineSerialization(t *testing.T) {
 	json.Indent(&b, []byte(serialized), "", "  ")
 	if got, want := string(bs), b.String(); got != want {
 		t.Error("json serialization doesn't roundtrip")
+	}
+}
+
+func TestSealViaSharedKey(t *testing.T) {
+	// encrypt a message from a to b
+	a := NewMachine()
+	b := NewMachine()
+	apub, bpub := a.Public(), b.Public()
+
+	shared := a.SharedKey(bpub)
+
+	const clear = "the eagle flies at midnight"
+	enc := shared.Seal([]byte(clear))
+
+	back, ok := b.OpenFrom(apub, enc)
+	if !ok {
+		t.Fatal("failed to decrypt")
+	}
+	if string(back) != clear {
+		t.Errorf("OpenFrom got %q; want cleartext %q", back, clear)
+	}
+
+	backShared, ok := shared.Open(enc)
+	if !ok {
+		t.Fatal("failed to decrypt from shared key")
+	}
+	if string(backShared) != clear {
+		t.Errorf("Open got %q; want cleartext %q", back, clear)
 	}
 }

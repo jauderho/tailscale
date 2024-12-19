@@ -1,10 +1,11 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestUrlOfListenAddr(t *testing.T) {
 	tests := []struct {
@@ -35,9 +36,9 @@ func TestUrlOfListenAddr(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			url := urlOfListenAddr(tt.in)
-			if url != tt.want {
-				t.Errorf("expected url: %q, got: %q", tt.want, url)
+			u := urlOfListenAddr(tt.in)
+			if u != tt.want {
+				t.Errorf("expected url: %q, got: %q", tt.want, u)
 			}
 		})
 	}

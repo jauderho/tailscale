@@ -1,58 +1,97 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"math/rand"
 	"net"
 	"net/http"
-	"runtime"
+	"net/netip"
+	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	dns "golang.org/x/net/dns/dnsmessage"
-	"inet.af/netaddr"
-	"tailscale.com/hostinfo"
+	"tailscale.com/control/controlknobs"
+	"tailscale.com/envknob"
+	"tailscale.com/health"
+	"tailscale.com/net/dns/publicdns"
+	"tailscale.com/net/dnscache"
 	"tailscale.com/net/neterror"
-	"tailscale.com/net/netns"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/sockstats"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/nettype"
+	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/wgengine/monitor"
+	"tailscale.com/util/race"
+	"tailscale.com/version"
 )
 
 // headerBytes is the number of bytes in a DNS message header.
 const headerBytes = 12
 
-const (
-	// responseTimeout is the maximal amount of time to wait for a DNS response.
-	responseTimeout = 5 * time.Second
+// dnsFlagTruncated is set in the flags word when the packet is truncated.
+const dnsFlagTruncated = 0x200
 
-	// dohTransportTimeout is how long to keep idle HTTP
-	// connections open to DNS-over-HTTPs servers. This is pretty
-	// arbitrary.
-	dohTransportTimeout = 30 * time.Second
+// truncatedFlagSet returns true if the DNS packet signals that it has
+// been truncated. False is also returned if the packet was too small
+// to be valid.
+func truncatedFlagSet(pkt []byte) bool {
+	if len(pkt) < headerBytes {
+		return false
+	}
+	return (binary.BigEndian.Uint16(pkt[2:4]) & dnsFlagTruncated) != 0
+}
+
+const (
+	// dohIdleConnTimeout is how long to keep idle HTTP connections
+	// open to DNS-over-HTTPS servers. 10 seconds is a sensible
+	// default, as it's long enough to handle a burst of queries
+	// coming in a row, but short enough to not keep idle connections
+	// open for too long. In theory, idle connections could be kept
+	// open for a long time without any battery impact as no traffic
+	// is supposed to be flowing on them.
+	// However, in practice, DoH servers will send TCP keepalives (e.g.
+	// NextDNS sends them every ~10s). Handling these keepalives
+	// wakes up the modem, and that uses battery. Therefore, we keep
+	// the idle timeout low enough to allow idle connections to be
+	// closed during an extended period with no DNS queries, killing
+	// keepalive network activity.
+	dohIdleConnTimeout = 10 * time.Second
+
+	// dohTransportTimeout is how much of a head start to give a DoH query
+	// that was upgraded from a well-known public DNS provider's IP before
+	// normal UDP mode is attempted as a fallback.
+	dohHeadStart = 500 * time.Millisecond
 
 	// wellKnownHostBackupDelay is how long to artificially delay upstream
 	// DNS queries to the "fallback" DNS server IP for a known provider
 	// (e.g. how long to wait to query Google's 8.8.4.4 after 8.8.8.8).
 	wellKnownHostBackupDelay = 200 * time.Millisecond
-)
 
-var errNoUpstreams = errors.New("upstream nameservers not set")
+	// udpRaceTimeout is the timeout after which we will start a DNS query
+	// over TCP while waiting for the UDP query to complete.
+	udpRaceTimeout = 2 * time.Second
+
+	// tcpQueryTimeout is the timeout for a DNS query performed over TCP.
+	// It matches the default 5sec timeout of the 'dig' utility.
+	tcpQueryTimeout = 5 * time.Second
+)
 
 // txid identifies a DNS transaction.
 //
@@ -139,6 +178,23 @@ func clampEDNSSize(packet []byte, maxSize uint16) {
 	binary.BigEndian.PutUint16(opt[3:5], maxSize)
 }
 
+// dnsForwarderFailing should be raised when the forwarder is unable to reach the
+// upstream resolvers. This is a high severity warning as it results in "no internet".
+// This warning must be cleared when the forwarder is working again.
+//
+// We allow for 5 second grace period to ensure this is not raised for spurious errors
+// under the assumption that DNS queries are relatively frequent and a subsequent
+// successful query will clear any one-off errors.
+var dnsForwarderFailing = health.Register(&health.Warnable{
+	Code:                "dns-forward-failing",
+	Title:               "DNS unavailable",
+	Severity:            health.SeverityMedium,
+	DependsOn:           []*health.Warnable{health.NetworkStatusWarnable},
+	Text:                health.StaticMessage("Tailscale can't reach the configured DNS servers. Internet connectivity may be affected."),
+	ImpactsConnectivity: true,
+	TimeToVisible:       15 * time.Second,
+})
+
 type route struct {
 	Suffix    dnsname.FQDN
 	Resolvers []resolverAndDelay
@@ -148,7 +204,7 @@ type route struct {
 // long to wait before querying it.
 type resolverAndDelay struct {
 	// name is the upstream resolver.
-	name dnstype.Resolver
+	name *dnstype.Resolver
 
 	// startDelay is an amount to delay this resolver at
 	// start. It's used when, say, there are four Google or
@@ -160,16 +216,15 @@ type resolverAndDelay struct {
 // forwarder forwards DNS packets to a number of upstream nameservers.
 type forwarder struct {
 	logf    logger.Logf
-	linkMon *monitor.Mon
-	linkSel ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absords it
+	netMon  *netmon.Monitor     // always non-nil
+	linkSel ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absorbs it
 	dialer  *tsdial.Dialer
-	dohSem  chan struct{}
+	health  *health.Tracker // always non-nil
+
+	controlKnobs *controlknobs.Knobs // or nil
 
 	ctx       context.Context    // good until Close
 	ctxCancel context.CancelFunc // closes ctx
-
-	// responses is a channel by which responses are returned.
-	responses chan packet
 
 	mu sync.Mutex // guards following
 
@@ -178,44 +233,36 @@ type forwarder struct {
 	// routes are per-suffix resolvers to use, with
 	// the most specific routes first.
 	routes []route
+	// cloudHostFallback are last resort resolvers to use if no per-suffix
+	// resolver matches. These are only populated on cloud hosts where the
+	// platform provides a well-known recursive resolver.
+	//
+	// That is, if we're running on GCP or AWS where there's always a well-known
+	// IP of a recursive resolver, return that rather than having callers return
+	// SERVFAIL. This fixes both normal 100.100.100.100 resolution when
+	// /etc/resolv.conf is missing/corrupt, and the peerapi ExitDNS stub
+	// resolver lookup.
+	cloudHostFallback []resolverAndDelay
+
+	// missingUpstreamRecovery, if non-nil, is set called when a SERVFAIL is
+	// returned due to missing upstream resolvers.
+	//
+	// This should attempt to properly (re)set the upstream resolvers.
+	missingUpstreamRecovery func()
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-func maxDoHInFlight(goos string) int {
-	if goos != "ios" {
-		return 1000 // effectively unlimited
+func newForwarder(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs) *forwarder {
+	if netMon == nil {
+		panic("nil netMon")
 	}
-	// iOS <  15 limits the memory to 15MB for NetworkExtensions.
-	// iOS >= 15 gives us 50MB.
-	// See: https://tailscale.com/blog/go-linker/
-	ver := hostinfo.GetOSVersion()
-	if ver == "" {
-		// Unknown iOS version, be cautious.
-		return 10
-	}
-	idx := strings.Index(ver, ".")
-	if idx == -1 {
-		// Unknown iOS version, be cautious.
-		return 10
-	}
-	major := ver[:idx]
-	if m, err := strconv.Atoi(major); err != nil || m < 15 {
-		return 10
-	}
-	return 1000
-}
-
-func newForwarder(logf logger.Logf, responses chan packet, linkMon *monitor.Mon, linkSel ForwardLinkSelector, dialer *tsdial.Dialer) *forwarder {
 	f := &forwarder{
-		logf:      logger.WithPrefix(logf, "forward: "),
-		linkMon:   linkMon,
-		linkSel:   linkSel,
-		dialer:    dialer,
-		responses: responses,
-		dohSem:    make(chan struct{}, maxDoHInFlight(runtime.GOOS)),
+		logf:                    logger.WithPrefix(logf, "forward: "),
+		netMon:                  netMon,
+		linkSel:                 linkSel,
+		dialer:                  dialer,
+		health:                  health,
+		controlKnobs:            knobs,
+		missingUpstreamRecovery: func() {},
 	}
 	f.ctx, f.ctxCancel = context.WithCancel(context.Background())
 	return f
@@ -226,81 +273,117 @@ func (f *forwarder) Close() error {
 	return nil
 }
 
-// resolversWithDelays maps from a set of DNS server names to a slice of
-// a type that included a startDelay. So if resolvers contains e.g. four
-// Google DNS IPs (two IPv4 + twoIPv6), this function partition adds
-// delays to some.
-func resolversWithDelays(resolvers []dnstype.Resolver) []resolverAndDelay {
+// resolversWithDelays maps from a set of DNS server names to a slice of a type
+// that included a startDelay, upgrading any well-known DoH (DNS-over-HTTP)
+// servers in the process, insert a DoH lookup first before UDP fallbacks.
+func resolversWithDelays(resolvers []*dnstype.Resolver) []resolverAndDelay {
+	rr := make([]resolverAndDelay, 0, len(resolvers)+2)
+
+	type dohState uint8
+	const addedDoH = dohState(1)
+	const addedDoHAndDontAddUDP = dohState(2)
+
+	// Add the known DoH ones first, starting immediately.
+	didDoH := map[string]dohState{}
+	for _, r := range resolvers {
+		ipp, ok := r.IPPort()
+		if !ok {
+			continue
+		}
+		dohBase, dohOnly, ok := publicdns.DoHEndpointFromIP(ipp.Addr())
+		if !ok || didDoH[dohBase] != 0 {
+			continue
+		}
+		if dohOnly {
+			didDoH[dohBase] = addedDoHAndDontAddUDP
+		} else {
+			didDoH[dohBase] = addedDoH
+		}
+		rr = append(rr, resolverAndDelay{name: &dnstype.Resolver{Addr: dohBase}})
+	}
+
 	type hostAndFam struct {
 		host string // some arbitrary string representing DNS host (currently the DoH base)
 		bits uint8  // either 32 or 128 for IPv4 vs IPv6s address family
 	}
-
-	// Track how many of each known resolver host are in the list,
-	// per address family.
-	total := map[hostAndFam]int{}
-
-	rr := make([]resolverAndDelay, len(resolvers))
-	for _, r := range resolvers {
-		if ip, err := netaddr.ParseIP(r.Addr); err == nil {
-			if host, ok := knownDoH[ip]; ok {
-				total[hostAndFam{host, ip.BitLen()}]++
-			}
-		}
-	}
-
 	done := map[hostAndFam]int{}
-	for i, r := range resolvers {
-		var startDelay time.Duration
-		if ip, err := netaddr.ParseIP(r.Addr); err == nil {
-			if host, ok := knownDoH[ip]; ok {
-				key4 := hostAndFam{host, 32}
-				key6 := hostAndFam{host, 128}
-				switch {
-				case ip.Is4():
-					if done[key4] > 0 {
-						startDelay += wellKnownHostBackupDelay
-					}
-				case ip.Is6():
-					total4 := total[key4]
-					if total4 >= 2 {
-						// If we have two IPv4 IPs of the same provider
-						// already in the set, delay the IPv6 queries
-						// until halfway through the timeout (so wait
-						// 2.5 seconds). Even the network is IPv6-only,
-						// the DoH dialer will fallback to IPv6
-						// immediately anyway.
-						startDelay = responseTimeout / 2
-					} else if total4 == 1 {
-						startDelay += wellKnownHostBackupDelay
-					}
-					if done[key6] > 0 {
-						startDelay += wellKnownHostBackupDelay
-					}
-				}
-				done[hostAndFam{host, ip.BitLen()}]++
-			}
+	for _, r := range resolvers {
+		ipp, ok := r.IPPort()
+		if !ok {
+			// Pass non-IP ones through unchanged, without delay.
+			// (e.g. DNS-over-ExitDNS when using an exit node)
+			rr = append(rr, resolverAndDelay{name: r})
+			continue
 		}
-		rr[i] = resolverAndDelay{
+		ip := ipp.Addr()
+		var startDelay time.Duration
+		if host, _, ok := publicdns.DoHEndpointFromIP(ip); ok {
+			if didDoH[host] == addedDoHAndDontAddUDP {
+				continue
+			}
+			// We already did the DoH query early. These
+			// are for normal dns53 UDP queries.
+			startDelay = dohHeadStart
+			key := hostAndFam{host, uint8(ip.BitLen())}
+			if done[key] > 0 {
+				startDelay += wellKnownHostBackupDelay
+			}
+			done[key]++
+		}
+		rr = append(rr, resolverAndDelay{
 			name:       r,
 			startDelay: startDelay,
-		}
+		})
 	}
 	return rr
+}
+
+var (
+	cloudResolversOnce sync.Once
+	cloudResolversLazy []resolverAndDelay
+)
+
+func cloudResolvers() []resolverAndDelay {
+	cloudResolversOnce.Do(func() {
+		if ip := cloudenv.Get().ResolverIP(); ip != "" {
+			cloudResolver := []*dnstype.Resolver{{Addr: ip}}
+			cloudResolversLazy = resolversWithDelays(cloudResolver)
+		}
+	})
+	return cloudResolversLazy
 }
 
 // setRoutes sets the routes to use for DNS forwarding. It's called by
 // Resolver.SetConfig on reconfig.
 //
 // The memory referenced by routesBySuffix should not be modified.
-func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]dnstype.Resolver) {
+func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]*dnstype.Resolver) {
 	routes := make([]route, 0, len(routesBySuffix))
+
+	cloudHostFallback := cloudResolvers()
 	for suffix, rs := range routesBySuffix {
-		routes = append(routes, route{
-			Suffix:    suffix,
-			Resolvers: resolversWithDelays(rs),
-		})
+		if suffix == "." && len(rs) == 0 && len(cloudHostFallback) > 0 {
+			routes = append(routes, route{
+				Suffix:    suffix,
+				Resolvers: cloudHostFallback,
+			})
+		} else {
+			routes = append(routes, route{
+				Suffix:    suffix,
+				Resolvers: resolversWithDelays(rs),
+			})
+		}
 	}
+
+	if cloudenv.Get().HasInternalTLD() && len(cloudHostFallback) > 0 {
+		if _, ok := routesBySuffix["internal."]; !ok {
+			routes = append(routes, route{
+				Suffix:    "internal.",
+				Resolvers: cloudHostFallback,
+			})
+		}
+	}
+
 	// Sort from longest prefix to shortest.
 	sort.Slice(routes, func(i, j int) bool {
 		return routes[i].Suffix.NumLabels() > routes[j].Suffix.NumLabels()
@@ -309,15 +392,12 @@ func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]dnstype.Resolver
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.routes = routes
+	f.cloudHostFallback = cloudHostFallback
 }
 
-var stdNetPacketListener packetListener = new(net.ListenConfig)
+var stdNetPacketListener nettype.PacketListenerWithNetIP = nettype.MakePacketListenerWithNetIP(new(net.ListenConfig))
 
-type packetListener interface {
-	ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error)
-}
-
-func (f *forwarder) packetListener(ip netaddr.IP) (packetListener, error) {
+func (f *forwarder) packetListener(ip netip.Addr) (nettype.PacketListenerWithNetIP, error) {
 	if f.linkSel == nil || initListenConfig == nil {
 		return stdNetPacketListener, nil
 	}
@@ -326,80 +406,78 @@ func (f *forwarder) packetListener(ip netaddr.IP) (packetListener, error) {
 		return stdNetPacketListener, nil
 	}
 	lc := new(net.ListenConfig)
-	if err := initListenConfig(lc, f.linkMon, linkName); err != nil {
+	if err := initListenConfig(lc, f.netMon, linkName); err != nil {
 		return nil, err
 	}
-	return lc, nil
+	return nettype.MakePacketListenerWithNetIP(lc), nil
 }
 
-func (f *forwarder) getKnownDoHClient(ip netaddr.IP) (urlBase string, c *http.Client, ok bool) {
-	urlBase, ok = knownDoH[ip]
-	if !ok {
-		return
-	}
-
+// getKnownDoHClientForProvider returns an HTTP client for a specific DoH
+// provider named by its DoH base URL (like "https://dns.google/dns-query").
+//
+// The returned client race/Happy Eyeballs dials all IPs for urlBase (usually
+// 4), as statically known by the publicdns package.
+func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c, ok := f.dohClient[urlBase]; ok {
-		return urlBase, c, true
+		return c, true
 	}
-	if f.dohClient == nil {
-		f.dohClient = map[string]*http.Client{}
+	allIPs := publicdns.DoHIPsOfBase(urlBase)
+	if len(allIPs) == 0 {
+		return nil, false
 	}
-	nsDialer := netns.NewDialer(f.logf)
+	dohURL, err := url.Parse(urlBase)
+	if err != nil {
+		return nil, false
+	}
+
+	dialer := dnscache.Dialer(f.getDialerType(), &dnscache.Resolver{
+		SingleHost:             dohURL.Hostname(),
+		SingleHostStaticResult: allIPs,
+		Logf:                   f.logf,
+	})
+	tlsConfig := &tls.Config{
+		// Enforce TLS 1.3, as all of our supported DNS-over-HTTPS servers are compatible with it
+		// (see tailscale.com/net/dns/publicdns/publicdns.go).
+		MinVersion: tls.VersionTLS13,
+	}
 	c = &http.Client{
 		Transport: &http.Transport{
-			IdleConnTimeout: dohTransportTimeout,
+			ForceAttemptHTTP2: true,
+			IdleConnTimeout:   dohIdleConnTimeout,
+			// On mobile platforms TCP KeepAlive is disabled in the dialer,
+			// ensure that we timeout if the connection appears to be hung.
+			ResponseHeaderTimeout: 10 * time.Second,
+			MaxIdleConnsPerHost:   1,
 			DialContext: func(ctx context.Context, netw, addr string) (net.Conn, error) {
 				if !strings.HasPrefix(netw, "tcp") {
 					return nil, fmt.Errorf("unexpected network %q", netw)
 				}
-				c, err := nsDialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), "443"))
-				// If v4 failed, try an equivalent v6 also in the time remaining.
-				if err != nil && ctx.Err() == nil {
-					if ip6, ok := dohV6(urlBase); ok && ip.Is4() {
-						if c6, err := nsDialer.DialContext(ctx, "tcp", net.JoinHostPort(ip6.String(), "443")); err == nil {
-							return c6, nil
-						}
-					}
-				}
-				return c, err
+				return dialer(ctx, netw, addr)
 			},
+			TLSClientConfig: tlsConfig,
 		},
 	}
+	if f.dohClient == nil {
+		f.dohClient = map[string]*http.Client{}
+	}
 	f.dohClient[urlBase] = c
-	return urlBase, c, true
+	return c, true
 }
 
 const dohType = "application/dns-message"
 
-func (f *forwarder) releaseDoHSem() { <-f.dohSem }
-
 func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client, packet []byte) ([]byte, error) {
-	// Bound the number of HTTP requests in flight. This primarily
-	// matters for iOS where we're very memory constrained and
-	// HTTP requests are heavier on iOS where we don't include
-	// HTTP/2 for binary size reasons (as binaries on iOS linked
-	// with Go code cost memory proportional to the binary size,
-	// for reasons not fully understood).
-	select {
-	case f.dohSem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	defer f.releaseDoHSem()
-
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDNSForwarderDoH, f.logf)
 	metricDNSFwdDoH.Add(1)
 	req, err := http.NewRequestWithContext(ctx, "POST", urlBase, bytes.NewReader(packet))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", dohType)
-	// Note: we don't currently set the Accept header (which is
-	// only a SHOULD in the spec) as iOS doesn't use HTTP/2 and
-	// we'd rather save a few bytes on outgoing requests when
-	// empirically no provider cares about the Accept header's
-	// absence.
+	req.Header.Set("Accept", dohType)
+	req.Header.Set("User-Agent", "tailscaled/"+version.Long())
 
 	hres, err := c.Do(req)
 	if err != nil {
@@ -409,55 +487,183 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 	defer hres.Body.Close()
 	if hres.StatusCode != 200 {
 		metricDNSFwdDoHErrorStatus.Add(1)
+		if hres.StatusCode/100 == 5 {
+			// Translate 5xx HTTP server errors into SERVFAIL DNS responses.
+			return nil, fmt.Errorf("%w: %s", errServerFailure, hres.Status)
+		}
 		return nil, errors.New(hres.Status)
 	}
 	if ct := hres.Header.Get("Content-Type"); ct != dohType {
 		metricDNSFwdDoHErrorCT.Add(1)
 		return nil, fmt.Errorf("unexpected response Content-Type %q", ct)
 	}
-	res, err := ioutil.ReadAll(hres.Body)
+	res, err := io.ReadAll(hres.Body)
 	if err != nil {
 		metricDNSFwdDoHErrorBody.Add(1)
+	}
+	if truncatedFlagSet(res) {
+		metricDNSFwdTruncated.Add(1)
 	}
 	return res, err
 }
 
+var (
+	verboseDNSForward = envknob.RegisterBool("TS_DEBUG_DNS_FORWARD_SEND")
+	skipTCPRetry      = envknob.RegisterBool("TS_DNS_FORWARD_SKIP_TCP_RETRY")
+
+	// For correlating log messages in the send() function; only used when
+	// verboseDNSForward() is true.
+	forwarderCount atomic.Uint64
+)
+
 // send sends packet to dst. It is best effort.
 //
 // send expects the reply to have the same txid as txidOut.
-func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) ([]byte, error) {
+func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
+	if verboseDNSForward() {
+		id := forwarderCount.Add(1)
+		domain, typ, _ := nameFromQuery(fq.packet)
+		f.logf("forwarder.send(%q, %d, %v, %d) [%d] ...", rr.name.Addr, fq.txid, typ, len(domain), id)
+		defer func() {
+			f.logf("forwarder.send(%q, %d, %v, %d) [%d] = %v, %v", rr.name.Addr, fq.txid, typ, len(domain), id, len(ret), err)
+		}()
+	}
 	if strings.HasPrefix(rr.name.Addr, "http://") {
 		return f.sendDoH(ctx, rr.name.Addr, f.dialer.PeerAPIHTTPClient(), fq.packet)
 	}
 	if strings.HasPrefix(rr.name.Addr, "https://") {
+		// Only known DoH providers are supported currently. Specifically, we
+		// only support DoH providers where we can TCP connect to them on port
+		// 443 at the same IP address they serve normal UDP DNS from (1.1.1.1,
+		// 8.8.8.8, 9.9.9.9, etc.) That's why OpenDNS and custom DoH providers
+		// aren't currently supported. There's no backup DNS resolution path for
+		// them.
+		urlBase := rr.name.Addr
+		if hc, ok := f.getKnownDoHClientForProvider(urlBase); ok {
+			return f.sendDoH(ctx, urlBase, hc, fq.packet)
+		}
 		metricDNSFwdErrorType.Add(1)
-		return nil, fmt.Errorf("https:// resolvers not supported yet")
+		return nil, fmt.Errorf("arbitrary https:// resolvers not supported yet")
 	}
 	if strings.HasPrefix(rr.name.Addr, "tls://") {
 		metricDNSFwdErrorType.Add(1)
 		return nil, fmt.Errorf("tls:// resolvers not supported yet")
 	}
-	ipp, err := netaddr.ParseIPPort(rr.name.Addr)
-	if err != nil {
-		return nil, err
-	}
 
-	// Upgrade known DNS IPs to DoH (DNS-over-HTTPs).
-	// All known DoH is over port 53.
-	if urlBase, dc, ok := f.getKnownDoHClient(ipp.IP()); ok {
-		res, err := f.sendDoH(ctx, urlBase, dc, fq.packet)
-		if err == nil || ctx.Err() != nil {
-			return res, err
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	isUDPQuery := fq.family == "udp"
+	skipTCP := skipTCPRetry() || (f.controlKnobs != nil && f.controlKnobs.DisableDNSForwarderTCPRetries.Load())
+
+	// Print logs about retries if this was because of a truncated response.
+	var explicitRetry atomic.Bool // true if truncated UDP response retried
+	defer func() {
+		if !explicitRetry.Load() {
+			return
 		}
-		f.logf("DoH error from %v: %v", ipp.IP(), err)
+		if err == nil {
+			f.logf("forwarder.send(%q): successfully retried via TCP", rr.name.Addr)
+		} else {
+			f.logf("forwarder.send(%q): could not retry via TCP: %v", rr.name.Addr, err)
+		}
+	}()
+
+	firstUDP := func(ctx context.Context) ([]byte, error) {
+		resp, err := f.sendUDP(ctx, fq, rr)
+		if err != nil {
+			return nil, err
+		}
+		if !truncatedFlagSet(resp) {
+			// Successful, non-truncated response; no retry.
+			return resp, nil
+		}
+
+		// If this is a UDP query, return it regardless of whether the
+		// response is truncated or not; the client can retry
+		// communicating with tailscaled over TCP. There's no point
+		// falling back to TCP for a truncated query if we can't return
+		// the results to the client.
+		if isUDPQuery {
+			return resp, nil
+		}
+
+		if skipTCP {
+			// Envknob or control knob disabled the TCP retry behaviour;
+			// just return what we have.
+			return resp, nil
+		}
+
+		// This is a TCP query from the client, and the UDP response
+		// from the upstream DNS server is truncated; map this to an
+		// error to cause our retry helper to immediately kick off the
+		// TCP retry.
+		explicitRetry.Store(true)
+		return nil, truncatedResponseError{resp}
+	}
+	thenTCP := func(ctx context.Context) ([]byte, error) {
+		// If we're skipping the TCP fallback, then wait until the
+		// context is canceled and return that error (i.e. not
+		// returning anything).
+		if skipTCP {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+
+		return f.sendTCP(ctx, fq, rr)
 	}
 
+	// If the input query is TCP, then don't have a timeout between
+	// starting UDP and TCP.
+	timeout := udpRaceTimeout
+	if !isUDPQuery {
+		timeout = 0
+	}
+
+	// Kick off the race between the UDP and TCP queries.
+	rh := race.New(timeout, firstUDP, thenTCP)
+	resp, err := rh.Start(ctx)
+	if err == nil {
+		return resp, nil
+	}
+
+	// If we got a truncated UDP response, return that instead of an error.
+	var trErr truncatedResponseError
+	if errors.As(err, &trErr) {
+		return trErr.res, nil
+	}
+	return nil, err
+}
+
+type truncatedResponseError struct {
+	res []byte
+}
+
+func (tr truncatedResponseError) Error() string { return "response truncated" }
+
+var errServerFailure = errors.New("response code indicates server issue")
+var errTxIDMismatch = errors.New("txid doesn't match")
+
+func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
+	ipp, ok := rr.name.IPPort()
+	if !ok {
+		metricDNSFwdErrorType.Add(1)
+		return nil, fmt.Errorf("unrecognized resolver type %q", rr.name.Addr)
+	}
 	metricDNSFwdUDP.Add(1)
-	ln, err := f.packetListener(ipp.IP())
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDNSForwarderUDP, f.logf)
+
+	ln, err := f.packetListener(ipp.Addr())
 	if err != nil {
 		return nil, err
 	}
-	conn, err := ln.ListenPacket(ctx, "udp", ":0")
+
+	// Specify the exact UDP family to work around https://github.com/golang/go/issues/52264
+	udpFam := "udp4"
+	if ipp.Addr().Is6() {
+		udpFam = "udp6"
+	}
+	conn, err := ln.ListenPacket(ctx, udpFam, ":0")
 	if err != nil {
 		f.logf("ListenPacket failed: %v", err)
 		return nil, err
@@ -467,7 +673,7 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 	fq.closeOnCtxDone.Add(conn)
 	defer fq.closeOnCtxDone.Remove(conn)
 
-	if _, err := conn.WriteTo(fq.packet, ipp.UDPAddr()); err != nil {
+	if _, err := conn.WriteToUDPAddrPort(fq.packet, ipp); err != nil {
 		metricDNSFwdUDPErrorWrite.Add(1)
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -478,7 +684,7 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 
 	// The 1 extra byte is to detect packet truncation.
 	out := make([]byte, maxResponseBytes+1)
-	n, _, err := conn.ReadFrom(out)
+	n, _, err := conn.ReadFromUDPAddrPort(out)
 	if err != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -501,18 +707,18 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 	txid := getTxID(out)
 	if txid != fq.txid {
 		metricDNSFwdUDPErrorTxID.Add(1)
-		return nil, errors.New("txid doesn't match")
+		return nil, errTxIDMismatch
 	}
 	rcode := getRCode(out)
 	// don't forward transient errors back to the client when the server fails
 	if rcode == dns.RCodeServerFailure {
 		f.logf("recv: response code indicating server failure: %d", rcode)
 		metricDNSFwdUDPErrorServer.Add(1)
-		return nil, errors.New("response code indicates server issue")
+		return nil, errServerFailure
 	}
 
 	if truncated {
-		const dnsFlagTruncated = 0x200
+		// Set the truncated bit if it wasn't already.
 		flags := binary.BigEndian.Uint16(out[2:4])
 		flags |= dnsFlagTruncated
 		binary.BigEndian.PutUint16(out[2:4], flags)
@@ -524,8 +730,115 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 		// best we can do.
 	}
 
+	if truncatedFlagSet(out) {
+		metricDNSFwdTruncated.Add(1)
+	}
+
 	clampEDNSSize(out, maxResponseBytes)
 	metricDNSFwdUDPSuccess.Add(1)
+	return out, nil
+}
+
+func (f *forwarder) getDialerType() dnscache.DialContextFunc {
+	if f.controlKnobs != nil && f.controlKnobs.UserDialUseRoutes.Load() {
+		// It is safe to use UserDial as it dials external servers without going through Tailscale
+		// and closes connections on interface change in the same way as SystemDial does,
+		// thus preventing DNS resolution issues when switching between WiFi and cellular,
+		// but can also dial an internal DNS server on the Tailnet or via a subnet router.
+		//
+		// TODO(nickkhyl): Update tsdial.Dialer to reuse the bart.Table we create in net/tstun.Wrapper
+		// to avoid having two bart tables in memory, especially on iOS. Once that's done,
+		// we can get rid of the nodeAttr/control knob and always use UserDial for DNS.
+		//
+		// See https://github.com/tailscale/tailscale/issues/12027.
+		return f.dialer.UserDial
+	}
+	return f.dialer.SystemDial
+}
+
+func (f *forwarder) sendTCP(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
+	ipp, ok := rr.name.IPPort()
+	if !ok {
+		metricDNSFwdErrorType.Add(1)
+		return nil, fmt.Errorf("unrecognized resolver type %q", rr.name.Addr)
+	}
+	metricDNSFwdTCP.Add(1)
+	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDNSForwarderTCP, f.logf)
+
+	// Specify the exact family to work around https://github.com/golang/go/issues/52264
+	tcpFam := "tcp4"
+	if ipp.Addr().Is6() {
+		tcpFam = "tcp6"
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, tcpQueryTimeout)
+	defer cancel()
+
+	conn, err := f.getDialerType()(ctx, tcpFam, ipp.String())
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	fq.closeOnCtxDone.Add(conn)
+	defer fq.closeOnCtxDone.Remove(conn)
+
+	ctxOrErr := func(err2 error) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, err2
+	}
+
+	// Write the query to the server.
+	query := make([]byte, len(fq.packet)+2)
+	binary.BigEndian.PutUint16(query, uint16(len(fq.packet)))
+	copy(query[2:], fq.packet)
+	if _, err := conn.Write(query); err != nil {
+		metricDNSFwdTCPErrorWrite.Add(1)
+		return ctxOrErr(err)
+	}
+
+	metricDNSFwdTCPWrote.Add(1)
+
+	// Read the header length back from the server
+	var length uint16
+	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+		metricDNSFwdTCPErrorRead.Add(1)
+		return ctxOrErr(err)
+	}
+
+	// Now read the response
+	out := make([]byte, length)
+	n, err := io.ReadFull(conn, out)
+	if err != nil {
+		metricDNSFwdTCPErrorRead.Add(1)
+		return ctxOrErr(err)
+	}
+
+	if n < int(length) {
+		f.logf("sendTCP: packet too small (%d bytes)", n)
+		return nil, io.ErrUnexpectedEOF
+	}
+	out = out[:n]
+	txid := getTxID(out)
+	if txid != fq.txid {
+		metricDNSFwdTCPErrorTxID.Add(1)
+		return nil, errTxIDMismatch
+	}
+
+	rcode := getRCode(out)
+
+	// don't forward transient errors back to the client when the server fails
+	if rcode == dns.RCodeServerFailure {
+		f.logf("sendTCP: response code indicating server failure: %d", rcode)
+		metricDNSFwdTCPErrorServer.Add(1)
+		return nil, errServerFailure
+	}
+
+	// TODO(andrew): do we need to do this?
+	//clampEDNSSize(out, maxResponseBytes)
+	metricDNSFwdTCPSuccess.Add(1)
 	return out, nil
 }
 
@@ -533,13 +846,25 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 func (f *forwarder) resolvers(domain dnsname.FQDN) []resolverAndDelay {
 	f.mu.Lock()
 	routes := f.routes
+	cloudHostFallback := f.cloudHostFallback
 	f.mu.Unlock()
 	for _, route := range routes {
 		if route.Suffix == "." || route.Suffix.Contains(domain) {
 			return route.Resolvers
 		}
 	}
-	return nil
+	return cloudHostFallback // or nil if no fallback
+}
+
+// GetUpstreamResolvers returns the resolvers that would be used to resolve
+// the given FQDN.
+func (f *forwarder) GetUpstreamResolvers(name dnsname.FQDN) []*dnstype.Resolver {
+	resolvers := f.resolvers(name)
+	upstreamResolvers := make([]*dnstype.Resolver, 0, len(resolvers))
+	for _, r := range resolvers {
+		upstreamResolvers = append(upstreamResolvers, r.name)
+	}
+	return upstreamResolvers
 }
 
 // forwardQuery is information and state about a forwarded DNS query that's
@@ -552,6 +877,7 @@ func (f *forwarder) resolvers(domain dnsname.FQDN) []resolverAndDelay {
 type forwardQuery struct {
 	txid   txid
 	packet []byte
+	family string // "tcp" or "udp"
 
 	// closeOnCtxDone lets send register values to Close if the
 	// caller's ctx expires. This avoids send from allocating its
@@ -566,17 +892,6 @@ type forwardQuery struct {
 	// ...
 }
 
-// forward forwards the query to all upstream nameservers and waits for
-// the first response.
-//
-// It either sends to f.responses and returns nil, or returns a
-// non-nil error (without sending to the channel).
-func (f *forwarder) forward(query packet) error {
-	ctx, cancel := context.WithTimeout(f.ctx, responseTimeout)
-	defer cancel()
-	return f.forwardWithDestChan(ctx, query, f.responses)
-}
-
 // forwardWithDestChan forwards the query to all upstream nameservers
 // and waits for the first response.
 //
@@ -587,11 +902,15 @@ func (f *forwarder) forward(query packet) error {
 // node DNS proxy queries), otherwise f.resolvers is used.
 func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, responseChan chan<- packet, resolvers ...resolverAndDelay) error {
 	metricDNSFwd.Add(1)
-	domain, err := nameFromQuery(query.bs)
+	domain, typ, err := nameFromQuery(query.bs)
 	if err != nil {
 		metricDNSFwdErrorName.Add(1)
 		return err
 	}
+
+	// Guarantee that the ctx we use below is done when this function returns.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// Drop DNS service discovery spam, primarily for battery life
 	// on mobile.  Things like Spotify on iOS generate this traffic,
@@ -601,18 +920,17 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 		metricDNSFwdDropBonjour.Add(1)
 		res, err := nxDomainResponse(query)
 		if err != nil {
-			f.logf("error parsing bonjour query: %v", err)
-			return nil
+			return err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("waiting to send NXDOMAIN: %w", ctx.Err())
 		case responseChan <- res:
 			return nil
 		}
 	}
 
-	if fl, ok := fwdLogAtomic.Load().(*fwdLog); ok {
+	if fl := fwdLogAtomic.Load(); fl != nil {
 		fl.addName(string(domain))
 	}
 
@@ -622,23 +940,47 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 		resolvers = f.resolvers(domain)
 		if len(resolvers) == 0 {
 			metricDNSFwdErrorNoUpstream.Add(1)
-			return errNoUpstreams
+			f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: ""})
+			f.logf("no upstream resolvers set, returning SERVFAIL")
+
+			// Attempt to recompile the DNS configuration
+			// If we are being asked to forward queries and we have no
+			// nameservers, the network is in a bad state.
+			if f.missingUpstreamRecovery != nil {
+				f.missingUpstreamRecovery()
+			}
+
+			res, err := servfailResponse(query)
+			if err != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("waiting to send SERVFAIL: %w", ctx.Err())
+			case responseChan <- res:
+				return nil
+			}
+		} else {
+			f.health.SetHealthy(dnsForwarderFailing)
 		}
 	}
 
 	fq := &forwardQuery{
 		txid:           getTxID(query.bs),
 		packet:         query.bs,
+		family:         query.family,
 		closeOnCtxDone: new(closePool),
 	}
 	defer fq.closeOnCtxDone.Close()
 
-	resc := make(chan []byte, 1)
-	var (
-		mu       sync.Mutex
-		firstErr error
-	)
+	if verboseDNSForward() {
+		domainSha256 := sha256.Sum256([]byte(domain))
+		domainSig := base64.RawStdEncoding.EncodeToString(domainSha256[:3])
+		f.logf("request(%d, %v, %d, %s) %d...", fq.txid, typ, len(domain), domainSig, len(fq.packet))
+	}
 
+	resc := make(chan []byte, 1) // it's fine buffered or not
+	errc := make(chan error, 1)  // it's fine buffered or not too
 	for i := range resolvers {
 		go func(rr *resolverAndDelay) {
 			if rr.startDelay > 0 {
@@ -652,63 +994,114 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			}
 			resb, err := f.send(ctx, fq, *rr)
 			if err != nil {
-				mu.Lock()
-				defer mu.Unlock()
-				if firstErr == nil {
-					firstErr = err
+				err = fmt.Errorf("resolving using %q: %w", rr.name.Addr, err)
+				select {
+				case errc <- err:
+				case <-ctx.Done():
 				}
 				return
 			}
 			select {
 			case resc <- resb:
-			default:
+			case <-ctx.Done():
 			}
 		}(&resolvers[i])
 	}
 
-	select {
-	case v := <-resc:
+	var firstErr error
+	var numErr int
+	for {
 		select {
+		case v := <-resc:
+			select {
+			case <-ctx.Done():
+				metricDNSFwdErrorContext.Add(1)
+				return fmt.Errorf("waiting to send response: %w", ctx.Err())
+			case responseChan <- packet{v, query.family, query.addr}:
+				if verboseDNSForward() {
+					f.logf("response(%d, %v, %d) = %d, nil", fq.txid, typ, len(domain), len(v))
+				}
+				metricDNSFwdSuccess.Add(1)
+				f.health.SetHealthy(dnsForwarderFailing)
+				return nil
+			}
+		case err := <-errc:
+			if firstErr == nil {
+				firstErr = err
+			}
+			numErr++
+			if numErr == len(resolvers) {
+				if errors.Is(firstErr, errServerFailure) {
+					res, err := servfailResponse(query)
+					if err != nil {
+						f.logf("building servfail response: %v", err)
+						return firstErr
+					}
+
+					select {
+					case <-ctx.Done():
+						metricDNSFwdErrorContext.Add(1)
+						metricDNSFwdErrorContextGotError.Add(1)
+						var resolverAddrs []string
+						for _, rr := range resolvers {
+							resolverAddrs = append(resolverAddrs, rr.name.Addr)
+						}
+						f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
+					case responseChan <- res:
+						if verboseDNSForward() {
+							f.logf("forwarder response(%d, %v, %d) = %d, %v", fq.txid, typ, len(domain), len(res.bs), firstErr)
+						}
+						return nil
+					}
+				}
+				return firstErr
+			}
 		case <-ctx.Done():
 			metricDNSFwdErrorContext.Add(1)
-			return ctx.Err()
-		case responseChan <- packet{v, query.addr}:
-			metricDNSFwdSuccess.Add(1)
-			return nil
+			if firstErr != nil {
+				metricDNSFwdErrorContextGotError.Add(1)
+				return firstErr
+			}
+
+			// If we haven't got an error or a successful response,
+			// include all resolvers in the error message so we can
+			// at least see what what servers we're trying to
+			// query.
+			var resolverAddrs []string
+			for _, rr := range resolvers {
+				resolverAddrs = append(resolverAddrs, rr.name.Addr)
+			}
+			f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
+			return fmt.Errorf("waiting for response or error from %v: %w", resolverAddrs, ctx.Err())
 		}
-	case <-ctx.Done():
-		mu.Lock()
-		defer mu.Unlock()
-		metricDNSFwdErrorContext.Add(1)
-		if firstErr != nil {
-			metricDNSFwdErrorContextGotError.Add(1)
-			return firstErr
-		}
-		return ctx.Err()
 	}
 }
 
-var initListenConfig func(_ *net.ListenConfig, _ *monitor.Mon, tunName string) error
+var initListenConfig func(_ *net.ListenConfig, _ *netmon.Monitor, tunName string) error
 
 // nameFromQuery extracts the normalized query name from bs.
-func nameFromQuery(bs []byte) (dnsname.FQDN, error) {
+func nameFromQuery(bs []byte) (dnsname.FQDN, dns.Type, error) {
 	var parser dns.Parser
 
 	hdr, err := parser.Start(bs)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if hdr.Response {
-		return "", errNotQuery
+		return "", 0, errNotQuery
 	}
 
 	q, err := parser.Question()
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	n := q.Name.Data[:q.Name.Length]
-	return dnsname.ToFQDN(rawNameToLower(n))
+	fqdn, err := dnsname.ToFQDN(rawNameToLower(n))
+	if err != nil {
+		return "", 0, err
+	}
+	return fqdn, q.Type, nil
 }
 
 // nxDomainResponse returns an NXDomain DNS reply for the provided request.
@@ -728,6 +1121,29 @@ func nxDomainResponse(req packet) (res packet, err error) {
 	// TODO(bradfitz): should we add an SOA record in the Authority
 	// section too? (for the nxdomain negative caching TTL)
 	// For which zone? Does iOS care?
+	b.StartQuestions()
+	b.Question(p.Question)
+	res.bs, err = b.Finish()
+	res.addr = req.addr
+	return res, err
+}
+
+// servfailResponse returns a SERVFAIL error reply for the provided request.
+func servfailResponse(req packet) (res packet, err error) {
+	p := dnsParserPool.Get().(*dnsParser)
+	defer dnsParserPool.Put(p)
+
+	if err := p.parseQuery(req.bs); err != nil {
+		return packet{}, err
+	}
+
+	h := p.Header
+	h.Response = true
+	h.Authoritative = true
+	h.RCode = dns.RCodeServerFailure
+	b := dns.NewBuilder(nil, h)
+	b.StartQuestions()
+	b.Question(p.Question)
 	res.bs, err = b.Finish()
 	res.addr = req.addr
 	return res, err
@@ -776,70 +1192,4 @@ func (p *closePool) Close() error {
 		c.Close()
 	}
 	return nil
-}
-
-var knownDoH = map[netaddr.IP]string{} // 8.8.8.8 => "https://..."
-
-var dohIPsOfBase = map[string][]netaddr.IP{}
-
-func addDoH(ipStr, base string) {
-	ip := netaddr.MustParseIP(ipStr)
-	knownDoH[ip] = base
-	dohIPsOfBase[base] = append(dohIPsOfBase[base], ip)
-}
-
-func dohV6(base string) (ip netaddr.IP, ok bool) {
-	for _, ip := range dohIPsOfBase[base] {
-		if ip.Is6() {
-			return ip, true
-		}
-	}
-	return ip, false
-}
-
-func init() {
-	// Cloudflare
-	addDoH("1.1.1.1", "https://cloudflare-dns.com/dns-query")
-	addDoH("1.0.0.1", "https://cloudflare-dns.com/dns-query")
-	addDoH("2606:4700:4700::1111", "https://cloudflare-dns.com/dns-query")
-	addDoH("2606:4700:4700::1001", "https://cloudflare-dns.com/dns-query")
-
-	// Cloudflare -Malware
-	addDoH("1.1.1.2", "https://security.cloudflare-dns.com/dns-query")
-	addDoH("1.0.0.2", "https://security.cloudflare-dns.com/dns-query")
-	addDoH("2606:4700:4700::1112", "https://security.cloudflare-dns.com/dns-query")
-	addDoH("2606:4700:4700::1002", "https://security.cloudflare-dns.com/dns-query")
-
-	// Cloudflare -Malware -Adult
-	addDoH("1.1.1.3", "https://family.cloudflare-dns.com/dns-query")
-	addDoH("1.0.0.3", "https://family.cloudflare-dns.com/dns-query")
-	addDoH("2606:4700:4700::1113", "https://family.cloudflare-dns.com/dns-query")
-	addDoH("2606:4700:4700::1003", "https://family.cloudflare-dns.com/dns-query")
-
-	// Google
-	addDoH("8.8.8.8", "https://dns.google/dns-query")
-	addDoH("8.8.4.4", "https://dns.google/dns-query")
-	addDoH("2001:4860:4860::8888", "https://dns.google/dns-query")
-	addDoH("2001:4860:4860::8844", "https://dns.google/dns-query")
-
-	// OpenDNS
-	// TODO(bradfitz): OpenDNS is unique amongst this current set in that
-	// its DoH DNS names resolve to different IPs than its normal DNS
-	// IPs. Support that later. For now we assume that they're the same.
-	// addDoH("208.67.222.222", "https://doh.opendns.com/dns-query")
-	// addDoH("208.67.220.220", "https://doh.opendns.com/dns-query")
-	// addDoH("208.67.222.123", "https://doh.familyshield.opendns.com/dns-query")
-	// addDoH("208.67.220.123", "https://doh.familyshield.opendns.com/dns-query")
-
-	// Quad9
-	addDoH("9.9.9.9", "https://dns.quad9.net/dns-query")
-	addDoH("149.112.112.112", "https://dns.quad9.net/dns-query")
-	addDoH("2620:fe::fe", "https://dns.quad9.net/dns-query")
-	addDoH("2620:fe::fe:9", "https://dns.quad9.net/dns-query")
-
-	// Quad9 -DNSSEC
-	addDoH("9.9.9.10", "https://dns10.quad9.net/dns-query")
-	addDoH("149.112.112.10", "https://dns10.quad9.net/dns-query")
-	addDoH("2620:fe::10", "https://dns10.quad9.net/dns-query")
-	addDoH("2620:fe::fe:10", "https://dns10.quad9.net/dns-query")
 }

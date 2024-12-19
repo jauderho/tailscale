@@ -1,13 +1,12 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux || (darwin && !ios)
-// +build linux darwin,!ios
+//go:build linux || (darwin && !ios) || freebsd || openbsd
 
 package ipnlocal
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -17,52 +16,134 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
-	"golang.org/x/crypto/ssh"
-	"tailscale.com/envknob"
+	"github.com/tailscale/golang-x-crypto/ssh"
+	"go4.org/mem"
+	"tailscale.com/tailcfg"
+	"tailscale.com/util/lineiter"
+	"tailscale.com/util/mak"
 )
-
-var useHostKeys = envknob.Bool("TS_USE_SYSTEM_SSH_HOST_KEYS")
 
 // keyTypes are the SSH key types that we either try to read from the
 // system's OpenSSH keys or try to generate for ourselves when not
 // running as root.
 var keyTypes = []string{"rsa", "ecdsa", "ed25519"}
 
-func (b *LocalBackend) GetSSH_HostKeys() (keys []ssh.Signer, err error) {
-	if os.Geteuid() == 0 {
-		keys, err = b.getSystemSSH_HostKeys()
-		if err != nil || len(keys) > 0 {
-			return keys, err
-		}
-		// Otherwise, perhaps they don't have OpenSSH etc installed.
-		// Generate our own keys...
+// getSSHUsernames discovers and returns the list of usernames that are
+// potential Tailscale SSH user targets.
+//
+// Invariant: must not be called with b.mu held.
+func (b *LocalBackend) getSSHUsernames(req *tailcfg.C2NSSHUsernamesRequest) (*tailcfg.C2NSSHUsernamesResponse, error) {
+	res := new(tailcfg.C2NSSHUsernamesResponse)
+	if !b.tailscaleSSHEnabled() {
+		return res, nil
 	}
-	return b.getTailscaleSSH_HostKeys()
-}
 
-func (b *LocalBackend) getTailscaleSSH_HostKeys() (keys []ssh.Signer, err error) {
-	root := b.TailscaleVarRoot()
-	if root == "" {
-		return nil, errors.New("no var root for ssh keys")
+	max := 10
+	if req != nil && req.Max != 0 {
+		max = req.Max
 	}
-	keyDir := filepath.Join(root, "ssh")
-	if err := os.MkdirAll(keyDir, 0700); err != nil {
-		return nil, err
+
+	add := func(u string) {
+		if req != nil && req.Exclude[u] {
+			return
+		}
+		switch u {
+		case "nobody", "daemon", "sync":
+			return
+		}
+		if slices.Contains(res.Usernames, u) {
+			return
+		}
+		if len(res.Usernames) > max {
+			// Enough for a hint.
+			return
+		}
+		res.Usernames = append(res.Usernames, u)
 	}
-	for _, typ := range keyTypes {
-		hostKey, err := b.hostKeyFileOrCreate(keyDir, typ)
+
+	if opUser := b.operatorUserName(); opUser != "" {
+		add(opUser)
+	}
+
+	// Check popular usernames and see if they exist with a real shell.
+	switch runtime.GOOS {
+	case "darwin":
+		out, err := exec.Command("dscl", ".", "list", "/Users").Output()
 		if err != nil {
 			return nil, err
+		}
+		for line := range lineiter.Bytes(out) {
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 || line[0] == '_' {
+				continue
+			}
+			add(string(line))
+		}
+	default:
+		for lr := range lineiter.File("/etc/passwd") {
+			line, err := lr.Value()
+			if err != nil {
+				break
+			}
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 || line[0] == '#' || line[0] == '_' {
+				continue
+			}
+			if mem.HasSuffix(mem.B(line), mem.S("/nologin")) ||
+				mem.HasSuffix(mem.B(line), mem.S("/false")) {
+				continue
+			}
+			colon := bytes.IndexByte(line, ':')
+			if colon != -1 {
+				add(string(line[:colon]))
+			}
+		}
+	}
+	return res, nil
+}
+
+func (b *LocalBackend) GetSSH_HostKeys() (keys []ssh.Signer, err error) {
+	var existing map[string]ssh.Signer
+	if os.Geteuid() == 0 {
+		existing = b.getSystemSSH_HostKeys()
+	}
+	return b.getTailscaleSSH_HostKeys(existing)
+}
+
+// getTailscaleSSH_HostKeys returns the three (rsa, ecdsa, ed25519) SSH host
+// keys, reusing the provided ones in existing if present in the map.
+func (b *LocalBackend) getTailscaleSSH_HostKeys(existing map[string]ssh.Signer) (keys []ssh.Signer, err error) {
+	var keyDir string // lazily initialized $TAILSCALE_VAR/ssh dir.
+	for _, typ := range keyTypes {
+		if s, ok := existing[typ]; ok {
+			keys = append(keys, s)
+			continue
+		}
+		if keyDir == "" {
+			root := b.TailscaleVarRoot()
+			if root == "" {
+				return nil, errors.New("no var root for ssh keys")
+			}
+			keyDir = filepath.Join(root, "ssh")
+			if err := os.MkdirAll(keyDir, 0700); err != nil {
+				return nil, err
+			}
+		}
+		hostKey, err := b.hostKeyFileOrCreate(keyDir, typ)
+		if err != nil {
+			return nil, fmt.Errorf("error creating SSH host key type %q in %q: %w", typ, keyDir, err)
 		}
 		signer, err := ssh.ParsePrivateKey(hostKey)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error parsing SSH host key type %q from %q: %w", typ, keyDir, err)
 		}
 		keys = append(keys, signer)
 	}
@@ -76,14 +157,14 @@ func (b *LocalBackend) hostKeyFileOrCreate(keyDir, typ string) ([]byte, error) {
 	defer keyGenMu.Unlock()
 
 	path := filepath.Join(keyDir, "ssh_host_"+typ+"_key")
-	v, err := ioutil.ReadFile(path)
+	v, err := os.ReadFile(path)
 	if err == nil {
 		return v, nil
 	}
 	if !os.IsNotExist(err) {
 		return nil, err
 	}
-	var priv interface{}
+	var priv any
 	switch typ {
 	default:
 		return nil, fmt.Errorf("unsupported key type %q", typ)
@@ -114,29 +195,40 @@ func (b *LocalBackend) hostKeyFileOrCreate(keyDir, typ string) ([]byte, error) {
 	return pemGen, err
 }
 
-func (b *LocalBackend) getSystemSSH_HostKeys() (ret []ssh.Signer, err error) {
-	// TODO(bradfitz): cache this?
+func (b *LocalBackend) getSystemSSH_HostKeys() (ret map[string]ssh.Signer) {
 	for _, typ := range keyTypes {
-		hostKey, err := ioutil.ReadFile("/etc/ssh/ssh_host_" + typ + "_key")
-		if os.IsNotExist(err) {
+		filename := "/etc/ssh/ssh_host_" + typ + "_key"
+		hostKey, err := os.ReadFile(filename)
+		if err != nil || len(bytes.TrimSpace(hostKey)) == 0 {
 			continue
-		}
-		if err != nil {
-			return nil, err
 		}
 		signer, err := ssh.ParsePrivateKey(hostKey)
 		if err != nil {
-			return nil, err
+			b.logf("warning: error reading host key %s: %v (generating one instead)", filename, err)
+			continue
 		}
-		ret = append(ret, signer)
-	}
-	return ret, nil
-}
-
-func (b *LocalBackend) getSSHHostKeyPublicStrings() (ret []string) {
-	signers, _ := b.GetSSH_HostKeys()
-	for _, signer := range signers {
-		ret = append(ret, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))))
+		mak.Set(&ret, typ, signer)
 	}
 	return ret
+}
+
+func (b *LocalBackend) getSSHHostKeyPublicStrings() ([]string, error) {
+	signers, err := b.GetSSH_HostKeys()
+	if err != nil {
+		return nil, err
+	}
+	var keyStrings []string
+	for _, signer := range signers {
+		keyStrings = append(keyStrings, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))))
+	}
+	return keyStrings, nil
+}
+
+// tailscaleSSHEnabled reports whether Tailscale SSH is currently enabled based
+// on prefs. It returns false if there are no prefs set.
+func (b *LocalBackend) tailscaleSSHEnabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := b.pm.CurrentPrefs()
+	return p.Valid() && p.RunSSH()
 }

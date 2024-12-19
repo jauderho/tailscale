@@ -1,15 +1,15 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package natlab
 
 import (
 	"fmt"
+	"net/netip"
 	"sync"
 	"time"
 
-	"inet.af/netaddr"
+	"tailscale.com/util/mak"
 )
 
 // FirewallType is the type of filtering a stateful firewall
@@ -37,8 +37,8 @@ const (
 // some fields, so in practice the key is either a 2-tuple (src only),
 // 3-tuple (src ip+port and dst ip) or 4-tuple (src+dst ip+port).
 type fwKey struct {
-	src netaddr.IPPort
-	dst netaddr.IPPort
+	src netip.AddrPort
+	dst netip.AddrPort
 }
 
 // key returns an fwKey for the given src and dst, trimmed according
@@ -47,12 +47,12 @@ type fwKey struct {
 // world), it's the caller's responsibility to swap src and dst in the
 // call to key when processing packets inbound from the "untrusted"
 // world.
-func (s FirewallType) key(src, dst netaddr.IPPort) fwKey {
+func (s FirewallType) key(src, dst netip.AddrPort) fwKey {
 	k := fwKey{src: src}
 	switch s {
 	case EndpointIndependentFirewall:
 	case AddressDependentFirewall:
-		k.dst = k.dst.WithIP(dst.IP())
+		k.dst = netip.AddrPortFrom(dst.Addr(), k.dst.Port())
 	case AddressAndPortDependentFirewall:
 		k.dst = dst
 	default:
@@ -101,19 +101,19 @@ func (f *Firewall) timeNow() time.Time {
 	return time.Now()
 }
 
-func (f *Firewall) init() {
-	if f.seen == nil {
-		f.seen = map[fwKey]time.Time{}
-	}
+// Reset drops all firewall state, forgetting all flows.
+func (f *Firewall) Reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = nil
 }
 
 func (f *Firewall) HandleOut(p *Packet, oif *Interface) *Packet {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.init()
 
 	k := f.Type.key(p.Src, p.Dst)
-	f.seen[k] = f.timeNow().Add(f.sessionTimeoutLocked())
+	mak.Set(&f.seen, k, f.timeNow().Add(f.sessionTimeoutLocked()))
 	p.Trace("firewall out ok")
 	return p
 }
@@ -121,7 +121,6 @@ func (f *Firewall) HandleOut(p *Packet, oif *Interface) *Packet {
 func (f *Firewall) HandleIn(p *Packet, iif *Interface) *Packet {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.init()
 
 	// reverse src and dst because the session table is from the POV
 	// of outbound packets.

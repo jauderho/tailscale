@@ -1,34 +1,54 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
-// +build linux,!android
 
 package hostinfo
 
 import (
 	"bytes"
-	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
-	"syscall"
 
-	"tailscale.com/util/lineread"
+	"golang.org/x/sys/unix"
+	"tailscale.com/types/ptr"
+	"tailscale.com/util/lineiter"
 	"tailscale.com/version/distro"
 )
 
 func init() {
-	osVersion = osVersionLinux
+	osVersion = lazyOSVersion.Get
 	packageType = packageTypeLinux
-
-	if v := linuxDeviceModel(); v != "" {
-		SetDeviceModel(v)
-	}
+	distroName = distroNameLinux
+	distroVersion = distroVersionLinux
+	distroCodeName = distroCodeNameLinux
+	deviceModel = deviceModelLinux
 }
 
-func linuxDeviceModel() string {
+var (
+	lazyVersionMeta = &lazyAtomicValue[versionMeta]{f: ptr.To(linuxVersionMeta)}
+	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionLinux)}
+)
+
+type versionMeta struct {
+	DistroName     string
+	DistroVersion  string
+	DistroCodeName string // "jammy", etc (VERSION_CODENAME from /etc/os-release)
+}
+
+func distroNameLinux() string {
+	return lazyVersionMeta.Get().DistroName
+}
+
+func distroVersionLinux() string {
+	return lazyVersionMeta.Get().DistroVersion
+}
+
+func distroCodeNameLinux() string {
+	return lazyVersionMeta.Get().DistroCodeName
+}
+
+func deviceModelLinux() string {
 	for _, path := range []string{
 		// First try the Synology-specific location.
 		// Example: "DS916+-j"
@@ -37,6 +57,7 @@ func linuxDeviceModel() string {
 		// Otherwise, try the Devicetree model, usually set on
 		// ARM SBCs, etc.
 		// Example: "Raspberry Pi 4 Model B Rev 1.2"
+		// Example: "WD My Cloud Gen2: Marvell Armada 375"
 		"/sys/firmware/devicetree/base/model", // Raspberry Pi 4 Model B Rev 1.2"
 	} {
 		b, _ := os.ReadFile(path)
@@ -47,79 +68,108 @@ func linuxDeviceModel() string {
 	return ""
 }
 
+func getQnapQtsVersion(versionInfo string) string {
+	for _, field := range strings.Fields(versionInfo) {
+		if suffix, ok := strings.CutPrefix(field, "QTSFW_"); ok {
+			return suffix
+		}
+	}
+	return ""
+}
+
 func osVersionLinux() string {
+	var un unix.Utsname
+	unix.Uname(&un)
+	return unix.ByteSliceToString(un.Release[:])
+}
+
+func linuxVersionMeta() (meta versionMeta) {
 	dist := distro.Get()
+	meta.DistroName = string(dist)
+
 	propFile := "/etc/os-release"
 	switch dist {
 	case distro.Synology:
 		propFile = "/etc.defaults/VERSION"
 	case distro.OpenWrt:
 		propFile = "/etc/openwrt_release"
+	case distro.Unraid:
+		propFile = "/etc/unraid-version"
+	case distro.WDMyCloud:
+		slurp, _ := os.ReadFile("/etc/version")
+		meta.DistroVersion = string(bytes.TrimSpace(slurp))
+		return
+	case distro.QNAP:
+		slurp, _ := os.ReadFile("/etc/version_info")
+		meta.DistroVersion = getQnapQtsVersion(string(slurp))
+		return
 	}
 
 	m := map[string]string{}
-	lineread.File(propFile, func(line []byte) error {
+	for lr := range lineiter.File(propFile) {
+		line, err := lr.Value()
+		if err != nil {
+			break
+		}
 		eq := bytes.IndexByte(line, '=')
 		if eq == -1 {
-			return nil
+			continue
 		}
 		k, v := string(line[:eq]), strings.Trim(string(line[eq+1:]), `"'`)
 		m[k] = v
-		return nil
-	})
-
-	var un syscall.Utsname
-	syscall.Uname(&un)
-
-	var attrBuf strings.Builder
-	attrBuf.WriteString("; kernel=")
-	for _, b := range un.Release {
-		if b == 0 {
-			break
-		}
-		attrBuf.WriteByte(byte(b))
 	}
-	if inContainer() {
-		attrBuf.WriteString("; container")
-	}
-	if env := GetEnvType(); env != "" {
-		fmt.Fprintf(&attrBuf, "; env=%s", env)
-	}
-	attr := attrBuf.String()
 
+	if v := m["VERSION_CODENAME"]; v != "" {
+		meta.DistroCodeName = v
+	}
+	if v := m["VERSION_ID"]; v != "" {
+		meta.DistroVersion = v
+	}
 	id := m["ID"]
-
+	if id != "" {
+		meta.DistroName = id
+	}
 	switch id {
 	case "debian":
-		slurp, _ := ioutil.ReadFile("/etc/debian_version")
-		return fmt.Sprintf("Debian %s (%s)%s", bytes.TrimSpace(slurp), m["VERSION_CODENAME"], attr)
-	case "ubuntu":
-		return fmt.Sprintf("Ubuntu %s%s", m["VERSION"], attr)
+		// Debian's VERSION_ID is just like "11". But /etc/debian_version has "11.5" normally.
+		// Or "bookworm/sid" on sid/testing.
+		slurp, _ := os.ReadFile("/etc/debian_version")
+		if v := string(bytes.TrimSpace(slurp)); v != "" {
+			if '0' <= v[0] && v[0] <= '9' {
+				meta.DistroVersion = v
+			} else if meta.DistroCodeName == "" {
+				meta.DistroCodeName = v
+			}
+		}
 	case "", "centos": // CentOS 6 has no /etc/os-release, so its id is ""
-		if cr, _ := ioutil.ReadFile("/etc/centos-release"); len(cr) > 0 { // "CentOS release 6.10 (Final)
-			return fmt.Sprintf("%s%s", bytes.TrimSpace(cr), attr)
+		if meta.DistroVersion == "" {
+			if cr, _ := os.ReadFile("/etc/centos-release"); len(cr) > 0 { // "CentOS release 6.10 (Final)
+				meta.DistroVersion = string(bytes.TrimSpace(cr))
+			}
 		}
-		fallthrough
-	case "fedora", "rhel", "alpine", "nixos":
-		// Their PRETTY_NAME is fine as-is for all versions I tested.
-		fallthrough
-	default:
-		if v := m["PRETTY_NAME"]; v != "" {
-			return fmt.Sprintf("%s%s", v, attr)
-		}
+	}
+	if v := m["PRETTY_NAME"]; v != "" && meta.DistroVersion == "" && !strings.HasSuffix(v, "/sid") {
+		meta.DistroVersion = v
 	}
 	switch dist {
 	case distro.Synology:
-		return fmt.Sprintf("Synology %s%s", m["productversion"], attr)
+		meta.DistroVersion = m["productversion"]
 	case distro.OpenWrt:
-		return fmt.Sprintf("OpenWrt %s%s", m["DISTRIB_RELEASE"], attr)
-	case distro.Gokrazy:
-		return fmt.Sprintf("Gokrazy%s", attr)
+		meta.DistroVersion = m["DISTRIB_RELEASE"]
+	case distro.Unraid:
+		meta.DistroVersion = m["version"]
 	}
-	return fmt.Sprintf("Other%s", attr)
+	return
 }
 
+// linuxBuildTagPackageType is set by packagetype_*.go
+// build tag guarded files.
+var linuxBuildTagPackageType string
+
 func packageTypeLinux() string {
+	if v := linuxBuildTagPackageType; v != "" {
+		return v
+	}
 	// Report whether this is in a snap.
 	// See https://snapcraft.io/docs/environment-variables
 	// We just look at two somewhat arbitrarily.

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package logger defines a type for writing to logs. It's just a
 // convenience type so that we don't have to pass verbose func(...)
@@ -14,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"strings"
 	"sync"
@@ -22,20 +20,25 @@ import (
 
 	"context"
 
+	"go4.org/mem"
 	"tailscale.com/envknob"
+	"tailscale.com/util/ctxkey"
 )
 
 // Logf is the basic Tailscale logger type: a printf-like func.
 // Like log.Printf, the format need not end in a newline.
 // Logf functions must be safe for concurrent use.
-type Logf func(format string, args ...interface{})
+type Logf func(format string, args ...any)
+
+// LogfKey stores and loads [Logf] values within a [context.Context].
+var LogfKey = ctxkey.New("", Logf(log.Printf))
 
 // A Context is a context.Context that should contain a custom log function, obtainable from FromContext.
 // If no log function is present, FromContext will return log.Printf.
 // To construct a Context, use Add
+//
+// Deprecated: Do not use.
 type Context context.Context
-
-type logfKey struct{}
 
 // jenc is a json.Encode + bytes.Buffer pair wired up to be reused in a pool.
 type jenc struct {
@@ -43,7 +46,7 @@ type jenc struct {
 	enc *json.Encoder
 }
 
-var jencPool = &sync.Pool{New: func() interface{} {
+var jencPool = &sync.Pool{New: func() any {
 	je := new(jenc)
 	je.enc = json.NewEncoder(&je.buf)
 	return je
@@ -61,7 +64,7 @@ var jencPool = &sync.Pool{New: func() interface{} {
 //
 // The level can be from 0 to 9. Levels from 1 to 9 are included in
 // the logged JSON object, like {"foo":123,"v":2}.
-func (logf Logf) JSON(level int, recType string, v interface{}) {
+func (logf Logf) JSON(level int, recType string, v any) {
 	je := jencPool.Get().(*jenc)
 	defer jencPool.Put(je)
 	je.buf.Reset()
@@ -81,22 +84,22 @@ func (logf Logf) JSON(level int, recType string, v interface{}) {
 }
 
 // FromContext extracts a log function from ctx.
+//
+// Deprecated: Use [LogfKey.Value] instead.
 func FromContext(ctx Context) Logf {
-	v := ctx.Value(logfKey{})
-	if v == nil {
-		return log.Printf
-	}
-	return v.(Logf)
+	return LogfKey.Value(ctx)
 }
 
 // Ctx constructs a Context from ctx with fn as its custom log function.
+//
+// Deprecated: Use [LogfKey.WithValue] instead.
 func Ctx(ctx context.Context, fn Logf) Context {
-	return context.WithValue(ctx, logfKey{}, fn)
+	return LogfKey.WithValue(ctx, fn)
 }
 
 // WithPrefix wraps f, prefixing each format with the provided prefix.
 func WithPrefix(f Logf, prefix string) Logf {
-	return func(format string, args ...interface{}) {
+	return func(format string, args ...any) {
 		f(prefix+format, args...)
 	}
 }
@@ -119,7 +122,7 @@ func (w funcWriter) Write(p []byte) (int, error) {
 }
 
 // Discard is a Logf that throws away the logs given to it.
-func Discard(string, ...interface{}) {}
+func Discard(string, ...any) {}
 
 // limitData is used to keep track of each format string's associated
 // rate-limiting data.
@@ -128,8 +131,6 @@ type limitData struct {
 	nBlocked int           // number of messages skipped
 	ele      *list.Element // list element used to access this string in the cache
 }
-
-var disableRateLimit = envknob.String("TS_DEBUG_LOG_RATE") == "all"
 
 // rateFree are format string substrings that are exempt from rate limiting.
 // Things should not be added to this unless they're already limited otherwise
@@ -141,6 +142,8 @@ var rateFree = []string{
 	"SetPrefs: %v",
 	"peer keys: %s",
 	"v%v peers: %v",
+	// debug messages printed by 'tailscale bugreport'
+	"diag: ",
 }
 
 // RateLimitedFn is a wrapper for RateLimitedFnWithClock that includes the
@@ -156,7 +159,7 @@ func RateLimitedFn(logf Logf, f time.Duration, burst int, maxCache int) Logf {
 // timeNow is a function that returns the current time, used for calculating
 // rate limits.
 func RateLimitedFnWithClock(logf Logf, f time.Duration, burst int, maxCache int, timeNow func() time.Time) Logf {
-	if disableRateLimit {
+	if envknob.String("TS_DEBUG_LOG_RATE") == "all" {
 		return logf
 	}
 	var (
@@ -165,7 +168,7 @@ func RateLimitedFnWithClock(logf Logf, f time.Duration, burst int, maxCache int,
 		msgCache = list.New()                  // a rudimentary LRU that limits the size of the map
 	)
 
-	return func(format string, args ...interface{}) {
+	return func(format string, args ...any) {
 		// Shortcut for formats with no rate limit
 		for _, sub := range rateFree {
 			if strings.Contains(format, sub) {
@@ -230,6 +233,53 @@ func RateLimitedFnWithClock(logf Logf, f time.Duration, burst int, maxCache int,
 	}
 }
 
+// SlowLoggerWithClock is a logger that applies rate limits similar to
+// RateLimitedFnWithClock, but instead of dropping logs will sleep until they
+// can be written. This should only be used for debug logs, and not in a hot path.
+//
+// The provided context, if canceled, will cause all logs to be dropped and
+// prevent any sleeps.
+func SlowLoggerWithClock(ctx context.Context, logf Logf, f time.Duration, burst int, timeNow func() time.Time) Logf {
+	var (
+		mu sync.Mutex
+		tb = newTokenBucket(f, burst, timeNow())
+	)
+	return func(format string, args ...any) {
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Hold the mutex for the entire length of the check + log
+		// since our token bucket isn't concurrency-safe.
+		mu.Lock()
+		defer mu.Unlock()
+
+		tb.AdvanceTo(timeNow())
+
+		// If we can get a token, then do that and return.
+		if tb.Get() {
+			logf(format, args...)
+			return
+		}
+
+		// Otherwise, sleep for 2x the duration so that we don't
+		// immediately sleep again on the next call.
+		tmr := time.NewTimer(2 * f)
+		defer tmr.Stop()
+		select {
+		case curr := <-tmr.C:
+			tb.AdvanceTo(curr)
+		case <-ctx.Done():
+			return
+		}
+		if !tb.Get() {
+			log.Printf("[unexpected] error rate-limiting in SlowLoggerWithClock")
+			return
+		}
+		logf(format, args...)
+	}
+}
+
 // LogOnChange logs a given line only if line != lastLine, or if maxInterval has passed
 // since the last time this identical line was logged.
 func LogOnChange(logf Logf, maxInterval time.Duration, timeNow func() time.Time) Logf {
@@ -239,7 +289,7 @@ func LogOnChange(logf Logf, maxInterval time.Duration, timeNow func() time.Time)
 		tLastLogged = timeNow()
 	)
 
-	return func(format string, args ...interface{}) {
+	return func(format string, args ...any) {
 		s := fmt.Sprintf(format, args...)
 
 		mu.Lock()
@@ -270,13 +320,13 @@ func (fn ArgWriter) Format(f fmt.State, _ rune) {
 	argBufioPool.Put(bw)
 }
 
-var argBufioPool = &sync.Pool{New: func() interface{} { return bufio.NewWriterSize(ioutil.Discard, 1024) }}
+var argBufioPool = &sync.Pool{New: func() any { return bufio.NewWriterSize(io.Discard, 1024) }}
 
 // Filtered returns a Logf that silently swallows some log lines.
 // Each inbound format and args is evaluated and printed to a string s.
 // The original format and args are passed to logf if and only if allow(s) returns true.
 func Filtered(logf Logf, allow func(s string) bool) Logf {
-	return func(format string, args ...interface{}) {
+	return func(format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		if !allow(msg) {
 			return
@@ -297,7 +347,7 @@ func LogfCloser(logf Logf) (newLogf Logf, close func()) {
 		defer mu.Unlock()
 		closed = true
 	}
-	newLogf = func(msg string, args ...interface{}) {
+	newLogf = func(msg string, args ...any) {
 		mu.Lock()
 		if closed {
 			mu.Unlock()
@@ -307,4 +357,62 @@ func LogfCloser(logf Logf) (newLogf Logf, close func()) {
 		logf(msg, args...)
 	}
 	return newLogf, close
+}
+
+// AsJSON returns a formatter that formats v as JSON. The value is suitable to
+// passing to a regular %v printf argument. (%s is not required)
+//
+// If json.Marshal returns an error, the output is "%%!JSON-ERROR:" followed by
+// the error string.
+func AsJSON(v any) fmt.Formatter {
+	return asJSONResult{v}
+}
+
+type asJSONResult struct{ v any }
+
+func (a asJSONResult) Format(s fmt.State, verb rune) {
+	v, err := json.Marshal(a.v)
+	if err != nil {
+		fmt.Fprintf(s, "%%!JSON-ERROR:%v", err)
+		return
+	}
+	s.Write(v)
+}
+
+// TBLogger is the testing.TB subset needed by TestLogger.
+type TBLogger interface {
+	Helper()
+	Logf(format string, args ...any)
+}
+
+// TestLogger returns a logger that logs to tb.Logf
+// with a prefix to make it easier to distinguish spam
+// from explicit test failures.
+func TestLogger(tb TBLogger) Logf {
+	return func(format string, args ...any) {
+		tb.Helper()
+		tb.Logf("    ... "+format, args...)
+	}
+}
+
+// HTTPServerLogFilter is an io.Writer that can be used as the
+// net/http.Server.ErrorLog logger, and will filter out noisy, low-signal
+// messages that clutter up logs.
+type HTTPServerLogFilter struct {
+	Inner Logf
+}
+
+func (lf HTTPServerLogFilter) Write(p []byte) (int, error) {
+	b := mem.B(p)
+	if mem.HasSuffix(b, mem.S(": EOF\n")) ||
+		mem.HasSuffix(b, mem.S(": i/o timeout\n")) ||
+		mem.HasSuffix(b, mem.S(": read: connection reset by peer\n")) ||
+		mem.HasSuffix(b, mem.S(": remote error: tls: bad certificate\n")) ||
+		mem.HasSuffix(b, mem.S(": tls: first record does not look like a TLS handshake\n")) {
+		// Skip this log message, but say that we processed it
+		return len(p), nil
+	}
+
+	lf.Inner("%s", p)
+	return len(p), nil
 }

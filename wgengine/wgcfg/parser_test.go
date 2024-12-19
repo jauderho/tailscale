@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgcfg
 
@@ -8,11 +7,11 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"net/netip"
 	"reflect"
 	"runtime"
 	"testing"
 
-	"inet.af/netaddr"
 	"tailscale.com/types/key"
 )
 
@@ -25,7 +24,7 @@ func noError(t *testing.T, err error) bool {
 	return false
 }
 
-func equal(t *testing.T, expected, actual interface{}) bool {
+func equal(t *testing.T, expected, actual any) bool {
 	if reflect.DeepEqual(expected, actual) {
 		return true
 	}
@@ -67,11 +66,11 @@ func BenchmarkFromUAPI(b *testing.B) {
 		return k.Public(), k
 	}
 	k1, pk1 := newK()
-	ip1 := netaddr.MustParseIPPrefix("10.0.0.1/32")
+	ip1 := netip.MustParsePrefix("10.0.0.1/32")
 
 	peer := Peer{
 		PublicKey:  k1,
-		AllowedIPs: []netaddr.IPPrefix{ip1},
+		AllowedIPs: []netip.Prefix{ip1},
 	}
 	cfg1 := &Config{
 		PrivateKey: pk1,
@@ -86,7 +85,7 @@ func BenchmarkFromUAPI(b *testing.B) {
 	w.Flush()
 	r := bytes.NewReader(buf.Bytes())
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		r.Seek(0, io.SeekStart)
 		_, err := FromUAPI(r)
 		if err != nil {

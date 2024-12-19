@@ -1,13 +1,17 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
 import (
+	"bufio"
 	"errors"
+	"fmt"
+	"net/netip"
+	"slices"
+	"strings"
 
-	"inet.af/netaddr"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 )
 
@@ -17,6 +21,7 @@ type OSConfigurator interface {
 	// If cfg is the zero value, all Tailscale-related DNS
 	// configuration is removed.
 	// SetDNS must not be called after Close.
+	// SetDNS takes ownership of cfg.
 	SetDNS(cfg OSConfig) error
 	// SupportsSplitDNS reports whether the configurator is capable of
 	// installing a resolver only for specific DNS suffixes. If false,
@@ -36,10 +41,20 @@ type OSConfigurator interface {
 	Close() error
 }
 
+// HostEntry represents a single line in the OS's hosts file.
+type HostEntry struct {
+	Addr  netip.Addr
+	Hosts []string
+}
+
 // OSConfig is an OS DNS configuration.
 type OSConfig struct {
+	// Hosts is a map of DNS FQDNs to their IPs, which should be added to the
+	// OS's hosts file. Currently, (2022-08-12) it is only populated for Windows
+	// in SplitDNS mode and with Smart Name Resolution turned on.
+	Hosts []*HostEntry
 	// Nameservers are the IP addresses of the nameservers to use.
-	Nameservers []netaddr.IP
+	Nameservers []netip.Addr
 	// SearchDomains are the domain suffixes to use when expanding
 	// single-label name queries. SearchDomains is additive to
 	// whatever non-Tailscale search domains the OS has.
@@ -52,11 +67,53 @@ type OSConfig struct {
 	MatchDomains []dnsname.FQDN
 }
 
+func (o *OSConfig) WriteToBufioWriter(w *bufio.Writer) {
+	if o == nil {
+		w.WriteString("<nil>")
+		return
+	}
+	w.WriteString("{")
+	if len(o.Hosts) > 0 {
+		fmt.Fprintf(w, "Hosts:%v ", o.Hosts)
+	}
+	if len(o.Nameservers) > 0 {
+		fmt.Fprintf(w, "Nameservers:%v ", o.Nameservers)
+	}
+	if len(o.SearchDomains) > 0 {
+		fmt.Fprintf(w, "SearchDomains:%v ", o.SearchDomains)
+	}
+	if len(o.MatchDomains) > 0 {
+		w.WriteString("MatchDomains:[")
+		sp := ""
+		var numARPA int
+		for _, s := range o.MatchDomains {
+			if strings.HasSuffix(string(s), ".arpa.") {
+				numARPA++
+				continue
+			}
+			w.WriteString(sp)
+			w.WriteString(string(s))
+			sp = " "
+		}
+		w.WriteString("]")
+		if numARPA > 0 {
+			fmt.Fprintf(w, "+%darpa", numARPA)
+		}
+	}
+	w.WriteString("}")
+}
+
 func (o OSConfig) IsZero() bool {
-	return len(o.Nameservers) == 0 && len(o.SearchDomains) == 0 && len(o.MatchDomains) == 0
+	return len(o.Hosts) == 0 &&
+		len(o.Nameservers) == 0 &&
+		len(o.SearchDomains) == 0 &&
+		len(o.MatchDomains) == 0
 }
 
 func (a OSConfig) Equal(b OSConfig) bool {
+	if len(a.Hosts) != len(b.Hosts) {
+		return false
+	}
 	if len(a.Nameservers) != len(b.Nameservers) {
 		return false
 	}
@@ -67,6 +124,15 @@ func (a OSConfig) Equal(b OSConfig) bool {
 		return false
 	}
 
+	for i := range a.Hosts {
+		ha, hb := a.Hosts[i], b.Hosts[i]
+		if ha.Addr != hb.Addr {
+			return false
+		}
+		if !slices.Equal(ha.Hosts, hb.Hosts) {
+			return false
+		}
+	}
 	for i := range a.Nameservers {
 		if a.Nameservers[i] != b.Nameservers[i] {
 			return false
@@ -84,6 +150,44 @@ func (a OSConfig) Equal(b OSConfig) bool {
 	}
 
 	return true
+}
+
+// Format implements the fmt.Formatter interface to ensure that Hosts is
+// printed correctly (i.e. not as a bunch of pointers).
+//
+// Fixes https://github.com/tailscale/tailscale/issues/5669
+func (a OSConfig) Format(f fmt.State, verb rune) {
+	logger.ArgWriter(func(w *bufio.Writer) {
+		w.WriteString(`{Nameservers:[`)
+		for i, ns := range a.Nameservers {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", ns)
+		}
+		w.WriteString(`] SearchDomains:[`)
+		for i, domain := range a.SearchDomains {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", domain)
+		}
+		w.WriteString(`] MatchDomains:[`)
+		for i, domain := range a.MatchDomains {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", domain)
+		}
+		w.WriteString(`] Hosts:[`)
+		for i, host := range a.Hosts {
+			if i != 0 {
+				w.WriteString(" ")
+			}
+			fmt.Fprintf(w, "%+v", host)
+		}
+		w.WriteString(`]}`)
+	}).Format(f, verb)
 }
 
 // ErrGetBaseConfigNotSupported is the error

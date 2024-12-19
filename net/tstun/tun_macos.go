@@ -1,9 +1,7 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build darwin && !ios
-// +build darwin,!ios
 
 package tstun
 
@@ -17,7 +15,7 @@ func init() {
 	tunDiagnoseFailure = diagnoseDarwinTUNFailure
 }
 
-func diagnoseDarwinTUNFailure(tunName string, logf logger.Logf) {
+func diagnoseDarwinTUNFailure(tunName string, logf logger.Logf, err error) {
 	if os.Getuid() != 0 {
 		logf("failed to create TUN device as non-root user; use 'sudo tailscaled', or run under launchd with 'sudo tailscaled install-system-daemon'")
 	}

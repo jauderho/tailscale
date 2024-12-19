@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package controlbase implements the base transport of the Tailscale
 // 2021 control protocol.
@@ -52,10 +51,11 @@ type rxState struct {
 	sync.Mutex
 	cipher    cipher.AEAD
 	nonce     nonce
-	buf       [maxMessageSize]byte
-	n         int    // number of valid bytes in buf
-	next      int    // offset of next undecrypted packet
-	plaintext []byte // slice into buf of decrypted bytes
+	buf       *maxMsgBuffer   // or nil when reads exhausted
+	n         int             // number of valid bytes in buf
+	next      int             // offset of next undecrypted packet
+	plaintext []byte          // slice into buf of decrypted bytes
+	hdrBuf    [headerLen]byte // small buffer used when buf is nil
 }
 
 // txState is all the Conn state that Write uses.
@@ -63,7 +63,6 @@ type txState struct {
 	sync.Mutex
 	cipher cipher.AEAD
 	nonce  nonce
-	buf    [maxMessageSize]byte
 	err    error // records the first partial write error for all future calls
 }
 
@@ -89,6 +88,10 @@ func (c *Conn) Peer() key.MachinePublic {
 // readNLocked reads into c.rx.buf until buf contains at least total
 // bytes. Returns a slice of the total bytes in rxBuf, or an
 // error if fewer than total bytes are available.
+//
+// It may be called with a nil c.rx.buf only if total == headerLen.
+//
+// On success, c.rx.buf will be non-nil.
 func (c *Conn) readNLocked(total int) ([]byte, error) {
 	if total > maxMessageSize {
 		return nil, errReadTooBig{total}
@@ -97,8 +100,26 @@ func (c *Conn) readNLocked(total int) ([]byte, error) {
 		if total <= c.rx.n {
 			return c.rx.buf[:total], nil
 		}
-
-		n, err := c.conn.Read(c.rx.buf[c.rx.n:])
+		var n int
+		var err error
+		if c.rx.buf == nil {
+			if c.rx.n != 0 || total != headerLen {
+				panic("unexpected")
+			}
+			// Optimization to reduce memory usage.
+			// Most connections are blocked forever waiting for
+			// a read, so we don't want c.rx.buf to be allocated until
+			// we know there's data to read. Instead, when we're
+			// waiting for data to arrive here, read into the
+			// 3 byte hdrBuf:
+			n, err = c.conn.Read(c.rx.hdrBuf[:])
+			if n > 0 {
+				c.rx.buf = getMaxMsgBuffer()
+				copy(c.rx.buf[:], c.rx.hdrBuf[:n])
+			}
+		} else {
+			n, err = c.conn.Read(c.rx.buf[c.rx.n:])
+		}
 		c.rx.n += n
 		if err != nil {
 			return nil, err
@@ -134,19 +155,19 @@ func (c *Conn) decryptLocked(msg []byte) (err error) {
 	return err
 }
 
-// encryptLocked encrypts plaintext into c.tx.buf (including the
+// encryptLocked encrypts plaintext into buf (including the
 // packet header) and returns a slice of the ciphertext, or an error
 // if the cipher is exhausted (i.e. can no longer be used safely).
-func (c *Conn) encryptLocked(plaintext []byte) ([]byte, error) {
+func (c *Conn) encryptLocked(plaintext []byte, buf *maxMsgBuffer) ([]byte, error) {
 	if !c.tx.nonce.Valid() {
 		// Received 2^64-1 messages on this cipher state. Connection
 		// is no longer usable.
 		return nil, errCipherExhausted{}
 	}
 
-	c.tx.buf[0] = msgTypeRecord
-	binary.BigEndian.PutUint16(c.tx.buf[1:headerLen], uint16(len(plaintext)+chp.Overhead))
-	ret := c.tx.cipher.Seal(c.tx.buf[:headerLen], c.tx.nonce[:], plaintext, nil)
+	buf[0] = msgTypeRecord
+	binary.BigEndian.PutUint16(buf[1:headerLen], uint16(len(plaintext)+chp.Overhead))
+	ret := c.tx.cipher.Seal(buf[:headerLen], c.tx.nonce[:], plaintext, nil)
 	c.tx.nonce.Increment()
 
 	return ret, nil
@@ -191,6 +212,14 @@ func (c *Conn) decryptOneLocked() error {
 		c.rx.next = 0
 	}
 
+	// Return our buffer to the pool if it's empty, lest we be
+	// blocked in a long Read call, reading the 3 byte header. We
+	// don't to keep that buffer unnecessarily alive.
+	if c.rx.n == 0 && c.rx.next == 0 && c.rx.buf != nil {
+		bufPool.Put(c.rx.buf)
+		c.rx.buf = nil
+	}
+
 	bs, err := c.readNLocked(headerLen)
 	if err != nil {
 		return err
@@ -227,6 +256,12 @@ func (c *Conn) Read(bs []byte) (int, error) {
 	}
 	n := copy(bs, c.rx.plaintext)
 	c.rx.plaintext = c.rx.plaintext[n:]
+
+	// Lose slice's underlying array pointer to unneeded memory so
+	// GC can collect more.
+	if len(c.rx.plaintext) == 0 {
+		c.rx.plaintext = nil
+	}
 	return n, nil
 }
 
@@ -257,6 +292,9 @@ func (c *Conn) Write(bs []byte) (n int, err error) {
 		return 0, net.ErrClosed
 	}
 
+	buf := getMaxMsgBuffer()
+	defer bufPool.Put(buf)
+
 	var sent int
 	for len(bs) > 0 {
 		toSend := bs
@@ -265,7 +303,7 @@ func (c *Conn) Write(bs []byte) (n int, err error) {
 		}
 		bs = bs[len(toSend):]
 
-		ciphertext, err := c.encryptLocked(toSend)
+		ciphertext, err := c.encryptLocked(toSend, buf)
 		if err != nil {
 			return sent, err
 		}
@@ -354,4 +392,17 @@ func (n *nonce) Increment() {
 		panic("increment of invalid nonce")
 	}
 	binary.BigEndian.PutUint64(n[4:], 1+binary.BigEndian.Uint64(n[4:]))
+}
+
+type maxMsgBuffer [maxMessageSize]byte
+
+// bufPool holds the temporary buffers for Conn.Read & Write.
+var bufPool = &sync.Pool{
+	New: func() any {
+		return new(maxMsgBuffer)
+	},
+}
+
+func getMaxMsgBuffer() *maxMsgBuffer {
+	return bufPool.Get().(*maxMsgBuffer)
 }

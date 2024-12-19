@@ -1,18 +1,13 @@
-# Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-# Use of this source code is governed by a BSD-style
-# license that can be found in the LICENSE file.
+# Copyright (c) Tailscale Inc & AUTHORS
+# SPDX-License-Identifier: BSD-3-Clause
 
-############################################################################
+# Note that this Dockerfile is currently NOT used to build any of the published
+# Tailscale container images and may have drifted from the image build mechanism
+# we use.
+# Tailscale images are currently built using https://github.com/tailscale/mkctr,
+# and the build script can be found in ./build_docker.sh.
 #
-# WARNING: Tailscale is not yet officially supported in container
-# environments, such as Docker and Kubernetes. Though it should work, we
-# don't regularly test it, and we know there are some feature limitations.
 #
-# See current bugs tagged "containers":
-#    https://github.com/tailscale/tailscale/labels/containers
-#
-############################################################################
-
 # This Dockerfile includes all the tailscale binaries.
 #
 # To build the Dockerfile:
@@ -32,12 +27,23 @@
 #     $ docker exec tailscaled tailscale status
 
 
-FROM golang:1.17-alpine AS build-env
+FROM golang:1.23-alpine AS build-env
 
 WORKDIR /go/src/tailscale
 
 COPY go.mod go.sum ./
 RUN go mod download
+
+# Pre-build some stuff before the following COPY line invalidates the Docker cache.
+RUN go install \
+    github.com/aws/aws-sdk-go-v2/aws \
+    github.com/aws/aws-sdk-go-v2/config \
+    gvisor.dev/gvisor/pkg/tcpip/adapters/gonet \
+    gvisor.dev/gvisor/pkg/tcpip/stack \
+    golang.org/x/crypto/ssh \
+    golang.org/x/crypto/acme \
+    github.com/coder/websocket \
+    github.com/mdlayher/netlink
 
 COPY . .
 
@@ -51,10 +57,15 @@ ENV VERSION_GIT_HASH=$VERSION_GIT_HASH
 ARG TARGETARCH
 
 RUN GOARCH=$TARGETARCH go install -ldflags="\
-      -X tailscale.com/version.Long=$VERSION_LONG \
-      -X tailscale.com/version.Short=$VERSION_SHORT \
-      -X tailscale.com/version.GitCommit=$VERSION_GIT_HASH" \
-      -v ./cmd/tailscale ./cmd/tailscaled
+      -X tailscale.com/version.longStamp=$VERSION_LONG \
+      -X tailscale.com/version.shortStamp=$VERSION_SHORT \
+      -X tailscale.com/version.gitCommitStamp=$VERSION_GIT_HASH" \
+      -v ./cmd/tailscale ./cmd/tailscaled ./cmd/containerboot
 
-FROM ghcr.io/tailscale/alpine-base:3.14
+FROM alpine:3.18
+RUN apk add --no-cache ca-certificates iptables iproute2 ip6tables
+
 COPY --from=build-env /go/bin/* /usr/local/bin/
+# For compat with the previous run.sh, although ideally you should be
+# using build_docker.sh which sets an entrypoint for the image.
+RUN mkdir /tailscale && ln -s /usr/local/bin/containerboot /tailscale/run.sh

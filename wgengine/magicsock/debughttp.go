@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
 
@@ -9,11 +8,11 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
 
-	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
@@ -73,7 +72,7 @@ func (c *Conn) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<h2 id=ipport><a href=#ipport>#</a> ip:port to endpoint</h2><ul>")
 	{
 		type kv struct {
-			ipp netaddr.IPPort
+			ipp netip.AddrPort
 			pi  *peerInfo
 		}
 		ent := make([]kv, 0, len(c.peerMap.byIPPort))
@@ -102,11 +101,9 @@ func (c *Conn) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Slice(ent, func(i, j int) bool { return ent[i].pub.Less(ent[j].pub) })
 
-		peers := map[key.NodePublic]*tailcfg.Node{}
-		if c.netMap != nil {
-			for _, p := range c.netMap.Peers {
-				peers[p.Key] = p
-			}
+		peers := map[key.NodePublic]tailcfg.NodeView{}
+		for _, p := range c.peers.All() {
+			peers[p.Key()] = p
 		}
 
 		for _, e := range ent {
@@ -125,11 +122,11 @@ func (c *Conn) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 }
 
 func printEndpointHTML(w io.Writer, ep *endpoint) {
-	lastRecv := ep.lastRecv.LoadAtomic()
+	lastRecv := ep.lastRecvWG.LoadAtomic()
 
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
-	if ep.lastSend == 0 && lastRecv == 0 {
+	if ep.lastSendExt == 0 && lastRecv == 0 {
 		return // no activity ever
 	}
 
@@ -144,10 +141,10 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 
 	fmt.Fprintf(w, "<p>Best: <b>%+v</b>, %v ago (for %v)</p>\n", ep.bestAddr, fmtMono(ep.bestAddrAt), ep.trustBestAddrUntil.Sub(mnow).Round(time.Millisecond))
 	fmt.Fprintf(w, "<p>heartbeating: %v</p>\n", ep.heartBeatTimer != nil)
-	fmt.Fprintf(w, "<p>lastSend: %v ago</p>\n", fmtMono(ep.lastSend))
+	fmt.Fprintf(w, "<p>lastSend: %v ago</p>\n", fmtMono(ep.lastSendExt))
 	fmt.Fprintf(w, "<p>lastFullPing: %v ago</p>\n", fmtMono(ep.lastFullPing))
 
-	eps := make([]netaddr.IPPort, 0, len(ep.endpointState))
+	eps := make([]netip.AddrPort, 0, len(ep.endpointState))
 	for ipp := range ep.endpointState {
 		eps = append(eps, ipp)
 	}
@@ -155,7 +152,7 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 	io.WriteString(w, "<p>Endpoints:</p><ul>")
 	for _, ipp := range eps {
 		s := ep.endpointState[ipp]
-		if ipp == ep.bestAddr.IPPort {
+		if ipp == ep.bestAddr.AddrPort {
 			fmt.Fprintf(w, "<li><b>%s</b>: (best)<ul>", ipp)
 		} else {
 			fmt.Fprintf(w, "<li>%s: ...<ul>", ipp)
@@ -172,6 +169,11 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 				break
 			}
 			pos := (int(s.recentPong) - i) % len(s.recentPongs)
+			// If s.recentPongs wraps around pos will be negative, so start
+			// again from the end of the slice.
+			if pos < 0 {
+				pos += len(s.recentPongs)
+			}
 			pr := s.recentPongs[pos]
 			fmt.Fprintf(w, "<li>pong %v ago: in %v, from %v src %v</li>\n",
 				fmtMono(pr.pongAt), pr.latency.Round(time.Millisecond/10),
@@ -183,19 +185,19 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 
 }
 
-func peerDebugName(p *tailcfg.Node) string {
-	if p == nil {
+func peerDebugName(p tailcfg.NodeView) string {
+	if !p.Valid() {
 		return ""
 	}
-	n := p.Name
-	if i := strings.Index(n, "."); i != -1 {
-		return n[:i]
+	n := p.Name()
+	if base, _, ok := strings.Cut(n, "."); ok {
+		return base
 	}
-	return p.Hostinfo.Hostname()
+	return p.Hostinfo().Hostname()
 }
 
-func ipPortLess(a, b netaddr.IPPort) bool {
-	if v := a.IP().Compare(b.IP()); v != 0 {
+func ipPortLess(a, b netip.AddrPort) bool {
+	if v := a.Addr().Compare(b.Addr()); v != 0 {
 		return v < 0
 	}
 	return a.Port() < b.Port()

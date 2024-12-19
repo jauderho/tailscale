@@ -1,13 +1,15 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package netutil
 
 import (
 	"io"
 	"net"
+	"runtime"
 	"testing"
+
+	"tailscale.com/net/netmon"
 )
 
 type conn struct {
@@ -51,4 +53,32 @@ func TestOneConnListener(t *testing.T) {
 	if ln.Addr() == nil {
 		t.Errorf("nil Addr")
 	}
+}
+
+func TestIPForwardingEnabledLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("skipping on %s", runtime.GOOS)
+	}
+	got, err := ipForwardingEnabledLinux(ipv4, "some-not-found-interface")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Errorf("got true; want false")
+	}
+}
+
+func TestCheckReversePathFiltering(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("skipping on %s", runtime.GOOS)
+	}
+	netMon, err := netmon.New(t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer netMon.Close()
+
+	warn, err := CheckReversePathFiltering(netMon.InterfaceState())
+	t.Logf("err: %v", err)
+	t.Logf("warnings: %v", warn)
 }

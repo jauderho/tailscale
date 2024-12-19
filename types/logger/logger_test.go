@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package logger
 
@@ -16,6 +15,7 @@ import (
 
 	qt "github.com/frankban/quicktest"
 	"tailscale.com/tailcfg"
+	"tailscale.com/version"
 )
 
 func TestFuncWriter(t *testing.T) {
@@ -30,7 +30,7 @@ func TestStdLogger(t *testing.T) {
 }
 
 func logTester(want []string, t *testing.T, i *int) Logf {
-	return func(format string, args ...interface{}) {
+	return func(format string, args ...any) {
 		got := fmt.Sprintf(format, args...)
 		if *i >= len(want) {
 			t.Fatalf("Logging continued past end of expected input: %s", got)
@@ -70,7 +70,7 @@ func TestRateLimiter(t *testing.T) {
 	lgtest := logTester(want, t, &testsRun)
 	lg := RateLimitedFnWithClock(lgtest, 1*time.Minute, 2, 50, nowf)
 	var prefixed Logf
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		lg("boring string with constant formatting %s", "(constant)")
 		lg("templated format string no. %d", i)
 		if i == 4 {
@@ -121,7 +121,7 @@ func TestLogOnChange(t *testing.T) {
 	lgtest := logTester(want, t, &testsRun)
 	lg := LogOnChange(lgtest, 5*time.Second, timeNow)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		lg("%s", "1 2 3 4 5 6")
 	}
 	lg("1 2 3 4 5 7")
@@ -204,7 +204,7 @@ func TestContext(t *testing.T) {
 
 	// Test that FromContext and Ctx work together.
 	var called bool
-	markCalled := func(string, ...interface{}) {
+	markCalled := func(string, ...any) {
 		called = true
 	}
 	ctx = Ctx(ctx, markCalled)
@@ -215,10 +215,66 @@ func TestContext(t *testing.T) {
 
 func TestJSON(t *testing.T) {
 	var buf bytes.Buffer
-	var logf Logf = func(f string, a ...interface{}) { fmt.Fprintf(&buf, f, a...) }
+	var logf Logf = func(f string, a ...any) { fmt.Fprintf(&buf, f, a...) }
 	logf.JSON(1, "foo", &tailcfg.Hostinfo{})
-	want := "[v\x00JSON]1" + `{"foo":{"OS":"","Hostname":""}}`
+	want := "[v\x00JSON]1" + `{"foo":{}}`
 	if got := buf.String(); got != want {
 		t.Errorf("mismatch\n got: %q\nwant: %q\n", got, want)
+	}
+}
+
+func TestAsJSON(t *testing.T) {
+	got := fmt.Sprintf("got %v", AsJSON(struct {
+		Foo string
+		Bar int
+	}{"hi", 123}))
+	const want = `got {"Foo":"hi","Bar":123}`
+	if got != want {
+		t.Errorf("got %#q; want %#q", got, want)
+	}
+
+	got = fmt.Sprintf("got %v", AsJSON(func() {}))
+	const wantErr = `got %!JSON-ERROR:json: unsupported type: func()`
+	if got != wantErr {
+		t.Errorf("for marshal error, got %#q; want %#q", got, wantErr)
+	}
+
+	if version.IsRace() {
+		// skip the rest of the test in race mode;
+		// race mode causes more allocs which we don't care about.
+		return
+	}
+
+	var buf bytes.Buffer
+	n := int(testing.AllocsPerRun(1000, func() {
+		buf.Reset()
+		fmt.Fprintf(&buf, "got %v", AsJSON("hi"))
+	}))
+	if n > 2 {
+		// the JSON AsMarshal itself + boxing
+		// the asJSONResult into an interface (which needs
+		// to happen at some point to get to fmt, so might
+		// as well return an interface from AsJSON))
+		t.Errorf("allocs = %v; want max 2", n)
+	}
+}
+
+func TestHTTPServerLogFilter(t *testing.T) {
+	var buf bytes.Buffer
+	logf := func(format string, args ...any) {
+		t.Logf("[logf] "+format, args...)
+		fmt.Fprintf(&buf, format, args...)
+	}
+
+	lf := HTTPServerLogFilter{logf}
+	quietLogger := log.New(lf, "", 0)
+
+	quietLogger.Printf("foo bar")
+	quietLogger.Printf("http: TLS handshake error from %s:%d: EOF", "1.2.3.4", 9999)
+	quietLogger.Printf("baz")
+
+	const want = "foo bar\nbaz\n"
+	if s := buf.String(); s != want {
+		t.Errorf("got buf=%q, want %q", s, want)
 	}
 }

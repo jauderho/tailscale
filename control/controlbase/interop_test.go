@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlbase
 
@@ -12,14 +11,14 @@ import (
 	"net"
 	"testing"
 
-	tsnettest "tailscale.com/net/nettest"
+	"tailscale.com/net/memnet"
 	"tailscale.com/types/key"
 )
 
 // Can a reference Noise IK client talk to our server?
 func TestInteropClient(t *testing.T) {
 	var (
-		s1, s2      = tsnettest.NewConn("noise", 128000)
+		s1, s2      = memnet.NewConn("noise", 128000)
 		controlKey  = key.NewMachine()
 		machineKey  = key.NewMachine()
 		serverErr   = make(chan error, 2)
@@ -67,7 +66,7 @@ func TestInteropClient(t *testing.T) {
 // Can our client talk to a reference Noise IK server?
 func TestInteropServer(t *testing.T) {
 	var (
-		s1, s2      = tsnettest.NewConn("noise", 128000)
+		s1, s2      = memnet.NewConn("noise", 128000)
 		controlKey  = key.NewMachine()
 		machineKey  = key.NewMachine()
 		clientErr   = make(chan error, 2)
@@ -77,7 +76,7 @@ func TestInteropServer(t *testing.T) {
 	)
 
 	go func() {
-		client, err := Client(context.Background(), s1, machineKey, controlKey.Public())
+		client, err := Client(context.Background(), s1, machineKey, controlKey.Public(), testProtocolVersion)
 		clientErr <- err
 		if err != nil {
 			return
@@ -121,11 +120,11 @@ func noiseExplorerClient(conn net.Conn, controlKey key.MachinePublic, machineKey
 	copy(mk.public_key[:], machineKey.Public().UntypedBytes())
 	var peerKey [32]byte
 	copy(peerKey[:], controlKey.UntypedBytes())
-	session := InitSession(true, protocolVersionPrologue(protocolVersion), mk, peerKey)
+	session := InitSession(true, protocolVersionPrologue(testProtocolVersion), mk, peerKey)
 
 	_, msg1 := SendMessage(&session, nil)
 	var hdr [initiationHeaderLen]byte
-	binary.BigEndian.PutUint16(hdr[:2], protocolVersion)
+	binary.BigEndian.PutUint16(hdr[:2], testProtocolVersion)
 	hdr[2] = msgTypeInitiation
 	binary.BigEndian.PutUint16(hdr[3:5], 96)
 	if _, err := conn.Write(hdr[:]); err != nil {
@@ -193,7 +192,7 @@ func noiseExplorerServer(conn net.Conn, controlKey key.MachinePrivate, wantMachi
 	var mk keypair
 	copy(mk.private_key[:], controlKey.UntypedBytes())
 	copy(mk.public_key[:], controlKey.Public().UntypedBytes())
-	session := InitSession(false, protocolVersionPrologue(protocolVersion), mk, [32]byte{})
+	session := InitSession(false, protocolVersionPrologue(testProtocolVersion), mk, [32]byte{})
 
 	var buf [1024]byte
 	if _, err := io.ReadFull(conn, buf[:101]); err != nil {

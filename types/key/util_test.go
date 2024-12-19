@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -23,7 +22,7 @@ func TestRand(t *testing.T) {
 }
 
 func TestClamp25519Private(t *testing.T) {
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		var k [32]byte
 		rand(k[:])
 		clamp25519Private(k[:])

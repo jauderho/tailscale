@@ -1,25 +1,29 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-package tailcfg
+package tailcfg_test
 
 import (
-	"encoding"
 	"encoding/json"
+	"net/netip"
+	"os"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"inet.af/netaddr"
-	"tailscale.com/tstest"
+	. "tailscale.com/tailcfg"
+	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
-	"tailscale.com/version"
+	"tailscale.com/types/opt"
+	"tailscale.com/types/ptr"
+	"tailscale.com/util/must"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		fields = append(fields, t.Field(i).Name)
 	}
 	return
@@ -27,21 +31,52 @@ func fieldsOf(t reflect.Type) (fields []string) {
 
 func TestHostinfoEqual(t *testing.T) {
 	hiHandles := []string{
-		"IPNVersion", "FrontendLogID", "BackendLogID",
-		"OS", "OSVersion", "Package", "DeviceModel", "Hostname",
-		"ShieldsUp", "ShareeNode",
+		"IPNVersion",
+		"FrontendLogID",
+		"BackendLogID",
+		"OS",
+		"OSVersion",
+		"Container",
+		"Env",
+		"Distro",
+		"DistroVersion",
+		"DistroCodeName",
+		"App",
+		"Desktop",
+		"Package",
+		"DeviceModel",
+		"PushDeviceToken",
+		"Hostname",
+		"ShieldsUp",
+		"ShareeNode",
+		"NoLogsNoSupport",
+		"WireIngress",
+		"AllowsUpdate",
+		"Machine",
 		"GoArch",
-		"RoutableIPs", "RequestTags",
-		"Services", "NetInfo", "SSH_HostKeys",
+		"GoArchVar",
+		"GoVersion",
+		"RoutableIPs",
+		"RequestTags",
+		"WoLMACs",
+		"Services",
+		"NetInfo",
+		"SSH_HostKeys",
+		"Cloud",
+		"Userspace",
+		"UserspaceRouter",
+		"AppConnector",
+		"ServicesHash",
+		"Location",
 	}
-	if have := fieldsOf(reflect.TypeOf(Hostinfo{})); !reflect.DeepEqual(have, hiHandles) {
+	if have := fieldsOf(reflect.TypeFor[Hostinfo]()); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, hiHandles)
 	}
 
-	nets := func(strs ...string) (ns []netaddr.IPPrefix) {
+	nets := func(strs ...string) (ns []netip.Prefix) {
 		for _, s := range strs {
-			n, err := netaddr.ParseIPPrefix(s)
+			n, err := netip.ParsePrefix(s)
 			if err != nil {
 				panic(err)
 			}
@@ -186,6 +221,36 @@ func TestHostinfoEqual(t *testing.T) {
 			&Hostinfo{},
 			false,
 		},
+		{
+			&Hostinfo{App: "golink"},
+			&Hostinfo{App: "abc"},
+			false,
+		},
+		{
+			&Hostinfo{App: "golink"},
+			&Hostinfo{App: "golink"},
+			true,
+		},
+		{
+			&Hostinfo{AppConnector: opt.Bool("true")},
+			&Hostinfo{AppConnector: opt.Bool("true")},
+			true,
+		},
+		{
+			&Hostinfo{AppConnector: opt.Bool("true")},
+			&Hostinfo{AppConnector: opt.Bool("false")},
+			false,
+		},
+		{
+			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
+			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
+			true,
+		},
+		{
+			&Hostinfo{ServicesHash: "084c799cd551dd1d8d5c5f9a5d593b2e931f5e36122ee5c793c1d08a19839cc0"},
+			&Hostinfo{},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
@@ -224,12 +289,12 @@ func TestHostinfoHowEqual(t *testing.T) {
 			a: &Hostinfo{
 				IPNVersion:  "1",
 				ShieldsUp:   false,
-				RoutableIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.2.3.0/24")},
+				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("1.2.3.0/24")},
 			},
 			b: &Hostinfo{
 				IPNVersion:  "2",
 				ShieldsUp:   true,
-				RoutableIPs: []netaddr.IPPrefix{netaddr.MustParseIPPrefix("1.2.3.0/25")},
+				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("1.2.3.0/25")},
 			},
 			want: []string{"IPNVersion", "ShieldsUp", "RoutableIPs"},
 		},
@@ -271,17 +336,47 @@ func TestHostinfoHowEqual(t *testing.T) {
 	}
 }
 
+func TestHostinfoTailscaleSSHEnabled(t *testing.T) {
+	tests := []struct {
+		hi   *Hostinfo
+		want bool
+	}{
+		{
+			nil,
+			false,
+		},
+		{
+			&Hostinfo{},
+			false,
+		},
+		{
+			&Hostinfo{SSH_HostKeys: []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO.... root@bar"}},
+			true,
+		},
+	}
+
+	for i, tt := range tests {
+		got := tt.hi.TailscaleSSHEnabled()
+		if got != tt.want {
+			t.Errorf("%d. got %v; want %v", i, got, tt.want)
+		}
+	}
+}
+
 func TestNodeEqual(t *testing.T) {
 	nodeHandles := []string{
 		"ID", "StableID", "Name", "User", "Sharer",
-		"Key", "KeyExpiry", "Machine", "DiscoKey",
+		"Key", "KeyExpiry", "KeySignature", "Machine", "DiscoKey",
 		"Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo",
-		"Created", "Tags", "PrimaryRoutes",
-		"LastSeen", "Online", "KeepAlive", "MachineAuthorized",
-		"Capabilities",
+		"Created", "Cap", "Tags", "PrimaryRoutes",
+		"LastSeen", "Online", "MachineAuthorized",
+		"Capabilities", "CapMap",
+		"UnsignedPeerAPIOnly",
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
+		"DataPlaneAuditLogID", "Expired", "SelfNodeV4MasqAddrForThisPeer",
+		"SelfNodeV6MasqAddrForThisPeer", "IsWireGuardOnly", "IsJailed", "ExitNodeDNSResolvers",
 	}
-	if have := fieldsOf(reflect.TypeOf(Node{})); !reflect.DeepEqual(have, nodeHandles) {
+	if have := fieldsOf(reflect.TypeFor[Node]()); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, nodeHandles)
 	}
@@ -375,33 +470,33 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Addresses: []netaddr.IPPrefix{}},
+			&Node{Addresses: []netip.Prefix{}},
 			&Node{Addresses: nil},
 			false,
 		},
 		{
-			&Node{Addresses: []netaddr.IPPrefix{}},
-			&Node{Addresses: []netaddr.IPPrefix{}},
+			&Node{Addresses: []netip.Prefix{}},
+			&Node{Addresses: []netip.Prefix{}},
 			true,
 		},
 		{
-			&Node{AllowedIPs: []netaddr.IPPrefix{}},
+			&Node{AllowedIPs: []netip.Prefix{}},
 			&Node{AllowedIPs: nil},
 			false,
 		},
 		{
-			&Node{Addresses: []netaddr.IPPrefix{}},
-			&Node{Addresses: []netaddr.IPPrefix{}},
+			&Node{Addresses: []netip.Prefix{}},
+			&Node{Addresses: []netip.Prefix{}},
 			true,
 		},
 		{
-			&Node{Endpoints: []string{}},
+			&Node{Endpoints: []netip.AddrPort{}},
 			&Node{Endpoints: nil},
 			false,
 		},
 		{
-			&Node{Endpoints: []string{}},
-			&Node{Endpoints: []string{}},
+			&Node{Endpoints: []netip.AddrPort{}},
+			&Node{Endpoints: []netip.AddrPort{}},
 			true,
 		},
 		{
@@ -459,6 +554,80 @@ func TestNodeEqual(t *testing.T) {
 			&Node{},
 			false,
 		},
+		{
+			&Node{Expired: true},
+			&Node{},
+			false,
+		},
+		{
+			&Node{},
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			false,
+		},
+		{
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			true,
+		},
+		{
+			&Node{},
+			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			false,
+		},
+		{
+			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			true,
+		},
+		{
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"foo"`},
+				},
+			},
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"foo"`},
+				},
+			},
+			true,
+		},
+		{
+			&Node{
+				CapMap: NodeCapMap{
+					"bar": []RawMessage{`"foo"`},
+				},
+			},
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"bar"`},
+				},
+			},
+			false,
+		},
+		{
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": nil,
+				},
+			},
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"bar"`},
+				},
+			},
+			false,
+		},
+		{
+			&Node{IsJailed: true},
+			&Node{IsJailed: true},
+			true,
+		},
+		{
+			&Node{IsJailed: false},
+			&Node{IsJailed: true},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
@@ -473,7 +642,9 @@ func TestNetInfoFields(t *testing.T) {
 		"MappingVariesByDestIP",
 		"HairPinning",
 		"WorkingIPv6",
+		"OSHasIPv6",
 		"WorkingUDP",
+		"WorkingICMPv4",
 		"HavePortMap",
 		"UPnP",
 		"PMP",
@@ -481,34 +652,11 @@ func TestNetInfoFields(t *testing.T) {
 		"PreferredDERP",
 		"LinkType",
 		"DERPLatency",
+		"FirewallMode",
 	}
-	if have := fieldsOf(reflect.TypeOf(NetInfo{})); !reflect.DeepEqual(have, handled) {
+	if have := fieldsOf(reflect.TypeFor[NetInfo]()); !reflect.DeepEqual(have, handled) {
 		t.Errorf("NetInfo.Clone/BasicallyEqually check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, handled)
-	}
-}
-
-type keyIn interface {
-	String() string
-	MarshalText() ([]byte, error)
-}
-
-func testKey(t *testing.T, prefix string, in keyIn, out encoding.TextUnmarshaler) {
-	got, err := in.MarshalText()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := out.UnmarshalText(got); err != nil {
-		t.Fatal(err)
-	}
-	if s := in.String(); string(got) != s {
-		t.Errorf("MarshalText = %q != String %q", got, s)
-	}
-	if !strings.HasPrefix(string(got), prefix) {
-		t.Errorf("%q didn't start with prefix %q", got, prefix)
-	}
-	if reflect.ValueOf(out).Elem().Interface() != in {
-		t.Errorf("mismatch after unmarshal")
 	}
 }
 
@@ -537,9 +685,9 @@ func TestCloneNode(t *testing.T) {
 	}{
 		{"nil_fields", &Node{}},
 		{"zero_fields", &Node{
-			Addresses:  make([]netaddr.IPPrefix, 0),
-			AllowedIPs: make([]netaddr.IPPrefix, 0),
-			Endpoints:  make([]string, 0),
+			Addresses:  make([]netip.Prefix, 0),
+			AllowedIPs: make([]netip.Prefix, 0),
+			Endpoints:  make([]netip.AddrPort, 0),
 		}},
 	}
 	for _, tt := range tests {
@@ -592,33 +740,214 @@ func TestEndpointTypeMarshal(t *testing.T) {
 	}
 }
 
-var sinkBytes []byte
-
-func BenchmarkKeyMarshalText(b *testing.B) {
-	b.ReportAllocs()
-	var k [32]byte
-	for i := 0; i < b.N; i++ {
-		sinkBytes = keyMarshalText("prefix", k)
-	}
-}
-
-func TestAppendKeyAllocs(t *testing.T) {
-	if version.IsRace() {
-		t.Skip("skipping in race detector") // append(b, make([]byte, N)...) not optimized in compiler with race
-	}
-	var k [32]byte
-	err := tstest.MinAllocsPerRun(t, 1, func() {
-		sinkBytes = keyMarshalText("prefix", k)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestRegisterRequestNilClone(t *testing.T) {
 	var nilReq *RegisterRequest
 	got := nilReq.Clone()
 	if got != nil {
 		t.Errorf("got = %v; want nil", got)
+	}
+}
+
+// Tests that CurrentCapabilityVersion is bumped when the comment block above it gets bumped.
+// We've screwed this up several times.
+func TestCurrentCapabilityVersion(t *testing.T) {
+	f := must.Get(os.ReadFile("tailcfg.go"))
+	matches := regexp.MustCompile(`(?m)^//[\s-]+(\d+): \d\d\d\d-\d\d-\d\d: `).FindAllStringSubmatch(string(f), -1)
+	max := 0
+	for _, m := range matches {
+		n := must.Get(strconv.Atoi(m[1]))
+		if n > max {
+			max = n
+		}
+	}
+	if CapabilityVersion(max) != CurrentCapabilityVersion {
+		t.Errorf("CurrentCapabilityVersion = %d; want %d", CurrentCapabilityVersion, max)
+	}
+}
+
+func TestUnmarshalHealth(t *testing.T) {
+	tests := []struct {
+		in   string   // MapResponse JSON
+		want []string // MapResponse.Health wanted value post-unmarshal
+	}{
+		{in: `{}`},
+		{in: `{"Health":null}`},
+		{in: `{"Health":[]}`, want: []string{}},
+		{in: `{"Health":["bad"]}`, want: []string{"bad"}},
+	}
+	for _, tt := range tests {
+		var mr MapResponse
+		if err := json.Unmarshal([]byte(tt.in), &mr); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(mr.Health, tt.want) {
+			t.Errorf("for %#q: got %v; want %v", tt.in, mr.Health, tt.want)
+		}
+	}
+}
+
+func TestRawMessage(t *testing.T) {
+	// Create a few types of json.RawMessages and then marshal them back and
+	// forth to make sure they round-trip.
+
+	type rule struct {
+		Ports []int `json:",omitempty"`
+	}
+	tests := []struct {
+		name string
+		val  map[string][]rule
+		wire map[string][]RawMessage
+	}{
+		{
+			name: "nil",
+			val:  nil,
+			wire: nil,
+		},
+		{
+			name: "empty",
+			val:  map[string][]rule{},
+			wire: map[string][]RawMessage{},
+		},
+		{
+			name: "one",
+			val: map[string][]rule{
+				"foo": {{Ports: []int{1, 2, 3}}},
+			},
+			wire: map[string][]RawMessage{
+				"foo": {
+					`{"Ports":[1,2,3]}`,
+				},
+			},
+		},
+		{
+			name: "many",
+			val: map[string][]rule{
+				"foo": {{Ports: []int{1, 2, 3}}},
+				"bar": {{Ports: []int{4, 5, 6}}, {Ports: []int{7, 8, 9}}},
+				"baz": nil,
+				"abc": {},
+				"def": {{}},
+			},
+			wire: map[string][]RawMessage{
+				"foo": {
+					`{"Ports":[1,2,3]}`,
+				},
+				"bar": {
+					`{"Ports":[4,5,6]}`,
+					`{"Ports":[7,8,9]}`,
+				},
+				"baz": nil,
+				"abc": {},
+				"def": {"{}"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			j := must.Get(json.Marshal(tc.val))
+			var gotWire map[string][]RawMessage
+			if err := json.Unmarshal(j, &gotWire); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(gotWire, tc.wire) {
+				t.Errorf("got %#v; want %#v", gotWire, tc.wire)
+			}
+
+			j = must.Get(json.Marshal(tc.wire))
+			var gotVal map[string][]rule
+			if err := json.Unmarshal(j, &gotVal); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(gotVal, tc.val) {
+				t.Errorf("got %#v; want %#v", gotVal, tc.val)
+			}
+		})
+	}
+}
+
+func TestMarshalToRawMessageAndBack(t *testing.T) {
+	type inner struct {
+		Groups []string `json:"groups,omitempty"`
+	}
+	testip := netip.MustParseAddrPort("1.2.3.4:80")
+	type testRule struct {
+		Ports    []int            `json:"ports,omitempty"`
+		ToggleOn bool             `json:"toggleOn,omitempty"`
+		Name     string           `json:"name,omitempty"`
+		Groups   inner            `json:"groups,omitempty"`
+		Addrs    []netip.AddrPort `json:"addrs"`
+	}
+	tests := []struct {
+		name    string
+		capType PeerCapability
+		val     testRule
+	}{
+		{
+			name:    "empty",
+			val:     testRule{},
+			capType: PeerCapability("foo"),
+		},
+		{
+			name:    "some values",
+			val:     testRule{Ports: []int{80, 443}, Name: "foo"},
+			capType: PeerCapability("foo"),
+		},
+		{
+			name:    "all values",
+			val:     testRule{Ports: []int{80, 443}, Name: "foo", ToggleOn: true, Groups: inner{Groups: []string{"foo", "bar"}}, Addrs: []netip.AddrPort{testip}},
+			capType: PeerCapability("foo"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := MarshalCapJSON(tc.val)
+			if err != nil {
+				t.Fatalf("unexpected error marshalling raw message: %v", err)
+			}
+			cap := PeerCapMap{tc.capType: []RawMessage{raw}}
+			after, err := UnmarshalCapJSON[testRule](cap, tc.capType)
+			if err != nil {
+				t.Fatalf("unexpected error unmarshaling raw message: %v", err)
+			}
+			if !reflect.DeepEqual([]testRule{tc.val}, after) {
+				t.Errorf("got %#v; want %#v", after, []testRule{tc.val})
+			}
+		})
+	}
+}
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		BadDeps: map[string]string{
+			// Make sure we don't again accidentally bring in a dependency on
+			// drive or its transitive dependencies
+			"testing":                        "do not use testing package in production code",
+			"tailscale.com/drive/driveimpl":  "https://github.com/tailscale/tailscale/pull/10631",
+			"github.com/studio-b12/gowebdav": "https://github.com/tailscale/tailscale/pull/10631",
+		},
+	}.Check(t)
+}
+
+func TestCheckTag(t *testing.T) {
+	tests := []struct {
+		name string
+		tag  string
+		want bool
+	}{
+		{"empty", "", false},
+		{"good", "tag:foo", true},
+		{"bad", "tag:", false},
+		{"no_leading_num", "tag:1foo", false},
+		{"no_punctuation", "tag:foa@bar", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckTag(tt.tag)
+			if err == nil && !tt.want {
+				t.Errorf("got nil; want error")
+			} else if err != nil && tt.want {
+				t.Errorf("got %v; want nil", err)
+			}
+		})
 	}
 }

@@ -1,8 +1,8 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-// Package derp implements DERP, the Detour Encrypted Routing Protocol.
+// Package derp implements the Designated Encrypted Relay for Packets (DERP)
+// protocol.
 //
 // DERP routes packets to clients using curve25519 keys as addresses.
 //
@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"time"
 )
 
@@ -40,8 +39,8 @@ const (
 )
 
 // ProtocolVersion is bumped whenever there's a wire-incompatible change.
-//   * version 1 (zero on wire): consistent box headers, in use by employee dev nodes a bit
-//   * version 2: received packets have src addrs in frameRecvPacket at beginning
+//   - version 1 (zero on wire): consistent box headers, in use by employee dev nodes a bit
+//   - version 2: received packets have src addrs in frameRecvPacket at beginning
 const ProtocolVersion = 2
 
 // frameType is the one byte frame type at the beginning of the frame
@@ -78,12 +77,22 @@ const (
 	// a previous sender is no longer connected. That is, if A
 	// sent to B, and then if A disconnects, the server sends
 	// framePeerGone to B so B can forget that a reverse path
-	// exists on that connection to get back to A.
-	framePeerGone = frameType(0x08) // 32B pub key of peer that's gone
+	// exists on that connection to get back to A. It is also sent
+	// if A tries to send a CallMeMaybe to B and the server has no
+	// record of B (which currently would only happen if there was
+	// a bug).
+	framePeerGone = frameType(0x08) // 32B pub key of peer that's gone + 1 byte reason
 
-	// framePeerPresent is like framePeerGone, but for other
-	// members of the DERP region when they're meshed up together.
-	framePeerPresent = frameType(0x09) // 32B pub key of peer that's connected
+	// framePeerPresent is like framePeerGone, but for other members of the DERP
+	// region when they're meshed up together.
+	//
+	// The message is at least 32 bytes (the public key of the peer that's
+	// connected). If there are at least 18 bytes remaining after that, it's the
+	// 16 byte IP + 2 byte BE uint16 port of the client. If there's another byte
+	// remaining after that, it's a PeerPresentFlags byte.
+	// While current servers send 41 bytes, old servers will send fewer, and newer
+	// servers might send more.
+	framePeerPresent = frameType(0x09)
 
 	// frameWatchConns is how one DERP node in a regional mesh
 	// subscribes to the others in the region.
@@ -115,6 +124,30 @@ const (
 	// and how long to try total. See ServerRestartingMessage docs for
 	// more details on how the client should interpret them.
 	frameRestarting = frameType(0x15)
+)
+
+// PeerGoneReasonType is a one byte reason code explaining why a
+// server does not have a path to the requested destination.
+type PeerGoneReasonType byte
+
+const (
+	PeerGoneReasonDisconnected  = PeerGoneReasonType(0x00) // peer disconnected from this server
+	PeerGoneReasonNotHere       = PeerGoneReasonType(0x01) // server doesn't know about this peer, unexpected
+	PeerGoneReasonMeshConnBroke = PeerGoneReasonType(0xf0) // invented by Client.RunWatchConnectionLoop on disconnect; not sent on the wire
+)
+
+// PeerPresentFlags is an optional byte of bit flags sent after a framePeerPresent message.
+//
+// For a modern server, the value should always be non-zero. If the value is zero,
+// that means the server doesn't support this field.
+type PeerPresentFlags byte
+
+// PeerPresentFlags bits.
+const (
+	PeerPresentIsRegular  = 1 << 0
+	PeerPresentIsMeshPeer = 1 << 1
+	PeerPresentIsProber   = 1 << 2
+	PeerPresentNotIdeal   = 1 << 3 // client said derp server is not its Region.Nodes[0] ideal node
 )
 
 var bin = binary.BigEndian
@@ -188,13 +221,13 @@ func readFrame(br *bufio.Reader, maxSize uint32, b []byte) (t frameType, frameLe
 		return 0, 0, fmt.Errorf("frame header size %d exceeds reader limit of %d", frameLen, maxSize)
 	}
 
-	n, err := io.ReadFull(br, b[:minUint32(frameLen, uint32(len(b)))])
+	n, err := io.ReadFull(br, b[:min(frameLen, uint32(len(b)))])
 	if err != nil {
 		return 0, 0, err
 	}
 	remain := frameLen - uint32(n)
 	if remain > 0 {
-		if _, err := io.CopyN(ioutil.Discard, br, int64(remain)); err != nil {
+		if _, err := io.CopyN(io.Discard, br, int64(remain)); err != nil {
 			return 0, 0, err
 		}
 		err = io.ErrShortBuffer
@@ -221,11 +254,4 @@ func writeFrame(bw *bufio.Writer, t frameType, b []byte) error {
 		return err
 	}
 	return bw.Flush()
-}
-
-func minUint32(a, b uint32) uint32 {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
@@ -9,9 +8,8 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"time"
-
-	"inet.af/netaddr"
 )
 
 // References:
@@ -19,7 +17,7 @@ import (
 // https://www.rfc-editor.org/rfc/pdfrfc/rfc6887.txt.pdf
 // https://tools.ietf.org/html/rfc6887
 
-//go:generate go run tailscale.com/cmd/addlicense -year 2021 -file pcpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pcpResultCode -trimprefix=pcpCode
+//go:generate go run tailscale.com/cmd/addlicense -file pcpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pcpResultCode -trimprefix=pcpCode
 
 type pcpResultCode uint8
 
@@ -49,28 +47,34 @@ const (
 
 type pcpMapping struct {
 	c        *Client
-	gw       netaddr.IPPort
-	internal netaddr.IPPort
-	external netaddr.IPPort
+	gw       netip.AddrPort
+	internal netip.AddrPort
+	external netip.AddrPort
 
 	renewAfter time.Time
 	goodUntil  time.Time
 
-	// TODO should this also contain an epoch?
-	// Doesn't seem to be used elsewhere, but can use it for validation at some point.
+	epoch uint32
 }
 
+func (p *pcpMapping) MappingType() string      { return "pcp" }
 func (p *pcpMapping) GoodUntil() time.Time     { return p.goodUntil }
 func (p *pcpMapping) RenewAfter() time.Time    { return p.renewAfter }
-func (p *pcpMapping) External() netaddr.IPPort { return p.external }
+func (p *pcpMapping) External() netip.AddrPort { return p.external }
+func (p *pcpMapping) MappingDebug() string {
+	return fmt.Sprintf("pcpMapping{gw:%v, external:%v, internal:%v, renewAfter:%d, goodUntil:%d}",
+		p.gw, p.external, p.internal,
+		p.renewAfter.Unix(), p.goodUntil.Unix())
+}
+
 func (p *pcpMapping) Release(ctx context.Context) {
 	uc, err := p.c.listenPacket(ctx, "udp4", ":0")
 	if err != nil {
 		return
 	}
 	defer uc.Close()
-	pkt := buildPCPRequestMappingPacket(p.internal.IP(), p.internal.Port(), p.external.Port(), 0, p.external.IP())
-	uc.WriteTo(pkt, p.gw.UDPAddr())
+	pkt := buildPCPRequestMappingPacket(p.internal.Addr(), p.internal.Port(), p.external.Port(), 0, p.external.Addr())
+	uc.WriteToUDPAddrPort(pkt, p.gw)
 }
 
 // buildPCPRequestMappingPacket generates a PCP packet with a MAP opcode.
@@ -78,10 +82,10 @@ func (p *pcpMapping) Release(ctx context.Context) {
 // If prevPort is not known, it should be set to 0.
 // If prevExternalIP is not known, it should be set to 0.0.0.0.
 func buildPCPRequestMappingPacket(
-	myIP netaddr.IP,
+	myIP netip.Addr,
 	localPort, prevPort uint16,
 	lifetimeSec uint32,
-	prevExternalIP netaddr.IP,
+	prevExternalIP netip.Addr,
 ) (pkt []byte) {
 	// 24 byte common PCP header + 36 bytes of MAP-specific fields
 	pkt = make([]byte, 24+36)
@@ -115,6 +119,9 @@ func parsePCPMapResponse(resp []byte) (*pcpMapping, error) {
 	if !ok {
 		return nil, fmt.Errorf("Invalid PCP common header")
 	}
+	if res.ResultCode == pcpCodeNotAuthorized {
+		return nil, fmt.Errorf("PCP is implemented but not enabled in the router")
+	}
 	if res.ResultCode != pcpCodeOK {
 		return nil, fmt.Errorf("PCP response not ok, code %d", res.ResultCode)
 	}
@@ -122,9 +129,9 @@ func parsePCPMapResponse(resp []byte) (*pcpMapping, error) {
 	externalPort := binary.BigEndian.Uint16(resp[42:44])
 	externalIPBytes := [16]byte{}
 	copy(externalIPBytes[:], resp[44:])
-	externalIP := netaddr.IPFrom16(externalIPBytes)
+	externalIP := netip.AddrFrom16(externalIPBytes).Unmap()
 
-	external := netaddr.IPPortFrom(externalIP, externalPort)
+	external := netip.AddrPortFrom(externalIP, externalPort)
 
 	lifetime := time.Second * time.Duration(res.Lifetime)
 	now := time.Now()
@@ -132,13 +139,14 @@ func parsePCPMapResponse(resp []byte) (*pcpMapping, error) {
 		external:   external,
 		renewAfter: now.Add(lifetime / 2),
 		goodUntil:  now.Add(lifetime),
+		epoch:      res.Epoch,
 	}
 
 	return mapping, nil
 }
 
 // pcpAnnounceRequest generates a PCP packet with an ANNOUNCE opcode.
-func pcpAnnounceRequest(myIP netaddr.IP) []byte {
+func pcpAnnounceRequest(myIP netip.Addr) []byte {
 	// See https://tools.ietf.org/html/rfc6887#section-7.1
 	pkt := make([]byte, 24)
 	pkt[0] = pcpVersion

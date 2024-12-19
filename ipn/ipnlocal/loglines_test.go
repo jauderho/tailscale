@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
@@ -12,11 +11,12 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store/mem"
-	"tailscale.com/logtail"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/persist"
 	"tailscale.com/wgengine"
 )
@@ -26,7 +26,6 @@ import (
 // functions.
 func TestLocalLogLines(t *testing.T) {
 	logListen := tstest.NewLogLineTracker(t.Logf, []string{
-		"SetPrefs: %v",
 		"[v1] peer keys: %s",
 		"[v1] v%v peers: %v",
 	})
@@ -38,9 +37,9 @@ func TestLocalLogLines(t *testing.T) {
 	// This lets the logListen tracker verify that the rate-limiter allows these key lines.
 	logf := logger.RateLimitedFnWithClock(logListen.Logf, 5*time.Second, 0, 10, time.Now)
 
-	logid := func(hex byte) logtail.PublicID {
-		var ret logtail.PublicID
-		for i := 0; i < len(ret); i++ {
+	logid := func(hex byte) logid.PublicID {
+		var ret logid.PublicID
+		for i := range len(ret) {
 			ret[i] = hex
 		}
 		return ret
@@ -48,21 +47,22 @@ func TestLocalLogLines(t *testing.T) {
 	idA := logid(0xaa)
 
 	// set up a LocalBackend, super bare bones. No functional data.
+	sys := new(tsd.System)
 	store := new(mem.Store)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys.Set(store)
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.Close)
+	sys.Set(e)
 
-	lb, err := NewLocalBackend(logf, idA.String(), store, nil, e, 0)
+	lb, err := NewLocalBackend(logf, idA, sys, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer lb.Shutdown()
 
-	// custom adjustments for required non-nil fields
-	lb.prefs = ipn.NewPrefs()
 	lb.hostinfo = &tailcfg.Hostinfo{}
 	// hacky manual override of the usual log-on-change behaviour of keylogf
 	lb.keyLogf = logListen.Logf
@@ -80,7 +80,7 @@ func TestLocalLogLines(t *testing.T) {
 	persist := &persist.Persist{}
 	prefs := ipn.NewPrefs()
 	prefs.Persist = persist
-	lb.SetPrefs(prefs)
+	lb.SetPrefsForTest(prefs)
 
 	t.Run("after_prefs", testWantRemain("[v1] peer keys: %s", "[v1] v%v peers: %v"))
 
@@ -110,5 +110,5 @@ func TestLocalLogLines(t *testing.T) {
 		}},
 	})
 	lb.mu.Unlock()
-	t.Run("after_second_peer_status", testWantRemain("SetPrefs: %v"))
+	t.Run("after_second_peer_status", testWantRemain())
 }

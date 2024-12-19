@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package netns contains the common code for using the Go net package
 // in a logical "network namespace" to avoid routing loops where
@@ -17,37 +16,65 @@ package netns
 import (
 	"context"
 	"net"
+	"net/netip"
+	"sync/atomic"
 
-	"inet.af/netaddr"
 	"tailscale.com/net/netknob"
-	"tailscale.com/syncs"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
-var disabled syncs.AtomicBool
+var disabled atomic.Bool
 
 // SetEnabled enables or disables netns for the process.
 // It defaults to being enabled.
 func SetEnabled(on bool) {
-	disabled.Set(!on)
+	disabled.Store(!on)
+}
+
+var bindToInterfaceByRoute atomic.Bool
+
+// SetBindToInterfaceByRoute enables or disables whether we use the system's
+// route information to bind to a particular interface. It is the same as
+// setting the TS_BIND_TO_INTERFACE_BY_ROUTE.
+//
+// Currently, this only changes the behaviour on macOS and Windows.
+func SetBindToInterfaceByRoute(v bool) {
+	bindToInterfaceByRoute.Store(v)
+}
+
+var disableBindConnToInterface atomic.Bool
+
+// SetDisableBindConnToInterface disables the (normal) behavior of binding
+// connections to the default network interface.
+//
+// Currently, this only has an effect on Darwin.
+func SetDisableBindConnToInterface(v bool) {
+	disableBindConnToInterface.Store(v)
 }
 
 // Listener returns a new net.Listener with its Control hook func
 // initialized as necessary to run in logical network namespace that
 // doesn't route back into Tailscale.
-func Listener(logf logger.Logf) *net.ListenConfig {
-	if disabled.Get() {
+func Listener(logf logger.Logf, netMon *netmon.Monitor) *net.ListenConfig {
+	if netMon == nil {
+		panic("netns.Listener called with nil netMon")
+	}
+	if disabled.Load() {
 		return new(net.ListenConfig)
 	}
-	return &net.ListenConfig{Control: control(logf)}
+	return &net.ListenConfig{Control: control(logf, netMon)}
 }
 
 // NewDialer returns a new Dialer using a net.Dialer with its Control
 // hook func initialized as necessary to run in a logical network
 // namespace that doesn't route back into Tailscale. It also handles
 // using a SOCKS if configured in the environment with ALL_PROXY.
-func NewDialer(logf logger.Logf) Dialer {
-	return FromDialer(logf, &net.Dialer{
+func NewDialer(logf logger.Logf, netMon *netmon.Monitor) Dialer {
+	if netMon == nil {
+		panic("netns.NewDialer called with nil netMon")
+	}
+	return FromDialer(logf, netMon, &net.Dialer{
 		KeepAlive: netknob.PlatformTCPKeepAlive(),
 	})
 }
@@ -56,11 +83,14 @@ func NewDialer(logf logger.Logf) Dialer {
 // network namespace that doesn't route back into Tailscale. It also
 // handles using a SOCKS if configured in the environment with
 // ALL_PROXY.
-func FromDialer(logf logger.Logf, d *net.Dialer) Dialer {
-	if disabled.Get() {
+func FromDialer(logf logger.Logf, netMon *netmon.Monitor, d *net.Dialer) Dialer {
+	if netMon == nil {
+		panic("netns.FromDialer called with nil netMon")
+	}
+	if disabled.Load() {
 		return d
 	}
-	d.Control = control(logf)
+	d.Control = control(logf, netMon)
 	if wrapDialer != nil {
 		return wrapDialer(d)
 	}
@@ -100,6 +130,6 @@ func isLocalhost(addr string) bool {
 		return true
 	}
 
-	ip, _ := netaddr.ParseIP(host)
+	ip, _ := netip.ParseAddr(host)
 	return ip.IsLoopback()
 }

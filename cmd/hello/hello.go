@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // The hello binary runs hello.ts.net.
 package main // import "tailscale.com/cmd/hello"
@@ -13,7 +12,6 @@ import (
 	"errors"
 	"flag"
 	"html/template"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -33,10 +31,12 @@ var (
 //go:embed hello.tmpl.html
 var embeddedTemplate string
 
+var localClient tailscale.LocalClient
+
 func main() {
 	flag.Parse()
 	if *testIP != "" {
-		res, err := tailscale.WhoIs(context.Background(), *testIP)
+		res, err := localClient.WhoIs(context.Background(), *testIP)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -78,7 +78,7 @@ func main() {
 					GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 						switch hi.ServerName {
 						case "hello.ts.net":
-							return tailscale.GetCertificate(hi)
+							return localClient.GetCertificate(hi)
 						case "hello.ipn.dev":
 							c, err := tls.LoadX509KeyPair(
 								"/etc/hello/hello.ipn.dev.crt",
@@ -106,7 +106,7 @@ func devMode() bool { return *httpsAddr == "" && *httpAddr != "" }
 
 func getTmpl() (*template.Template, error) {
 	if devMode() {
-		tmplData, err := ioutil.ReadFile("hello.tmpl.html")
+		tmplData, err := os.ReadFile("hello.tmpl.html")
 		if os.IsNotExist(err) {
 			log.Printf("using baked-in template in dev mode; can't find hello.tmpl.html in current directory")
 			return tmpl, nil
@@ -135,13 +135,13 @@ func tailscaleIP(who *apitype.WhoIsResponse) string {
 		return ""
 	}
 	for _, nodeIP := range who.Node.Addresses {
-		if nodeIP.IP().Is4() && nodeIP.IsSingleIP() {
-			return nodeIP.IP().String()
+		if nodeIP.Addr().Is4() && nodeIP.IsSingleIP() {
+			return nodeIP.Addr().String()
 		}
 	}
 	for _, nodeIP := range who.Node.Addresses {
 		if nodeIP.IsSingleIP() {
-			return nodeIP.IP().String()
+			return nodeIP.Addr().String()
 		}
 	}
 	return ""
@@ -172,7 +172,7 @@ func root(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	who, err := tailscale.WhoIs(r.Context(), r.RemoteAddr)
+	who, err := localClient.WhoIs(r.Context(), r.RemoteAddr)
 	var data tmplData
 	if err != nil {
 		if devMode() {
@@ -206,8 +206,6 @@ func root(w http.ResponseWriter, r *http.Request) {
 
 // firstLabel s up until the first period, if any.
 func firstLabel(s string) string {
-	if i := strings.Index(s, "."); i != -1 {
-		return s[:i]
-	}
+	s, _, _ = strings.Cut(s, ".")
 	return s
 }

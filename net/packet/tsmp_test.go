@@ -1,13 +1,11 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
 import (
+	"net/netip"
 	"testing"
-
-	"inet.af/netaddr"
 )
 
 func TestTailscaleRejectedHeader(t *testing.T) {
@@ -17,10 +15,10 @@ func TestTailscaleRejectedHeader(t *testing.T) {
 	}{
 		{
 			h: TailscaleRejectedHeader{
-				IPSrc:  netaddr.MustParseIP("5.5.5.5"),
-				IPDst:  netaddr.MustParseIP("1.2.3.4"),
-				Src:    netaddr.MustParseIPPort("1.2.3.4:567"),
-				Dst:    netaddr.MustParseIPPort("5.5.5.5:443"),
+				IPSrc:  netip.MustParseAddr("5.5.5.5"),
+				IPDst:  netip.MustParseAddr("1.2.3.4"),
+				Src:    netip.MustParseAddrPort("1.2.3.4:567"),
+				Dst:    netip.MustParseAddrPort("5.5.5.5:443"),
 				Proto:  TCP,
 				Reason: RejectedDueToACLs,
 			},
@@ -28,10 +26,10 @@ func TestTailscaleRejectedHeader(t *testing.T) {
 		},
 		{
 			h: TailscaleRejectedHeader{
-				IPSrc:  netaddr.MustParseIP("2::2"),
-				IPDst:  netaddr.MustParseIP("1::1"),
-				Src:    netaddr.MustParseIPPort("[1::1]:567"),
-				Dst:    netaddr.MustParseIPPort("[2::2]:443"),
+				IPSrc:  netip.MustParseAddr("2::2"),
+				IPDst:  netip.MustParseAddr("1::1"),
+				Src:    netip.MustParseAddrPort("[1::1]:567"),
+				Dst:    netip.MustParseAddrPort("[2::2]:443"),
 				Proto:  UDP,
 				Reason: RejectedDueToShieldsUp,
 			},
@@ -39,10 +37,10 @@ func TestTailscaleRejectedHeader(t *testing.T) {
 		},
 		{
 			h: TailscaleRejectedHeader{
-				IPSrc:       netaddr.MustParseIP("2::2"),
-				IPDst:       netaddr.MustParseIP("1::1"),
-				Src:         netaddr.MustParseIPPort("[1::1]:567"),
-				Dst:         netaddr.MustParseIPPort("[2::2]:443"),
+				IPSrc:       netip.MustParseAddr("2::2"),
+				IPDst:       netip.MustParseAddr("1::1"),
+				Src:         netip.MustParseAddrPort("[1::1]:567"),
+				Dst:         netip.MustParseAddrPort("[2::2]:443"),
 				Proto:       UDP,
 				Reason:      RejectedDueToIPForwarding,
 				MaybeBroken: true,

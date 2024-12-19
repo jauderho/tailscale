@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tshttpproxy
 
@@ -20,14 +19,11 @@ import (
 
 	"github.com/alexbrainman/sspi/negotiate"
 	"golang.org/x/sys/windows"
+	"tailscale.com/hostinfo"
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
-)
-
-var (
-	winHTTP            = windows.NewLazySystemDLL("winhttp.dll")
-	httpOpenProc       = winHTTP.NewProc("WinHttpOpen")
-	closeHandleProc    = winHTTP.NewProc("WinHttpCloseHandle")
-	getProxyForUrlProc = winHTTP.NewProc("WinHttpGetProxyForUrl")
+	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/cmpver"
 )
 
 func init() {
@@ -46,6 +42,15 @@ var cachedProxy struct {
 // HTTP request which ultimately will call back into us to log again,
 // forever. So for errors, we only log a bit.
 var proxyErrorf = logger.RateLimitedFn(log.Printf, 10*time.Minute, 2 /* burst*/, 10 /* maxCache */)
+
+var (
+	metricSuccess              = clientmetric.NewCounter("winhttp_proxy_success")
+	metricErrDetectionFailed   = clientmetric.NewCounter("winhttp_proxy_err_detection_failed")
+	metricErrInvalidParameters = clientmetric.NewCounter("winhttp_proxy_err_invalid_param")
+	metricErrDownloadScript    = clientmetric.NewCounter("winhttp_proxy_err_download_script")
+	metricErrTimeout           = clientmetric.NewCounter("winhttp_proxy_err_timeout")
+	metricErrOther             = clientmetric.NewCounter("winhttp_proxy_err_other")
+)
 
 func proxyFromWinHTTPOrCache(req *http.Request) (*url.URL, error) {
 	if req.URL == nil {
@@ -70,6 +75,7 @@ func proxyFromWinHTTPOrCache(req *http.Request) (*url.URL, error) {
 	case res := <-resc:
 		err := res.err
 		if err == nil {
+			metricSuccess.Add(1)
 			cachedProxy.Lock()
 			defer cachedProxy.Unlock()
 			if was, now := fmt.Sprint(cachedProxy.val), fmt.Sprint(res.proxy); was != now {
@@ -85,10 +91,12 @@ func proxyFromWinHTTPOrCache(req *http.Request) (*url.URL, error) {
 			ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT = 12167
 		)
 		if err == syscall.Errno(ERROR_WINHTTP_AUTODETECTION_FAILED) {
+			metricErrDetectionFailed.Add(1)
 			setNoProxyUntil(10 * time.Second)
 			return nil, nil
 		}
 		if err == windows.ERROR_INVALID_PARAMETER {
+			metricErrInvalidParameters.Add(1)
 			// Seen on Windows 8.1. (https://github.com/tailscale/tailscale/issues/879)
 			// TODO(bradfitz): figure this out.
 			setNoProxyUntil(time.Hour)
@@ -97,11 +105,14 @@ func proxyFromWinHTTPOrCache(req *http.Request) (*url.URL, error) {
 		}
 		proxyErrorf("tshttpproxy: winhttp: GetProxyForURL(%q): %v/%#v", urlStr, err, err)
 		if err == syscall.Errno(ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT) {
+			metricErrDownloadScript.Add(1)
 			setNoProxyUntil(10 * time.Second)
 			return nil, nil
 		}
+		metricErrOther.Add(1)
 		return nil, err
 	case <-ctx.Done():
+		metricErrTimeout.Add(1)
 		cachedProxy.Lock()
 		defer cachedProxy.Unlock()
 		proxyErrorf("tshttpproxy: winhttp: GetProxyForURL(%q): timeout; using cached proxy %v", urlStr, cachedProxy.val)
@@ -113,7 +124,7 @@ func proxyFromWinHTTP(ctx context.Context, urlStr string) (proxy *url.URL, err e
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	whi, err := winHTTPOpen()
+	whi, err := httpOpen()
 	if err != nil {
 		proxyErrorf("winhttp: Open: %v", err)
 		return nil, err
@@ -146,6 +157,7 @@ func proxyFromWinHTTP(ctx context.Context, urlStr string) (proxy *url.URL, err e
 var userAgent = windows.StringToUTF16Ptr("Tailscale")
 
 const (
+	winHTTP_ACCESS_TYPE_DEFAULT_PROXY   = 0
 	winHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4
 	winHTTP_AUTOPROXY_ALLOW_AUTOCONFIG  = 0x00000100
 	winHTTP_AUTOPROXY_AUTO_DETECT       = 1
@@ -153,38 +165,46 @@ const (
 	winHTTP_AUTO_DETECT_TYPE_DNS_A      = 0x00000002
 )
 
-func winHTTPOpen() (winHTTPInternet, error) {
-	if err := httpOpenProc.Find(); err != nil {
-		return 0, err
+// Windows 8.1 is actually Windows 6.3 under the hood. Yay, marketing!
+const win8dot1Ver = "6.3"
+
+// accessType is the flag we must pass to WinHttpOpen for proxy resolution
+// depending on whether or not we're running Windows < 8.1
+var accessType syncs.AtomicValue[uint32]
+
+func getAccessFlag() uint32 {
+	if flag, ok := accessType.LoadOk(); ok {
+		return flag
 	}
-	r, _, err := httpOpenProc.Call(
-		uintptr(unsafe.Pointer(userAgent)),
-		winHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-		0, /* WINHTTP_NO_PROXY_NAME */
-		0, /* WINHTTP_NO_PROXY_BYPASS */
-		0)
-	if r == 0 {
-		return 0, err
+	var flag uint32
+	if cmpver.Compare(hostinfo.GetOSVersion(), win8dot1Ver) < 0 {
+		flag = winHTTP_ACCESS_TYPE_DEFAULT_PROXY
+	} else {
+		flag = winHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
 	}
-	return winHTTPInternet(r), nil
+	accessType.Store(flag)
+	return flag
+}
+
+func httpOpen() (winHTTPInternet, error) {
+	return winHTTPOpen(
+		userAgent,
+		getAccessFlag(),
+		nil, /* WINHTTP_NO_PROXY_NAME */
+		nil, /* WINHTTP_NO_PROXY_BYPASS */
+		0,
+	)
 }
 
 type winHTTPInternet windows.Handle
 
 func (hi winHTTPInternet) Close() error {
-	if err := closeHandleProc.Find(); err != nil {
-		return err
-	}
-	r, _, err := closeHandleProc.Call(uintptr(hi))
-	if r == 1 {
-		return nil
-	}
-	return err
+	return winHTTPCloseHandle(hi)
 }
 
 // WINHTTP_AUTOPROXY_OPTIONS
 // https://docs.microsoft.com/en-us/windows/win32/api/winhttp/ns-winhttp-winhttp_autoproxy_options
-type autoProxyOptions struct {
+type winHTTPAutoProxyOptions struct {
 	DwFlags                uint32
 	DwAutoDetectFlags      uint32
 	AutoConfigUrl          *uint16
@@ -196,30 +216,46 @@ type autoProxyOptions struct {
 // WINHTTP_PROXY_INFO
 // https://docs.microsoft.com/en-us/windows/win32/api/winhttp/ns-winhttp-winhttp_proxy_info
 type winHTTPProxyInfo struct {
-	AccessType  uint16
+	AccessType  uint32
 	Proxy       *uint16
 	ProxyBypass *uint16
 }
 
-var proxyForURLOpts = &autoProxyOptions{
+type winHGlobal windows.Handle
+
+func globalFreeUTF16Ptr(p *uint16) error {
+	return globalFree((winHGlobal)(unsafe.Pointer(p)))
+}
+
+func (pi *winHTTPProxyInfo) free() {
+	if pi.Proxy != nil {
+		globalFreeUTF16Ptr(pi.Proxy)
+		pi.Proxy = nil
+	}
+	if pi.ProxyBypass != nil {
+		globalFreeUTF16Ptr(pi.ProxyBypass)
+		pi.ProxyBypass = nil
+	}
+}
+
+var proxyForURLOpts = &winHTTPAutoProxyOptions{
 	DwFlags:           winHTTP_AUTOPROXY_ALLOW_AUTOCONFIG | winHTTP_AUTOPROXY_AUTO_DETECT,
 	DwAutoDetectFlags: winHTTP_AUTO_DETECT_TYPE_DHCP, // | winHTTP_AUTO_DETECT_TYPE_DNS_A,
 }
 
 func (hi winHTTPInternet) GetProxyForURL(urlStr string) (string, error) {
-	if err := getProxyForUrlProc.Find(); err != nil {
+	var out winHTTPProxyInfo
+	err := winHTTPGetProxyForURL(
+		hi,
+		windows.StringToUTF16Ptr(urlStr),
+		proxyForURLOpts,
+		&out,
+	)
+	if err != nil {
 		return "", err
 	}
-	var out winHTTPProxyInfo
-	r, _, err := getProxyForUrlProc.Call(
-		uintptr(hi),
-		uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(urlStr))),
-		uintptr(unsafe.Pointer(proxyForURLOpts)),
-		uintptr(unsafe.Pointer(&out)))
-	if r == 1 {
-		return windows.UTF16PtrToString(out.Proxy), nil
-	}
-	return "", err
+	defer out.free()
+	return windows.UTF16PtrToString(out.Proxy), nil
 }
 
 func sysAuthHeaderWindows(u *url.URL) (string, error) {

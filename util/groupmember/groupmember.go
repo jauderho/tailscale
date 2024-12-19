@@ -1,20 +1,29 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package groupmember verifies group membership of the provided user on the
 // local system.
 package groupmember
 
 import (
-	"errors"
-	"runtime"
+	"os/user"
+	"slices"
 )
-
-var ErrNotImplemented = errors.New("not implemented for GOOS=" + runtime.GOOS)
 
 // IsMemberOfGroup reports whether the provided user is a member of
 // the provided system group.
 func IsMemberOfGroup(group, userName string) (bool, error) {
-	return isMemberOfGroup(group, userName)
+	u, err := user.Lookup(userName)
+	if err != nil {
+		return false, err
+	}
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		return false, err
+	}
+	ugids, err := u.GroupIds()
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(ugids, g.Gid), nil
 }

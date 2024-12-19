@@ -1,21 +1,20 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
 import (
+	"net/netip"
 	"testing"
 
-	"inet.af/netaddr"
 	"tailscale.com/types/ipproto"
 )
 
 func TestICMPv6PingResponse(t *testing.T) {
 	pingHdr := ICMP6Header{
 		IP6Header: IP6Header{
-			Src:     netaddr.MustParseIP("1::1"),
-			Dst:     netaddr.MustParseIP("2::2"),
+			Src:     netip.MustParseAddr("1::1"),
+			Dst:     netip.MustParseAddr("2::2"),
 			IPProto: ipproto.ICMPv6,
 		},
 		Type: ICMP6EchoRequest,

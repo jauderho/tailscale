@@ -1,10 +1,10 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"fmt"
 
@@ -63,7 +63,7 @@ func (k DiscoPrivate) Public() DiscoPublic {
 	return ret
 }
 
-// Shared returns the DiscoShared for communication betweek k and p.
+// Shared returns the DiscoShared for communication between k and p.
 func (k DiscoPrivate) Shared(p DiscoPublic) DiscoShared {
 	if k.IsZero() || p.IsZero() {
 		panic("can't compute shared secret with zero keys")
@@ -128,9 +128,22 @@ func (k DiscoPublic) String() string {
 	return string(bs)
 }
 
+// Compare returns an integer comparing DiscoPublic k and l lexicographically.
+// The result will be 0 if k == l, -1 if k < l, and +1 if k > l. This is useful
+// for situations requiring only one node in a pair to perform some operation,
+// e.g. probing UDP path lifetime.
+func (k DiscoPublic) Compare(l DiscoPublic) int {
+	return bytes.Compare(k.k[:], l.k[:])
+}
+
+// AppendText implements encoding.TextAppender.
+func (k DiscoPublic) AppendText(b []byte) ([]byte, error) {
+	return appendHexKey(b, discoPublicHexPrefix, k.k[:]), nil
+}
+
 // MarshalText implements encoding.TextMarshaler.
 func (k DiscoPublic) MarshalText() ([]byte, error) {
-	return toHex(k.k[:], discoPublicHexPrefix), nil
+	return k.AppendText(nil)
 }
 
 // MarshalText implements encoding.TextUnmarshaler.

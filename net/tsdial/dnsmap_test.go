@@ -1,21 +1,28 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tsdial
 
 import (
+	"net/netip"
 	"reflect"
 	"testing"
 
-	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/netmap"
 )
 
+func nodeViews(v []*tailcfg.Node) []tailcfg.NodeView {
+	nv := make([]tailcfg.NodeView, len(v))
+	for i, n := range v {
+		nv[i] = n.View()
+	}
+	return nv
+}
+
 func TestDNSMapFromNetworkMap(t *testing.T) {
-	pfx := netaddr.MustParseIPPrefix
-	ip := netaddr.MustParseIP
+	pfx := netip.MustParsePrefix
+	ip := netip.MustParseAddr
 	tests := []struct {
 		name string
 		nm   *netmap.NetworkMap
@@ -25,10 +32,12 @@ func TestDNSMapFromNetworkMap(t *testing.T) {
 			name: "self",
 			nm: &netmap.NetworkMap{
 				Name: "foo.tailnet",
-				Addresses: []netaddr.IPPrefix{
-					pfx("100.102.103.104/32"),
-					pfx("100::123/128"),
-				},
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						pfx("100.102.103.104/32"),
+						pfx("100::123/128"),
+					},
+				}).View(),
 			},
 			want: dnsMap{
 				"foo":         ip("100.102.103.104"),
@@ -39,24 +48,26 @@ func TestDNSMapFromNetworkMap(t *testing.T) {
 			name: "self_and_peers",
 			nm: &netmap.NetworkMap{
 				Name: "foo.tailnet",
-				Addresses: []netaddr.IPPrefix{
-					pfx("100.102.103.104/32"),
-					pfx("100::123/128"),
-				},
-				Peers: []*tailcfg.Node{
-					{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						pfx("100.102.103.104/32"),
+						pfx("100::123/128"),
+					},
+				}).View(),
+				Peers: []tailcfg.NodeView{
+					(&tailcfg.Node{
 						Name: "a.tailnet",
-						Addresses: []netaddr.IPPrefix{
+						Addresses: []netip.Prefix{
 							pfx("100.0.0.201/32"),
 							pfx("100::201/128"),
 						},
-					},
-					{
+					}).View(),
+					(&tailcfg.Node{
 						Name: "b.tailnet",
-						Addresses: []netaddr.IPPrefix{
+						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
-					},
+					}).View(),
 				},
 			},
 			want: dnsMap{
@@ -72,24 +83,26 @@ func TestDNSMapFromNetworkMap(t *testing.T) {
 			name: "self_has_v6_only",
 			nm: &netmap.NetworkMap{
 				Name: "foo.tailnet",
-				Addresses: []netaddr.IPPrefix{
-					pfx("100::123/128"),
-				},
-				Peers: []*tailcfg.Node{
+				SelfNode: (&tailcfg.Node{
+					Addresses: []netip.Prefix{
+						pfx("100::123/128"),
+					},
+				}).View(),
+				Peers: nodeViews([]*tailcfg.Node{
 					{
 						Name: "a.tailnet",
-						Addresses: []netaddr.IPPrefix{
+						Addresses: []netip.Prefix{
 							pfx("100.0.0.201/32"),
 							pfx("100::201/128"),
 						},
 					},
 					{
 						Name: "b.tailnet",
-						Addresses: []netaddr.IPPrefix{
+						Addresses: []netip.Prefix{
 							pfx("100::202/128"),
 						},
 					},
-				},
+				}),
 			},
 			want: dnsMap{
 				"foo":         ip("100::123"),

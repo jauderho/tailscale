@@ -1,11 +1,10 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package smallzstd
 
 import (
-	"io/ioutil"
+	"os"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -55,7 +54,7 @@ func benchEncoder(b *testing.B, mk func() (*zstd.Encoder, error)) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		e.EncodeAll(in, out)
 	}
 }
@@ -67,7 +66,7 @@ func benchEncoderWithConstruction(b *testing.B, mk func() (*zstd.Encoder, error)
 	out := make([]byte, 0, 10<<10) // 10kiB
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		e, err := mk()
 		if err != nil {
 			b.Fatalf("making encoder: %v", err)
@@ -89,7 +88,7 @@ func benchDecoder(b *testing.B, mk func() (*zstd.Decoder, error)) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		d.DecodeAll(in, out)
 	}
 }
@@ -101,7 +100,7 @@ func benchDecoderWithConstruction(b *testing.B, mk func() (*zstd.Decoder, error)
 	out := make([]byte, 0, 10<<10)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		d, err := mk()
 		if err != nil {
 			b.Fatalf("creating decoder: %v", err)
@@ -113,7 +112,7 @@ func benchDecoderWithConstruction(b *testing.B, mk func() (*zstd.Decoder, error)
 
 func testdata(b *testing.B) []byte {
 	b.Helper()
-	in, err := ioutil.ReadFile("testdata")
+	in, err := os.ReadFile("testdata")
 	if err != nil {
 		b.Fatalf("reading testdata: %v", err)
 	}

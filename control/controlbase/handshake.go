@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlbase
 
@@ -32,7 +31,7 @@ const (
 	protocolName = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
 	// protocolVersion is the version of the control protocol that
 	// Client will use when initiating a handshake.
-	protocolVersion uint16 = 1
+	//protocolVersion uint16 = 1
 	// protocolVersionPrefix is the name portion of the protocol
 	// name+version string that gets mixed into the handshake as a
 	// prologue.
@@ -66,7 +65,7 @@ type HandshakeContinuation func(context.Context, net.Conn) (*Conn, error)
 // protocol switching. By splitting the handshake into an initial
 // message and a continuation, we can embed the handshake initiation
 // into the HTTP protocol switching request and avoid a bit of delay.
-func ClientDeferred(machineKey key.MachinePrivate, controlKey key.MachinePublic) (initialHandshake []byte, continueHandshake HandshakeContinuation, err error) {
+func ClientDeferred(machineKey key.MachinePrivate, controlKey key.MachinePublic, protocolVersion uint16) (initialHandshake []byte, continueHandshake HandshakeContinuation, err error) {
 	var s symmetricState
 	s.Initialize()
 
@@ -78,7 +77,7 @@ func ClientDeferred(machineKey key.MachinePrivate, controlKey key.MachinePublic)
 	s.MixHash(controlKey.UntypedBytes())
 
 	// -> e, es, s, ss
-	init := mkInitiationMessage()
+	init := mkInitiationMessage(protocolVersion)
 	machineEphemeral := key.NewMachine()
 	machineEphemeralPub := machineEphemeral.Public()
 	copy(init.EphemeralPub(), machineEphemeralPub.UntypedBytes())
@@ -96,7 +95,7 @@ func ClientDeferred(machineKey key.MachinePrivate, controlKey key.MachinePublic)
 	s.EncryptAndHash(cipher, init.Tag(), nil) // empty message payload
 
 	cont := func(ctx context.Context, conn net.Conn) (*Conn, error) {
-		return continueClientHandshake(ctx, conn, &s, machineKey, machineEphemeral, controlKey)
+		return continueClientHandshake(ctx, conn, &s, machineKey, machineEphemeral, controlKey, protocolVersion)
 	}
 	return init[:], cont, nil
 }
@@ -107,8 +106,8 @@ func ClientDeferred(machineKey key.MachinePrivate, controlKey key.MachinePublic)
 // This is a helper for when you don't need the fancy
 // continuation-style handshake, and just want to synchronously
 // upgrade a net.Conn to a secure transport.
-func Client(ctx context.Context, conn net.Conn, machineKey key.MachinePrivate, controlKey key.MachinePublic) (*Conn, error) {
-	init, cont, err := ClientDeferred(machineKey, controlKey)
+func Client(ctx context.Context, conn net.Conn, machineKey key.MachinePrivate, controlKey key.MachinePublic, protocolVersion uint16) (*Conn, error) {
+	init, cont, err := ClientDeferred(machineKey, controlKey, protocolVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +117,7 @@ func Client(ctx context.Context, conn net.Conn, machineKey key.MachinePrivate, c
 	return cont(ctx, conn)
 }
 
-func continueClientHandshake(ctx context.Context, conn net.Conn, s *symmetricState, machineKey, machineEphemeral key.MachinePrivate, controlKey key.MachinePublic) (*Conn, error) {
+func continueClientHandshake(ctx context.Context, conn net.Conn, s *symmetricState, machineKey, machineEphemeral key.MachinePrivate, controlKey key.MachinePublic, protocolVersion uint16) (*Conn, error) {
 	// No matter what, this function can only run once per s. Ensure
 	// attempted reuse causes a panic.
 	defer func() {
@@ -239,9 +238,12 @@ func Server(ctx context.Context, conn net.Conn, controlKey key.MachinePrivate, o
 	} else if _, err := io.ReadFull(conn, init.Header()); err != nil {
 		return nil, err
 	}
-	if init.Version() != protocolVersion {
-		return nil, sendErr("unsupported protocol version")
-	}
+	// Just a rename to make it more obvious what the value is. In the
+	// current implementation we don't need to block any protocol
+	// versions at this layer, it's safe to let the handshake proceed
+	// and then let the caller make decisions based on the agreed-upon
+	// protocol version.
+	clientVersion := init.Version()
 	if init.Type() != msgTypeInitiation {
 		return nil, sendErr("unexpected handshake message type")
 	}
@@ -257,7 +259,7 @@ func Server(ctx context.Context, conn net.Conn, controlKey key.MachinePrivate, o
 
 	// prologue. Can only do this once we at least think the client is
 	// handshaking using a supported version.
-	s.MixHash(protocolVersionPrologue(protocolVersion))
+	s.MixHash(protocolVersionPrologue(clientVersion))
 
 	// <- s
 	// ...
@@ -310,7 +312,7 @@ func Server(ctx context.Context, conn net.Conn, controlKey key.MachinePrivate, o
 
 	c := &Conn{
 		conn:          conn,
-		version:       protocolVersion,
+		version:       clientVersion,
 		peer:          machineKey,
 		handshakeHash: s.h,
 		tx: txState{

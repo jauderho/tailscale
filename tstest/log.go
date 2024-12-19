@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
 
@@ -43,7 +42,9 @@ func (panicLogWriter) Write(b []byte) (int, error) {
 	// interfaces.GetState & tshttpproxy code to allow pushing
 	// down a Logger yet. TODO(bradfitz): do that refactoring once
 	// 1.2.0 is out.
-	if bytes.Contains(b, []byte("tshttpproxy: ")) {
+	if bytes.Contains(b, []byte("tshttpproxy: ")) ||
+		bytes.Contains(b, []byte("runtime/panic.go:")) ||
+		bytes.Contains(b, []byte("XXX")) {
 		os.Stderr.Write(b)
 		return len(b), nil
 	}
@@ -82,7 +83,7 @@ type LogLineTracker struct {
 }
 
 // Logf logs to its underlying logger and also tracks that the given format pattern has been seen.
-func (lt *LogLineTracker) Logf(format string, args ...interface{}) {
+func (lt *LogLineTracker) Logf(format string, args ...any) {
 	lt.mu.Lock()
 	if lt.closed {
 		lt.mu.Unlock()
@@ -131,7 +132,7 @@ type MemLogger struct {
 	bytes.Buffer
 }
 
-func (ml *MemLogger) Logf(format string, args ...interface{}) {
+func (ml *MemLogger) Logf(format string, args ...any) {
 	ml.Lock()
 	defer ml.Unlock()
 	fmt.Fprintf(&ml.Buffer, format, args...)
@@ -144,4 +145,51 @@ func (ml *MemLogger) String() string {
 	ml.Lock()
 	defer ml.Unlock()
 	return ml.Buffer.String()
+}
+
+// WhileTestRunningLogger returns a logger.Logf that logs to t.Logf until the
+// test finishes, at which point it no longer logs anything.
+func WhileTestRunningLogger(t testing.TB) logger.Logf {
+	var (
+		mu   sync.RWMutex
+		done bool
+	)
+	tlogf := logger.TestLogger(t)
+	logger := func(format string, args ...any) {
+		t.Helper()
+
+		mu.RLock()
+		defer mu.RUnlock()
+
+		if done {
+			return
+		}
+		tlogf(format, args...)
+	}
+
+	// t.Cleanup is run before the test is marked as done, so by acquiring
+	// the mutex and then disabling logs, we know that all existing log
+	// functions have completed, and that no future calls to the logger
+	// will log something.
+	//
+	// We can't do this with an atomic bool, since it's possible to
+	// observe the following race:
+	//
+	//    test goroutine                goroutine 1
+	//    --------------                -----------
+	//                                  check atomic, testFinished = no
+	//    test finishes
+	//    run t.Cleanups
+	//    set testFinished = true
+	//                                  call t.Logf
+	//                                  panic
+	//
+	// Using a mutex ensures that all actions in goroutine 1 in the
+	// sequence above occur atomically, and thus should not panic.
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		done = true
+	})
+	return logger
 }

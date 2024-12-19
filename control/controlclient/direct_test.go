@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
 
@@ -8,12 +7,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
-	"inet.af/netaddr"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
@@ -30,6 +31,7 @@ func TestNewDirect(t *testing.T) {
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) {
 			return k, nil
 		},
+		Dialer: tsdial.NewDialer(netmon.NewStatic()),
 	}
 	c, err := NewDirect(opts)
 	if err != nil {
@@ -40,7 +42,10 @@ func TestNewDirect(t *testing.T) {
 		t.Errorf("c.serverURL got %v want %v", c.serverURL, opts.ServerURL)
 	}
 
-	if !hi.Equal(c.hostinfo) {
+	// hi is stored without its NetInfo field.
+	hiWithoutNi := *hi
+	hiWithoutNi.NetInfo = nil
+	if !hiWithoutNi.Equal(c.hostinfo) {
 		t.Errorf("c.hostinfo got %v want %v", c.hostinfo, hi)
 	}
 
@@ -66,29 +71,25 @@ func TestNewDirect(t *testing.T) {
 	}
 
 	endpoints := fakeEndpoints(1, 2, 3)
-	changed = c.newEndpoints(12, endpoints)
+	changed = c.newEndpoints(endpoints)
 	if !changed {
-		t.Errorf("c.newEndpoints(12) want true got %v", changed)
+		t.Errorf("c.newEndpoints want true got %v", changed)
 	}
-	changed = c.newEndpoints(12, endpoints)
+	changed = c.newEndpoints(endpoints)
 	if changed {
-		t.Errorf("c.newEndpoints(12) want false got %v", changed)
-	}
-	changed = c.newEndpoints(13, endpoints)
-	if !changed {
-		t.Errorf("c.newEndpoints(13) want true got %v", changed)
+		t.Errorf("c.newEndpoints want false got %v", changed)
 	}
 	endpoints = fakeEndpoints(4, 5, 6)
-	changed = c.newEndpoints(13, endpoints)
+	changed = c.newEndpoints(endpoints)
 	if !changed {
-		t.Errorf("c.newEndpoints(13) want true got %v", changed)
+		t.Errorf("c.newEndpoints want true got %v", changed)
 	}
 }
 
 func fakeEndpoints(ports ...uint16) (ret []tailcfg.Endpoint) {
 	for _, port := range ports {
 		ret = append(ret, tailcfg.Endpoint{
-			Addr: netaddr.IPPortFrom(netaddr.IP{}, port),
+			Addr: netip.AddrPortFrom(netip.Addr{}, port),
 		})
 	}
 	return
@@ -106,6 +107,7 @@ func TestTsmpPing(t *testing.T) {
 		GetMachinePrivateKey: func() (key.MachinePrivate, error) {
 			return k, nil
 		},
+		Dialer: tsdial.NewDialer(netmon.NewStatic()),
 	}
 
 	c, err := NewDirect(opts)
@@ -113,7 +115,8 @@ func TestTsmpPing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pingRes := &ipnstate.PingResult{
+	pingRes := &tailcfg.PingResponse{
+		Type:     "TSMP",
 		IP:       "123.456.7890",
 		Err:      "",
 		NodeName: "testnode",

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgcfg
 
@@ -8,18 +7,17 @@ import (
 	"bufio"
 	"bytes"
 	"io"
-	"net"
+	"net/netip"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/tailscale/wireguard-go/conn"
+	"github.com/tailscale/wireguard-go/device"
+	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/mem"
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun"
-	"inet.af/netaddr"
 	"tailscale.com/types/key"
 )
 
@@ -30,19 +28,19 @@ func TestDeviceConfig(t *testing.T) {
 		return k.Public(), k
 	}
 	k1, pk1 := newK()
-	ip1 := netaddr.MustParseIPPrefix("10.0.0.1/32")
+	ip1 := netip.MustParsePrefix("10.0.0.1/32")
 
 	k2, pk2 := newK()
-	ip2 := netaddr.MustParseIPPrefix("10.0.0.2/32")
+	ip2 := netip.MustParsePrefix("10.0.0.2/32")
 
 	k3, _ := newK()
-	ip3 := netaddr.MustParseIPPrefix("10.0.0.3/32")
+	ip3 := netip.MustParsePrefix("10.0.0.3/32")
 
 	cfg1 := &Config{
 		PrivateKey: pk1,
 		Peers: []Peer{{
 			PublicKey:  k2,
-			AllowedIPs: []netaddr.IPPrefix{ip2},
+			AllowedIPs: []netip.Prefix{ip2},
 		}},
 	}
 
@@ -50,7 +48,7 @@ func TestDeviceConfig(t *testing.T) {
 		PrivateKey: pk2,
 		Peers: []Peer{{
 			PublicKey:           k1,
-			AllowedIPs:          []netaddr.IPPrefix{ip1},
+			AllowedIPs:          []netip.Prefix{ip1},
 			PersistentKeepalive: 5,
 		}},
 	}
@@ -143,7 +141,7 @@ func TestDeviceConfig(t *testing.T) {
 	t.Run("device1 add new peer", func(t *testing.T) {
 		cfg1.Peers = append(cfg1.Peers, Peer{
 			PublicKey:  k3,
-			AllowedIPs: []netaddr.IPPrefix{ip3},
+			AllowedIPs: []netip.Prefix{ip3},
 		})
 		sort.Slice(cfg1.Peers, func(i, j int) bool {
 			return cfg1.Peers[i].PublicKey.Less(cfg1.Peers[j].PublicKey)
@@ -214,18 +212,18 @@ func newNilTun() tun.Device {
 	}
 }
 
-func (t *nilTun) File() *os.File         { return nil }
-func (t *nilTun) Flush() error           { return nil }
-func (t *nilTun) MTU() (int, error)      { return 1420, nil }
-func (t *nilTun) Name() (string, error)  { return "niltun", nil }
-func (t *nilTun) Events() chan tun.Event { return t.events }
+func (t *nilTun) File() *os.File           { return nil }
+func (t *nilTun) Flush() error             { return nil }
+func (t *nilTun) MTU() (int, error)        { return 1420, nil }
+func (t *nilTun) Name() (string, error)    { return "niltun", nil }
+func (t *nilTun) Events() <-chan tun.Event { return t.events }
 
-func (t *nilTun) Read(data []byte, offset int) (int, error) {
+func (t *nilTun) Read(data [][]byte, sizes []int, offset int) (int, error) {
 	<-t.closed
 	return 0, io.EOF
 }
 
-func (t *nilTun) Write(data []byte, offset int) (int, error) {
+func (t *nilTun) Write(data [][]byte, offset int) (int, error) {
 	<-t.closed
 	return 0, io.EOF
 }
@@ -236,18 +234,21 @@ func (t *nilTun) Close() error {
 	return nil
 }
 
+func (t *nilTun) BatchSize() int { return 1 }
+
 // A noopBind is a conn.Bind that does no actual binding work.
 type noopBind struct{}
 
 func (noopBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
 	return nil, 1, nil
 }
-func (noopBind) Close() error                          { return nil }
-func (noopBind) SetMark(mark uint32) error             { return nil }
-func (noopBind) Send(b []byte, ep conn.Endpoint) error { return nil }
+func (noopBind) Close() error                            { return nil }
+func (noopBind) SetMark(mark uint32) error               { return nil }
+func (noopBind) Send(b [][]byte, ep conn.Endpoint) error { return nil }
 func (noopBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 	return dummyEndpoint(s), nil
 }
+func (noopBind) BatchSize() int { return 1 }
 
 // A dummyEndpoint is a string holding the endpoint destination.
 type dummyEndpoint string
@@ -256,5 +257,5 @@ func (e dummyEndpoint) ClearSrc()           {}
 func (e dummyEndpoint) SrcToString() string { return "" }
 func (e dummyEndpoint) DstToString() string { return string(e) }
 func (e dummyEndpoint) DstToBytes() []byte  { return nil }
-func (e dummyEndpoint) DstIP() net.IP       { return nil }
-func (dummyEndpoint) SrcIP() net.IP         { return nil }
+func (e dummyEndpoint) DstIP() netip.Addr   { return netip.Addr{} }
+func (dummyEndpoint) SrcIP() netip.Addr     { return netip.Addr{} }

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package jsonutil provides utilities to improve JSON performance.
 // It includes an Unmarshal wrapper that amortizes allocated garbage over subsequent runs
@@ -20,13 +19,13 @@ type decoder struct {
 }
 
 var readerPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return bytes.NewReader(nil)
 	},
 }
 
 var decoderPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		var d decoder
 		d.r = readerPool.Get().(*bytes.Reader)
 		d.dec = json.NewDecoder(d.r)
@@ -47,7 +46,7 @@ var decoderPool = sync.Pool{
 // don't use this Unmarshal.
 //
 // This Unmarshal allocates considerably less memory.
-func Unmarshal(b []byte, v interface{}) error {
+func Unmarshal(b []byte, v any) error {
 	d := decoderPool.Get().(*decoder)
 	d.r.Reset(b)
 	off := d.dec.InputOffset()

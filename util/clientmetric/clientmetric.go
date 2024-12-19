@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package clientmetric provides client-side metrics whose values
 // get occasionally logged.
@@ -10,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"expvar"
 	"fmt"
 	"io"
 	"sort"
@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"tailscale.com/util/set"
 )
 
 var (
@@ -40,8 +42,9 @@ var (
 // scanEntry contains the minimal data needed for quickly scanning
 // memory for changed values. It's small to reduce memory pressure.
 type scanEntry struct {
-	v          *int64 // Metric.v
-	lastLogged int64  // last logged value
+	v          *int64       // Metric.v
+	f          func() int64 // Metric.f
+	lastLogged int64        // last logged value
 }
 
 // Type is a metric type: counter or gauge.
@@ -56,10 +59,12 @@ const (
 //
 // It's safe for concurrent use.
 type Metric struct {
-	v      *int64 // atomic; the metric value
-	regIdx int    // index into lastLogVal and unsorted
-	name   string
-	typ    Type
+	v              *int64       // atomic; the metric value
+	f              func() int64 // value function (v is ignored if f is non-nil)
+	regIdx         int          // index into lastLogVal and unsorted
+	name           string
+	typ            Type
+	deltasDisabled bool
 
 	// The following fields are owned by the package-level 'mu':
 
@@ -75,13 +80,29 @@ type Metric struct {
 }
 
 func (m *Metric) Name() string { return m.name }
-func (m *Metric) Value() int64 { return atomic.LoadInt64(m.v) }
-func (m *Metric) Type() Type   { return m.typ }
+
+func (m *Metric) Value() int64 {
+	if m.f != nil {
+		return m.f()
+	}
+	return atomic.LoadInt64(m.v)
+}
+
+func (m *Metric) Type() Type { return m.typ }
+
+// DisableDeltas disables uploading of deltas for this metric (absolute values
+// are always uploaded).
+func (m *Metric) DisableDeltas() {
+	m.deltasDisabled = true
+}
 
 // Add increments m's value by n.
 //
 // If m is of type counter, n should not be negative.
 func (m *Metric) Add(n int64) {
+	if m.f != nil {
+		panic("Add() called on metric with value function")
+	}
 	atomic.AddInt64(m.v, n)
 }
 
@@ -89,6 +110,9 @@ func (m *Metric) Add(n int64) {
 //
 // If m is of type counter, Set should not be used.
 func (m *Metric) Set(v int64) {
+	if m.f != nil {
+		panic("Set() called on metric with value function")
+	}
 	atomic.StoreInt64(m.v, v)
 }
 
@@ -106,15 +130,19 @@ func (m *Metric) Publish() {
 	metrics[m.name] = m
 	sortedDirty = true
 
-	if len(valFreeList) == 0 {
-		valFreeList = make([]int64, 256)
+	if m.f != nil {
+		lastLogVal = append(lastLogVal, scanEntry{f: m.f})
+	} else {
+		if len(valFreeList) == 0 {
+			valFreeList = make([]int64, 256)
+		}
+		m.v = &valFreeList[0]
+		valFreeList = valFreeList[1:]
+		lastLogVal = append(lastLogVal, scanEntry{v: m.v})
 	}
-	m.v = &valFreeList[0]
-	valFreeList = valFreeList[1:]
 
 	m.regIdx = len(unsorted)
 	unsorted = append(unsorted, m)
-	lastLogVal = append(lastLogVal, scanEntry{v: m.v})
 }
 
 // Metrics returns the sorted list of metrics.
@@ -134,6 +162,15 @@ func Metrics() []*Metric {
 		})
 	}
 	return sorted
+}
+
+// HasPublished reports whether a metric with the given name has already been
+// published.
+func HasPublished(name string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	_, ok := metrics[name]
+	return ok
 }
 
 // NewUnpublished initializes a new Metric without calling Publish on
@@ -169,6 +206,74 @@ func NewGauge(name string) *Metric {
 	return m
 }
 
+// NewCounterFunc returns a counter metric that has its value determined by
+// calling the provided function (calling Add() and Set() will panic). No
+// locking guarantees are made for the invocation.
+func NewCounterFunc(name string, f func() int64) *Metric {
+	m := NewUnpublished(name, TypeCounter)
+	m.f = f
+	m.Publish()
+	return m
+}
+
+// NewGaugeFunc returns a gauge metric that has its value determined by
+// calling the provided function (calling Add() and Set() will panic). No
+// locking guarantees are made for the invocation.
+func NewGaugeFunc(name string, f func() int64) *Metric {
+	m := NewUnpublished(name, TypeGauge)
+	m.f = f
+	m.Publish()
+	return m
+}
+
+// AggregateCounter returns a sum of expvar counters registered with it.
+type AggregateCounter struct {
+	mu       sync.RWMutex
+	counters set.Set[*expvar.Int]
+}
+
+func (c *AggregateCounter) Value() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var sum int64
+	for cnt := range c.counters {
+		sum += cnt.Value()
+	}
+	return sum
+}
+
+// Register registers provided expvar counter.
+// When a counter is added to the counter, it will be reset
+// to start counting from 0. This is to avoid incrementing the
+// counter with an unexpectedly large value.
+func (c *AggregateCounter) Register(counter *expvar.Int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// No need to do anything if it's already registered.
+	if c.counters.Contains(counter) {
+		return
+	}
+	counter.Set(0)
+	c.counters.Add(counter)
+}
+
+// UnregisterAll unregisters all counters resulting in it
+// starting back down at zero. This is to ensure monotonicity
+// and respect the semantics of the counter.
+func (c *AggregateCounter) UnregisterAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counters = set.Set[*expvar.Int]{}
+}
+
+// NewAggregateCounter returns a new aggregate counter that returns
+// a sum of expvar variables registered with it.
+func NewAggregateCounter(name string) *AggregateCounter {
+	c := &AggregateCounter{counters: set.Set[*expvar.Int]{}}
+	NewGaugeFunc(name, c.Value)
+	return c
+}
+
 // WritePrometheusExpositionFormat writes all client metrics to w in
 // the Prometheus text-based exposition format.
 //
@@ -188,7 +293,7 @@ func WritePrometheusExpositionFormat(w io.Writer) {
 const (
 	// metricLogNameFrequency is how often a metric's name=>id
 	// mapping is redundantly put in the logs. In other words,
-	// this is how how far in the logs you need to fetch from a
+	// this is how far in the logs you need to fetch from a
 	// given point in time to recompute the metrics at that point
 	// in time.
 	metricLogNameFrequency = 4 * time.Hour
@@ -207,11 +312,11 @@ const (
 // without further escaping.
 //
 // The current encoding is:
-//   * name immediately following metric:
+//   - name immediately following metric:
 //     'N' + hex(varint(len(name))) + name
-//   * set value of a metric:
+//   - set value of a metric:
 //     'S' + hex(varint(wireid)) + hex(varint(value))
-//   * increment a metric: (decrements if negative)
+//   - increment a metric: (decrements if negative)
 //     'I' + hex(varint(wireid)) + hex(varint(value))
 func EncodeLogTailMetricsDelta() string {
 	mu.Lock()
@@ -225,7 +330,12 @@ func EncodeLogTailMetricsDelta() string {
 
 	var enc *deltaEncBuf // lazy
 	for i, ent := range lastLogVal {
-		val := atomic.LoadInt64(ent.v)
+		var val int64
+		if ent.f != nil {
+			val = ent.f()
+		} else {
+			val = atomic.LoadInt64(ent.v)
+		}
 		delta := val - ent.lastLogged
 		if delta == 0 {
 			continue
@@ -240,9 +350,14 @@ func EncodeLogTailMetricsDelta() string {
 			numWireID++
 			m.wireID = numWireID
 		}
+
+		writeValue := m.deltasDisabled
 		if m.lastNamed.IsZero() || now.Sub(m.lastNamed) > metricLogNameFrequency {
-			enc.writeName(m.Name())
+			enc.writeName(m.Name(), m.Type())
 			m.lastNamed = now
+			writeValue = true
+		}
+		if writeValue {
 			enc.writeValue(m.wireID, val)
 		} else {
 			enc.writeDelta(m.wireID, delta)
@@ -256,7 +371,7 @@ func EncodeLogTailMetricsDelta() string {
 }
 
 var deltaPool = &sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(deltaEncBuf)
 	},
 }
@@ -271,9 +386,16 @@ type deltaEncBuf struct {
 // writeName writes a "name" (N) record to the buffer, which notes
 // that the immediately following record's wireID has the provided
 // name.
-func (b *deltaEncBuf) writeName(name string) {
+func (b *deltaEncBuf) writeName(name string, typ Type) {
+	var namePrefix string
+	if typ == TypeGauge {
+		// Add the gauge_ prefix so that tsweb knows that this is a gauge metric
+		// when generating the Prometheus version.
+		namePrefix = "gauge_"
+	}
 	b.buf.WriteByte('N')
-	b.writeHexVarint(int64(len(name)))
+	b.writeHexVarint(int64(len(namePrefix) + len(name)))
+	b.buf.WriteString(namePrefix)
 	b.buf.WriteString(name)
 }
 
@@ -303,4 +425,12 @@ func (b *deltaEncBuf) writeHexVarint(v int64) {
 	hexBuf := b.buf.Bytes()[oldLen : oldLen+hexLen]
 	hex.Encode(hexBuf, b.scratch[:n])
 	b.buf.Write(hexBuf)
+}
+
+var TestHooks testHooks
+
+type testHooks struct{}
+
+func (testHooks) ResetLastDelta() {
+	lastDelta = time.Time{}
 }

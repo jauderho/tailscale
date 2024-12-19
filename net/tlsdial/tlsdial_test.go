@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tlsdial
 
@@ -16,6 +15,8 @@ import (
 	"runtime"
 	"sync/atomic"
 	"testing"
+
+	"tailscale.com/health"
 )
 
 func resetOnce() {
@@ -43,7 +44,7 @@ func TestFallbackRootWorks(t *testing.T) {
 	crtFile := filepath.Join(d, "tlsdial.test.crt")
 	keyFile := filepath.Join(d, "tlsdial.test.key")
 	caFile := filepath.Join(d, "rootCA.pem")
-	cmd := exec.Command(filepath.Join(runtime.GOROOT(), "bin", "go"),
+	cmd := exec.Command("go",
 		"run", "filippo.io/mkcert",
 		"--cert-file="+crtFile,
 		"--key-file="+keyFile,
@@ -106,7 +107,8 @@ func TestFallbackRootWorks(t *testing.T) {
 		},
 		DisableKeepAlives: true, // for test cleanup ease
 	}
-	tr.TLSClientConfig = Config("tlsdial.test", tr.TLSClientConfig)
+	ht := new(health.Tracker)
+	tr.TLSClientConfig = Config("tlsdial.test", ht, tr.TLSClientConfig)
 	c := &http.Client{Transport: tr}
 
 	ctr0 := atomic.LoadInt32(&counterFallbackOK)

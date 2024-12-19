@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package resolver
 
@@ -11,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
+	"net/netip"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -21,26 +22,27 @@ import (
 	"time"
 
 	miekdns "github.com/miekg/dns"
-	"golang.org/x/net/dns/dnsmessage"
 	dns "golang.org/x/net/dns/dnsmessage"
-	"inet.af/netaddr"
+	"tailscale.com/health"
+	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/wgengine/monitor"
 )
 
 var (
-	testipv4 = netaddr.MustParseIP("1.2.3.4")
-	testipv6 = netaddr.MustParseIP("0001:0203:0405:0607:0809:0a0b:0c0d:0e0f")
+	testipv4 = netip.MustParseAddr("1.2.3.4")
+	testipv6 = netip.MustParseAddr("0001:0203:0405:0607:0809:0a0b:0c0d:0e0f")
 
 	testipv4Arpa = dnsname.FQDN("4.3.2.1.in-addr.arpa.")
 	testipv6Arpa = dnsname.FQDN("f.0.e.0.d.0.c.0.b.0.a.0.9.0.8.0.7.0.6.0.5.0.4.0.3.0.2.0.1.0.0.0.ip6.arpa.")
 )
 
 var dnsCfg = Config{
-	Hosts: map[dnsname.FQDN][]netaddr.IP{
+	Hosts: map[dnsname.FQDN][]netip.Addr{
 		"test1.ipn.dev.": {testipv4},
 		"test2.ipn.dev.": {testipv6},
 	},
@@ -89,7 +91,7 @@ func dnspacket(domain dnsname.FQDN, tp dns.Type, ednsSize uint16) []byte {
 }
 
 type dnsResponse struct {
-	ip               netaddr.IP
+	ip               netip.Addr
 	txt              []string
 	name             dnsname.FQDN
 	rcode            dns.RCode
@@ -154,7 +156,7 @@ func unpackResponse(payload []byte) (dnsResponse, error) {
 			if err != nil {
 				return response, err
 			}
-			response.ip = netaddr.IPv6Raw(res.AAAA)
+			response.ip = netip.AddrFrom16(res.AAAA)
 		case dns.TypeTXT:
 			res, err := parser.TXTResource()
 			if err != nil {
@@ -231,32 +233,65 @@ func unpackResponse(payload []byte) (dnsResponse, error) {
 }
 
 func syncRespond(r *Resolver, query []byte) ([]byte, error) {
-	if err := r.EnqueueRequest(query, netaddr.IPPort{}); err != nil {
-		return nil, fmt.Errorf("EnqueueRequest: %w", err)
-	}
-	payload, _, err := r.NextResponse()
-	return payload, err
+	return r.Query(context.Background(), query, "udp", netip.AddrPort{})
 }
 
-func mustIP(str string) netaddr.IP {
-	ip, err := netaddr.ParseIP(str)
+func mustIP(str string) netip.Addr {
+	ip, err := netip.ParseAddr(str)
 	if err != nil {
 		panic(err)
 	}
 	return ip
 }
 
+func TestRoutesRequireNoCustomResolvers(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   Config
+		expected bool
+	}{
+		{"noRoutes", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{}}, true},
+		{"onlyDefault", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"ts.net.": {
+				{},
+			},
+		}}, true},
+		{"oneOther", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"example.com.": {
+				{},
+			},
+		}}, false},
+		{"defaultAndOneOther", Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{
+			"ts.net.": {
+				{},
+			},
+			"example.com.": {
+				{},
+			},
+		}}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.config.RoutesRequireNoCustomResolvers()
+			if result != tt.expected {
+				t.Errorf("result = %v; want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestRDNSNameToIPv4(t *testing.T) {
 	tests := []struct {
 		name   string
 		input  dnsname.FQDN
-		wantIP netaddr.IP
+		wantIP netip.Addr
 		wantOK bool
 	}{
 		{"valid", "4.123.24.1.in-addr.arpa.", netaddr.IPv4(1, 24, 123, 4), true},
-		{"double_dot", "1..2.3.in-addr.arpa.", netaddr.IP{}, false},
-		{"overflow", "1.256.3.4.in-addr.arpa.", netaddr.IP{}, false},
-		{"not_ip", "sub.do.ma.in.in-addr.arpa.", netaddr.IP{}, false},
+		{"double_dot", "1..2.3.in-addr.arpa.", netip.Addr{}, false},
+		{"overflow", "1.256.3.4.in-addr.arpa.", netip.Addr{}, false},
+		{"not_ip", "sub.do.ma.in.in-addr.arpa.", netip.Addr{}, false},
 	}
 
 	for _, tt := range tests {
@@ -275,7 +310,7 @@ func TestRDNSNameToIPv6(t *testing.T) {
 	tests := []struct {
 		name   string
 		input  dnsname.FQDN
-		wantIP netaddr.IP
+		wantIP netip.Addr
 		wantOK bool
 	}{
 		{
@@ -287,19 +322,19 @@ func TestRDNSNameToIPv6(t *testing.T) {
 		{
 			"double_dot",
 			"b..9.8.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.",
-			netaddr.IP{},
+			netip.Addr{},
 			false,
 		},
 		{
 			"double_hex",
 			"b.a.98.0.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.",
-			netaddr.IP{},
+			netip.Addr{},
 			false,
 		},
 		{
 			"not_hex",
 			"b.a.g.0.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.",
-			netaddr.IP{},
+			netip.Addr{},
 			false,
 		},
 	}
@@ -317,7 +352,12 @@ func TestRDNSNameToIPv6(t *testing.T) {
 }
 
 func newResolver(t testing.TB) *Resolver {
-	return New(t.Logf, nil /* no link monitor */, nil /* no link selector */, new(tsdial.Dialer))
+	return New(t.Logf,
+		nil, // no link selector
+		tsdial.NewDialer(netmon.NewStatic()),
+		new(health.Tracker),
+		nil, // no control knobs
+	)
 }
 
 func TestResolveLocal(t *testing.T) {
@@ -330,20 +370,45 @@ func TestResolveLocal(t *testing.T) {
 		name  string
 		qname dnsname.FQDN
 		qtype dns.Type
-		ip    netaddr.IP
+		ip    netip.Addr
 		code  dns.RCode
 	}{
 		{"ipv4", "test1.ipn.dev.", dns.TypeA, testipv4, dns.RCodeSuccess},
 		{"ipv6", "test2.ipn.dev.", dns.TypeAAAA, testipv6, dns.RCodeSuccess},
-		{"no-ipv6", "test1.ipn.dev.", dns.TypeAAAA, netaddr.IP{}, dns.RCodeSuccess},
-		{"nxdomain", "test3.ipn.dev.", dns.TypeA, netaddr.IP{}, dns.RCodeNameError},
-		{"foreign domain", "google.com.", dns.TypeA, netaddr.IP{}, dns.RCodeRefused},
+		{"no-ipv6", "test1.ipn.dev.", dns.TypeAAAA, netip.Addr{}, dns.RCodeSuccess},
+		{"nxdomain", "test3.ipn.dev.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
+		{"foreign domain", "google.com.", dns.TypeA, netip.Addr{}, dns.RCodeRefused},
 		{"all", "test1.ipn.dev.", dns.TypeA, testipv4, dns.RCodeSuccess},
-		{"mx-ipv4", "test1.ipn.dev.", dns.TypeMX, netaddr.IP{}, dns.RCodeSuccess},
-		{"mx-ipv6", "test2.ipn.dev.", dns.TypeMX, netaddr.IP{}, dns.RCodeSuccess},
-		{"mx-nxdomain", "test3.ipn.dev.", dns.TypeMX, netaddr.IP{}, dns.RCodeNameError},
-		{"ns-nxdomain", "test3.ipn.dev.", dns.TypeNS, netaddr.IP{}, dns.RCodeNameError},
-		{"onion-domain", "footest.onion.", dns.TypeA, netaddr.IP{}, dns.RCodeNameError},
+		{"mx-ipv4", "test1.ipn.dev.", dns.TypeMX, netip.Addr{}, dns.RCodeSuccess},
+		{"mx-ipv6", "test2.ipn.dev.", dns.TypeMX, netip.Addr{}, dns.RCodeSuccess},
+		{"mx-nxdomain", "test3.ipn.dev.", dns.TypeMX, netip.Addr{}, dns.RCodeNameError},
+		{"ns-nxdomain", "test3.ipn.dev.", dns.TypeNS, netip.Addr{}, dns.RCodeNameError},
+		{"onion-domain", "footest.onion.", dns.TypeA, netip.Addr{}, dns.RCodeNameError},
+		{"magicdns", dnsSymbolicFQDN, dns.TypeA, netip.MustParseAddr("100.100.100.100"), dns.RCodeSuccess},
+		{"via_hex", dnsname.FQDN("via-0xff.1.2.3.4."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:ff:1.2.3.4"), dns.RCodeSuccess},
+		{"via_dec", dnsname.FQDN("via-1.10.0.0.1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:10.0.0.1"), dns.RCodeSuccess},
+		{"x_via_hex", dnsname.FQDN("4.3.2.1.via-0xff."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:ff:4.3.2.1"), dns.RCodeSuccess},
+		{"x_via_dec", dnsname.FQDN("1.0.0.10.via-1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.0.0.10"), dns.RCodeSuccess},
+		{"via_invalid", dnsname.FQDN("via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+		{"via_invalid_2", dnsname.FQDN("2.3.4.5.via-."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+
+		// Hyphenated 4via6 format.
+		// Without any suffix domain:
+		{"via_form3_hex_bare", dnsname.FQDN("1-2-3-4-via-0xff."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:ff:1.2.3.4"), dns.RCodeSuccess},
+		{"via_form3_dec_bare", dnsname.FQDN("1-2-3-4-via-1."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		// With a Tailscale domain:
+		{"via_form3_dec_ts.net", dnsname.FQDN("1-2-3-4-via-1.foo.ts.net."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		{"via_form3_dec_tailscale.net", dnsname.FQDN("1-2-3-4-via-1.foo.tailscale.net."), dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		// Non-Tailscale domain suffixes aren't allowed for now: (the allowed
+		// suffixes are currently hard-coded and not plumbed via the netmap)
+		{"via_form3_dec_example.com", dnsname.FQDN("1-2-3-4-via-1.example.com."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+		{"via_form3_dec_examplets.net", dnsname.FQDN("1-2-3-4-via-1.examplets.net."), dns.TypeAAAA, netip.Addr{}, dns.RCodeRefused},
+
+		// Resolve A and ALL types of resource records.
+		{"via_type_a", dnsname.FQDN("1-2-3-4-via-1."), dns.TypeA, netip.Addr{}, dns.RCodeSuccess},
+		{"via_invalid_type_a", dnsname.FQDN("1-2-3-4-via-."), dns.TypeA, netip.Addr{}, dns.RCodeRefused},
+		{"via_type_all", dnsname.FQDN("1-2-3-4-via-1."), dns.TypeALL, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:1.2.3.4"), dns.RCodeSuccess},
+		{"via_invalid_type_all", dnsname.FQDN("1-2-3-4-via-."), dns.TypeALL, netip.Addr{}, dns.RCodeRefused},
 	}
 
 	for _, tt := range tests {
@@ -377,6 +442,8 @@ func TestResolveLocalReverse(t *testing.T) {
 		{"ipv4_nxdomain", dnsname.FQDN("5.3.2.1.in-addr.arpa."), "", dns.RCodeNameError},
 		{"ipv6_nxdomain", dnsname.FQDN("0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.0.0.ip6.arpa."), "", dns.RCodeNameError},
 		{"nxdomain", dnsname.FQDN("2.3.4.5.in-addr.arpa."), "", dns.RCodeRefused},
+		{"magicdns", dnsname.FQDN("100.100.100.100.in-addr.arpa."), dnsSymbolicFQDN, dns.RCodeSuccess},
+		{"ipv6_4to6", dnsname.FQDN("4.6.4.6.4.6.2.6.6.9.d.c.3.4.8.4.2.1.b.a.0.e.1.a.c.5.1.1.a.7.d.f.ip6.arpa."), dnsSymbolicFQDN, dns.RCodeSuccess},
 	}
 
 	for _, tt := range tests {
@@ -454,7 +521,7 @@ func TestDelegate(t *testing.T) {
 	// intend to handle responses this large, so there should be truncation.
 	hugeTXT := generateTXT(64000, randSource)
 
-	records := []interface{}{
+	records := []any{
 		"test.site.",
 		resolveToIP(testipv4, testipv6, "dns.test.site."),
 		"LCtesT.SiTe.",
@@ -476,10 +543,10 @@ func TestDelegate(t *testing.T) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".": {
-			dnstype.Resolver{Addr: v4server.PacketConn.LocalAddr().String()},
-			dnstype.Resolver{Addr: v6server.PacketConn.LocalAddr().String()},
+			&dnstype.Resolver{Addr: v4server.PacketConn.LocalAddr().String()},
+			&dnstype.Resolver{Addr: v6server.PacketConn.LocalAddr().String()},
 		},
 	}
 	r.SetConfig(cfg)
@@ -637,8 +704,8 @@ func TestDelegate(t *testing.T) {
 }
 
 func TestDelegateSplitRoute(t *testing.T) {
-	test4 := netaddr.MustParseIP("2.3.4.5")
-	test6 := netaddr.MustParseIP("ff::1")
+	test4 := netip.MustParseAddr("2.3.4.5")
+	test6 := netip.MustParseAddr("ff::1")
 
 	server1 := serveDNS(t, "127.0.0.1:0",
 		"test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
@@ -651,7 +718,7 @@ func TestDelegateSplitRoute(t *testing.T) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".":      {{Addr: server1.PacketConn.LocalAddr().String()}},
 		"other.": {{Addr: server2.PacketConn.LocalAddr().String()}},
 	}
@@ -696,75 +763,6 @@ func TestDelegateSplitRoute(t *testing.T) {
 				t.Errorf("name = %v; want %v", response.name, tt.response.name)
 			}
 		})
-	}
-}
-
-func TestDelegateCollision(t *testing.T) {
-	server := serveDNS(t, "127.0.0.1:0",
-		"test.site.", resolveToIP(testipv4, testipv6, "dns.test.site."))
-	defer server.Shutdown()
-
-	r := newResolver(t)
-	defer r.Close()
-
-	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
-		".": {{Addr: server.PacketConn.LocalAddr().String()}},
-	}
-	r.SetConfig(cfg)
-
-	packets := []struct {
-		qname dnsname.FQDN
-		qtype dns.Type
-		addr  netaddr.IPPort
-	}{
-		{"test.site.", dns.TypeA, netaddr.IPPortFrom(netaddr.IPv4(1, 1, 1, 1), 1001)},
-		{"test.site.", dns.TypeAAAA, netaddr.IPPortFrom(netaddr.IPv4(1, 1, 1, 1), 1002)},
-	}
-
-	// packets will have the same dns txid.
-	for _, p := range packets {
-		payload := dnspacket(p.qname, p.qtype, noEdns)
-		err := r.EnqueueRequest(payload, p.addr)
-		if err != nil {
-			t.Error(err)
-		}
-	}
-
-	// Despite the txid collision, the answer(s) should still match the query.
-	resp, addr, err := r.NextResponse()
-	if err != nil {
-		t.Error(err)
-	}
-
-	var p dns.Parser
-	_, err = p.Start(resp)
-	if err != nil {
-		t.Error(err)
-	}
-	err = p.SkipAllQuestions()
-	if err != nil {
-		t.Error(err)
-	}
-	ans, err := p.AllAnswers()
-	if err != nil {
-		t.Error(err)
-	}
-
-	var wantType dns.Type
-	switch ans[0].Body.(type) {
-	case *dns.AResource:
-		wantType = dns.TypeA
-	case *dns.AAAAResource:
-		wantType = dns.TypeAAAA
-	default:
-		t.Errorf("unexpected answer type: %T", ans[0].Body)
-	}
-
-	for _, p := range packets {
-		if p.qtype == wantType && p.addr != addr {
-			t.Errorf("addr = %v; want %v", addr, p.addr)
-		}
 	}
 }
 
@@ -965,8 +963,6 @@ func TestAllocs(t *testing.T) {
 	}{
 		// Name lowercasing, response slice created by dns.NewBuilder,
 		// and closure allocation from go call.
-		// (Closure allocation only happens when using new register ABI,
-		// which is amd64 with Go 1.17, and probably more platforms later.)
 		{"forward", dnspacket("test1.ipn.dev.", dns.TypeA, noEdns), 3},
 		// 3 extra allocs in rdnsNameToIPv4 and one in marshalPTRRecord (dns.NewName).
 		{"reverse", dnspacket("4.3.2.1.in-addr.arpa.", dns.TypePTR, noEdns), 5},
@@ -1014,7 +1010,7 @@ func BenchmarkFull(b *testing.B) {
 	defer r.Close()
 
 	cfg := dnsCfg
-	cfg.Routes = map[dnsname.FQDN][]dnstype.Resolver{
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
 		".": {{Addr: server.PacketConn.LocalAddr().String()}},
 	}
 
@@ -1030,7 +1026,7 @@ func BenchmarkFull(b *testing.B) {
 	for _, tt := range tests {
 		b.Run(tt.name, func(b *testing.B) {
 			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				syncRespond(r, tt.request)
 			}
 		})
@@ -1048,11 +1044,8 @@ func TestMarshalResponseFormatError(t *testing.T) {
 }
 
 func TestForwardLinkSelection(t *testing.T) {
-	old := initListenConfig
-	defer func() { initListenConfig = old }()
-
 	configCall := make(chan string, 1)
-	initListenConfig = func(nc *net.ListenConfig, mon *monitor.Mon, tunName string) error {
+	tstest.Replace(t, &initListenConfig, func(nc *net.ListenConfig, netMon *netmon.Monitor, tunName string) error {
 		select {
 		case configCall <- tunName:
 			return nil
@@ -1060,21 +1053,27 @@ func TestForwardLinkSelection(t *testing.T) {
 			t.Error("buffer full")
 			return errors.New("buffer full")
 		}
-	}
+	})
 
 	// specialIP is some IP we pretend that our link selector
 	// routes differently.
 	specialIP := netaddr.IPv4(1, 2, 3, 4)
 
-	fwd := newForwarder(t.Logf, nil, nil, linkSelFunc(func(ip netaddr.IP) string {
+	netMon, err := netmon.New(logger.WithPrefix(t.Logf, ".... netmon: "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { netMon.Close() })
+
+	fwd := newForwarder(t.Logf, netMon, linkSelFunc(func(ip netip.Addr) string {
 		if ip == netaddr.IPv4(1, 2, 3, 4) {
 			return "special"
 		}
 		return ""
-	}), new(tsdial.Dialer))
+	}), new(tsdial.Dialer), new(health.Tracker), nil /* no control knobs */)
 
 	// Test non-special IP.
-	if got, err := fwd.packetListener(netaddr.IP{}); err != nil {
+	if got, err := fwd.packetListener(netip.Addr{}); err != nil {
 		t.Fatal(err)
 	} else if got != stdNetPacketListener {
 		t.Errorf("for IP zero value, didn't get expected packet listener")
@@ -1098,30 +1097,30 @@ func TestForwardLinkSelection(t *testing.T) {
 	}
 }
 
-type linkSelFunc func(ip netaddr.IP) string
+type linkSelFunc func(ip netip.Addr) string
 
-func (f linkSelFunc) PickLink(ip netaddr.IP) string { return f(ip) }
+func (f linkSelFunc) PickLink(ip netip.Addr) string { return f(ip) }
 
 func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping test on Windows; waiting for golang.org/issue/33097")
 	}
 
-	records := []interface{}{
+	records := []any{
 		"no-records.test.",
 		dnsHandler(),
 
 		"one-a.test.",
-		dnsHandler(netaddr.MustParseIP("1.2.3.4")),
+		dnsHandler(netip.MustParseAddr("1.2.3.4")),
 
 		"two-a.test.",
-		dnsHandler(netaddr.MustParseIP("1.2.3.4"), netaddr.MustParseIP("5.6.7.8")),
+		dnsHandler(netip.MustParseAddr("1.2.3.4"), netip.MustParseAddr("5.6.7.8")),
 
 		"one-aaaa.test.",
-		dnsHandler(netaddr.MustParseIP("1::2")),
+		dnsHandler(netip.MustParseAddr("1::2")),
 
 		"two-aaaa.test.",
-		dnsHandler(netaddr.MustParseIP("1::2"), netaddr.MustParseIP("3::4")),
+		dnsHandler(netip.MustParseAddr("1::2"), netip.MustParseAddr("3::4")),
 
 		"nx-domain.test.",
 		resolveToNXDOMAIN,
@@ -1174,16 +1173,16 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	}
 
 	t.Run("no_such_host", func(t *testing.T) {
-		res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), backResolver, &response{
-			Header: dnsmessage.Header{
+		res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
+			Header: dns.Header{
 				ID:       123,
 				Response: true,
 				OpCode:   0, // query
 			},
-			Question: dnsmessage.Question{
-				Name:  dnsmessage.MustNewName("nx-domain.test."),
-				Type:  dnsmessage.TypeA,
-				Class: dnsmessage.ClassINET,
+			Question: dns.Question{
+				Name:  dns.MustNewName("nx-domain.test."),
+				Type:  dns.TypeA,
+				Class: dns.ClassINET,
 			},
 		})
 		if err != nil {
@@ -1210,74 +1209,74 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 	}
 
 	tests := []struct {
-		Type  dnsmessage.Type
+		Type  dns.Type
 		Name  string
 		Check func(t testing.TB, got []byte)
 	}{
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "one-a.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05one-a\x04test\x00\x00\x01\x00\x01\x05one-a\x04test\x00\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04"),
 		},
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "two-a.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x05two-a\x04test\x00\x00\x01\x00\x01\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x01\x02\x03\x04\xc0\f\x00\x01\x00\x01\x00\x00\x02X\x00\x04\x05\x06\a\b"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "one-aaaa.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\bone-aaaa\x04test\x00\x00\x1c\x00\x01\bone-aaaa\x04test\x00\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "two-aaaa.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\btwo-aaaa\x04test\x00\x00\x1c\x00\x01\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\xc0\f\x00\x1c\x00\x01\x00\x00\x02X\x00\x10\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04"),
 		},
 		{
-			Type:  dnsmessage.TypePTR,
+			Type:  dns.TypePTR,
 			Name:  "4.3.2.1.in-addr.arpa.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x014\x013\x012\x011\ain-addr\x04arpa\x00\x00\f\x00\x01\x00\x00\x02X\x00\t\x03foo\x03com\x00"),
 		},
 		{
-			Type:  dnsmessage.TypeCNAME,
+			Type:  dns.TypeCNAME,
 			Name:  "cname.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x01\x00\x00\x00\x00\x05cname\x04test\x00\x00\x05\x00\x01\x05cname\x04test\x00\x00\x05\x00\x01\x00\x00\x02X\x00\x10\nthe-target\x03foo\x00"),
 		},
 
 		// No records of various types
 		{
-			Type:  dnsmessage.TypeA,
+			Type:  dns.TypeA,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x01\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeAAAA,
+			Type:  dns.TypeAAAA,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x1c\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeCNAME,
+			Type:  dns.TypeCNAME,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00\x05\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeSRV,
+			Type:  dns.TypeSRV,
 			Name:  "no-records.test.",
 			Check: matchPacked("\x00{\x84\x03\x00\x01\x00\x00\x00\x00\x00\x00\nno-records\x04test\x00\x00!\x00\x01"),
 		},
 		{
-			Type:  dnsmessage.TypeTXT,
+			Type:  dns.TypeTXT,
 			Name:  "txt.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x03\x00\x00\x00\x00\x03txt\x04test\x00\x00\x10\x00\x01\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt1=one\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\t\btxt2=two\x03txt\x04test\x00\x00\x10\x00\x01\x00\x00\x02X\x00\v\ntxt3=three"),
 		},
 		{
-			Type:  dnsmessage.TypeSRV,
+			Type:  dns.TypeSRV,
 			Name:  "srv.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x03srv\x04test\x00\x00!\x00\x01\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x01\x00\x02\x00\x03\x03foo\x03com\x00\x03srv\x04test\x00\x00!\x00\x01\x00\x00\x02X\x00\x0f\x00\x04\x00\x05\x00\x06\x03bar\x03com\x00"),
 		},
 		{
-			Type:  dnsmessage.TypeNS,
+			Type:  dns.TypeNS,
 			Name:  "ns.test.",
 			Check: matchPacked("\x00{\x84\x00\x00\x01\x00\x02\x00\x00\x00\x00\x02ns\x04test\x00\x00\x02\x00\x01\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns1\x03foo\x00\x02ns\x04test\x00\x00\x02\x00\x01\x00\x00\x02X\x00\t\x03ns2\x03bar\x00"),
 		},
@@ -1285,16 +1284,16 @@ func TestHandleExitNodeDNSQueryWithNetPkg(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%v_%v", tt.Type, strings.Trim(tt.Name, ".")), func(t *testing.T) {
-			got, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), backResolver, &response{
-				Header: dnsmessage.Header{
+			got, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), t.Logf, backResolver, &response{
+				Header: dns.Header{
 					ID:       123,
 					Response: true,
 					OpCode:   0, // query
 				},
-				Question: dnsmessage.Question{
-					Name:  dnsmessage.MustNewName(tt.Name),
+				Question: dns.Question{
+					Name:  dns.MustNewName(tt.Name),
 					Type:  tt.Type,
-					Class: dnsmessage.ClassINET,
+					Class: dns.ClassINET,
 				},
 			})
 			if err != nil {
@@ -1447,7 +1446,7 @@ func (a *wrapResolverConn) WriteTo(q []byte, _ net.Addr) (n int, err error) {
 	if resp == nil {
 		return 0, errors.New("bad query")
 	}
-	res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), a.r, resp)
+	res, err := handleExitNodeDNSQueryWithNetPkg(context.Background(), log.Printf, a.r, resp)
 	if err != nil {
 		return 0, err
 	}
@@ -1479,5 +1478,47 @@ func TestUnARPA(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("unARPA(%q) = %q; want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+// TestServfail validates that a SERVFAIL error response is returned if
+// all upstream resolvers respond with SERVFAIL.
+//
+// See: https://github.com/tailscale/tailscale/issues/4722
+func TestServfail(t *testing.T) {
+	server := serveDNS(t, "127.0.0.1:0", "test.site.", miekdns.HandlerFunc(func(w miekdns.ResponseWriter, req *miekdns.Msg) {
+		m := new(miekdns.Msg)
+		m.Rcode = miekdns.RcodeServerFailure
+		w.WriteMsg(m)
+	}))
+	defer server.Shutdown()
+
+	r := newResolver(t)
+	defer r.Close()
+
+	cfg := dnsCfg
+	cfg.Routes = map[dnsname.FQDN][]*dnstype.Resolver{
+		".": {{Addr: server.PacketConn.LocalAddr().String()}},
+	}
+	r.SetConfig(cfg)
+
+	pkt, err := syncRespond(r, dnspacket("test.site.", dns.TypeA, noEdns))
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+
+	wantPkt := []byte{
+		0x00, 0x00, // transaction id: 0
+		0x84, 0x02, // flags: response, authoritative, error: servfail
+		0x00, 0x01, // one question
+		0x00, 0x00, // no answers
+		0x00, 0x00, 0x00, 0x00, // no authority or additional RRs
+		// Question:
+		0x04, 0x74, 0x65, 0x73, 0x74, 0x04, 0x73, 0x69, 0x74, 0x65, 0x00, // name
+		0x00, 0x01, 0x00, 0x01, // type A, class IN
+	}
+
+	if !bytes.Equal(pkt, wantPkt) {
+		t.Errorf("response was %X, want %X", pkt, wantPkt)
 	}
 }

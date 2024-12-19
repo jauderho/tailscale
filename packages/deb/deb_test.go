@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package deb
 
@@ -16,8 +15,8 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/goreleaser/nfpm"
-	_ "github.com/goreleaser/nfpm/deb"
+	"github.com/goreleaser/nfpm/v2"
+	_ "github.com/goreleaser/nfpm/v2/deb"
 )
 
 func TestDebInfo(t *testing.T) {
@@ -39,6 +38,7 @@ func TestDebInfo(t *testing.T) {
 					"Section", "net",
 					"Priority", "extra",
 					"Architecture", "amd64",
+					"Maintainer", "Tail Scalar",
 					"Installed-Size", "0",
 					"Description", "test package"),
 			},
@@ -55,6 +55,7 @@ func TestDebInfo(t *testing.T) {
 					"Section", "net",
 					"Priority", "extra",
 					"Architecture", "arm64",
+					"Maintainer", "Tail Scalar",
 					"Installed-Size", "0",
 					"Description", "test package"),
 			},
@@ -71,6 +72,7 @@ func TestDebInfo(t *testing.T) {
 					"Section", "net",
 					"Priority", "extra",
 					"Architecture", "amd64",
+					"Maintainer", "Tail Scalar",
 					"Installed-Size", "0",
 					"Description", "test package"),
 			},
@@ -141,7 +143,7 @@ func TestDebInfo(t *testing.T) {
 	}
 }
 
-func diff(got, want interface{}) string {
+func diff(got, want any) string {
 	matchField := func(name string) func(p cmp.Path) bool {
 		return func(p cmp.Path) bool {
 			if len(p) != 3 {
@@ -168,6 +170,7 @@ func mkTestDeb(version, arch string) []byte {
 		Version:     version,
 		Section:     "net",
 		Priority:    "extra",
+		Maintainer:  "Tail Scalar",
 	})
 
 	pkg, err := nfpm.Get("deb")

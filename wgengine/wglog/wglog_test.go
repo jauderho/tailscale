@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wglog_test
 
@@ -18,22 +17,22 @@ import (
 func TestLogger(t *testing.T) {
 	tests := []struct {
 		format string
-		args   []interface{}
+		args   []any
 		want   string
 		omit   bool
 	}{
-		{"hi", nil, "hi", false},
+		{"hi", nil, "wg: hi", false},
 		{"Routine: starting", nil, "", true},
-		{"%v says it misses you", []interface{}{stringer("peer(IMTB…r7lM)")}, "[IMTBr] says it misses you", false},
+		{"%v says it misses you", []any{stringer("peer(IMTB…r7lM)")}, "wg: [IMTBr] says it misses you", false},
 	}
 
 	type log struct {
 		format string
-		args   []interface{}
+		args   []any
 	}
 
 	c := make(chan log, 1)
-	logf := func(format string, args ...interface{}) {
+	logf := func(format string, args ...any) {
 		select {
 		case c <- log{format, args}:
 		default:
@@ -65,6 +64,23 @@ func TestLogger(t *testing.T) {
 	}
 }
 
+func TestSuppressLogs(t *testing.T) {
+	var logs []string
+	logf := func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+	x := wglog.NewLogger(logf)
+	x.DeviceLogger.Verbosef("pass")
+	x.DeviceLogger.Verbosef("UAPI: Adding allowedip")
+
+	if len(logs) != 1 {
+		t.Fatalf("got %d logs, want 1", len(logs))
+	}
+	if logs[0] != "wg: [v2] pass" {
+		t.Errorf("got %q, want \"wg: [v2] pass\"", logs[0])
+	}
+}
+
 func stringer(s string) stringerString {
 	return stringerString(s)
 }
@@ -77,7 +93,7 @@ func BenchmarkSetPeers(b *testing.B) {
 	b.ReportAllocs()
 	x := wglog.NewLogger(logger.Discard)
 	peers := [][]wgcfg.Peer{genPeers(0), genPeers(15), genPeers(16), genPeers(15)}
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		for _, p := range peers {
 			x.SetPeers(p)
 		}

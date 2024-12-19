@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -15,7 +14,7 @@ import (
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
-	"tailscale.com/types/key"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
@@ -36,11 +35,13 @@ func startMesh(s *derp.Server) error {
 
 func startMeshWithHost(s *derp.Server, host string) error {
 	logf := logger.WithPrefix(log.Printf, fmt.Sprintf("mesh(%q): ", host))
-	c, err := derphttp.NewClient(s.PrivateKey(), "https://"+host+"/derp", logf)
+	netMon := netmon.NewStatic() // good enough for cmd/derper; no need for netns fanciness
+	c, err := derphttp.NewClient(s.PrivateKey(), "https://"+host+"/derp", logf, netMon)
 	if err != nil {
 		return err
 	}
 	c.MeshKey = s.MeshKey()
+	c.WatchConnectionChanges = true
 
 	// For meshed peers within a region, connect via VPC addresses.
 	c.SetURLDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -50,8 +51,7 @@ func startMeshWithHost(s *derp.Server, host string) error {
 		}
 		var d net.Dialer
 		var r net.Resolver
-		if port == "443" && strings.HasSuffix(host, ".tailscale.com") {
-			base := strings.TrimSuffix(host, ".tailscale.com")
+		if base, ok := strings.CutSuffix(host, ".tailscale.com"); ok && port == "443" {
 			subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
 			vpcHost := base + "-vpc.tailscale.com"
@@ -69,8 +69,8 @@ func startMeshWithHost(s *derp.Server, host string) error {
 		return d.DialContext(ctx, network, addr)
 	})
 
-	add := func(k key.NodePublic) { s.AddPacketForwarder(k, c) }
-	remove := func(k key.NodePublic) { s.RemovePacketForwarder(k, c) }
+	add := func(m derp.PeerPresentMessage) { s.AddPacketForwarder(m.Key, c) }
+	remove := func(m derp.PeerGoneMessage) { s.RemovePacketForwarder(m.Peer, c) }
 	go c.RunWatchConnectionLoop(context.Background(), s.PublicKey(), logf, add, remove)
 	return nil
 }

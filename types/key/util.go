@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -11,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"go4.org/mem"
 )
@@ -42,19 +42,19 @@ func rand(b []byte) {
 // existing uses and whether you should clamp private keys at
 // creation.
 //
-//  - NaCl box: yes, clamp at creation.
-//  - WireGuard (userspace uapi or kernel): no, do not clamp.
-//  - Noise protocols: no, do not clamp.
+//   - NaCl box: yes, clamp at creation.
+//   - WireGuard (userspace uapi or kernel): no, do not clamp.
+//   - Noise protocols: no, do not clamp.
 func clamp25519Private(b []byte) {
 	b[0] &= 248
 	b[31] = (b[31] & 127) | 64
 }
 
-func toHex(k []byte, prefix string) []byte {
-	ret := make([]byte, len(prefix)+len(k)*2)
-	copy(ret, prefix)
-	hex.Encode(ret[len(prefix):], k)
-	return ret
+func appendHexKey(dst []byte, prefix string, key []byte) []byte {
+	dst = slices.Grow(dst, len(prefix)+hex.EncodedLen(len(key)))
+	dst = append(dst, prefix...)
+	dst = hex.AppendEncode(dst, key)
+	return dst
 }
 
 // parseHex decodes a key string of the form "<prefix><hex string>"

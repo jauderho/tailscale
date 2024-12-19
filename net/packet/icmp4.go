@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
@@ -24,6 +23,7 @@ const (
 	ICMP4EchoRequest  ICMP4Type = 0x08
 	ICMP4Unreachable  ICMP4Type = 0x03
 	ICMP4TimeExceeded ICMP4Type = 0x0b
+	ICMP4ParamProblem ICMP4Type = 0x12
 )
 
 func (t ICMP4Type) String() string {
@@ -36,6 +36,8 @@ func (t ICMP4Type) String() string {
 		return "Unreachable"
 	case ICMP4TimeExceeded:
 		return "TimeExceeded"
+	case ICMP4ParamProblem:
+		return "ParamProblem"
 	default:
 		return "Unknown"
 	}

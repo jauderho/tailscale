@@ -1,33 +1,35 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"github.com/toqueteos/webbrowser"
-	"inet.af/netaddr"
-	"tailscale.com/client/tailscale"
+	"golang.org/x/net/idna"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/util/dnsname"
 )
 
 var statusCmd = &ffcli.Command{
 	Name:       "status",
-	ShortUsage: "status [--active] [--web] [--json]",
+	ShortUsage: "tailscale status [--active] [--web] [--json]",
 	ShortHelp:  "Show state of tailscaled and its connections",
 	LongHelp: strings.TrimSpace(`
 
@@ -69,7 +71,14 @@ var statusArgs struct {
 }
 
 func runStatus(ctx context.Context, args []string) error {
-	st, err := tailscale.Status(ctx)
+	if len(args) > 0 {
+		return errors.New("unexpected non-flag arguments to 'tailscale status'")
+	}
+	getStatus := localClient.Status
+	if !statusArgs.peers {
+		getStatus = localClient.StatusWithoutPeers
+	}
+	st, err := getStatus(ctx)
 	if err != nil {
 		return fixTailscaledConnectError(err)
 	}
@@ -93,7 +102,7 @@ func runStatus(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		statusURL := interfaces.HTTPOfListener(ln)
+		statusURL := netmon.HTTPOfListener(ln)
 		printf("Serving Tailscale status at %v ...\n", statusURL)
 		go func() {
 			<-ctx.Done()
@@ -107,7 +116,7 @@ func runStatus(ctx context.Context, args []string) error {
 				http.NotFound(w, r)
 				return
 			}
-			st, err := tailscale.Status(ctx)
+			st, err := localClient.Status(ctx)
 			if err != nil {
 				http.Error(w, err.Error(), 500)
 				return
@@ -121,22 +130,27 @@ func runStatus(ctx context.Context, args []string) error {
 		return err
 	}
 
-	description, ok := isRunningOrStarting(st)
-	if !ok {
-		outln(description)
-		os.Exit(1)
-	}
-
-	if len(st.Health) > 0 {
+	printHealth := func() {
 		printf("# Health check:\n")
 		for _, m := range st.Health {
 			printf("#     - %s\n", m)
 		}
-		outln()
+	}
+
+	description, ok := isRunningOrStarting(st)
+	if !ok {
+		// print health check information if we're in a weird state, as it might
+		// provide context about why we're in that weird state.
+		if len(st.Health) > 0 && (st.BackendState == ipn.Starting.String() || st.BackendState == ipn.NoState.String()) {
+			printHealth()
+			outln()
+		}
+		outln(description)
+		os.Exit(1)
 	}
 
 	var buf bytes.Buffer
-	f := func(format string, a ...interface{}) { fmt.Fprintf(&buf, format, a...) }
+	f := func(format string, a ...any) { fmt.Fprintf(&buf, format, a...) }
 	printPS := func(ps *ipnstate.PeerStatus) {
 		f("%-15s %-20s %-12s %-7s ",
 			firstIPString(ps.TailscaleIPs),
@@ -187,11 +201,19 @@ func runStatus(ctx context.Context, args []string) error {
 	if statusArgs.self && st.Self != nil {
 		printPS(st.Self)
 	}
+
+	locBasedExitNode := false
 	if statusArgs.peers {
 		var peers []*ipnstate.PeerStatus
 		for _, peer := range st.Peers() {
 			ps := st.Peer[peer]
 			if ps.ShareeNode {
+				continue
+			}
+			if ps.Location != nil && ps.ExitNodeOption && !ps.ExitNode {
+				// Location based exit nodes are only shown with the
+				// `exit-node list` command.
+				locBasedExitNode = true
 				continue
 			}
 			peers = append(peers, ps)
@@ -205,7 +227,51 @@ func runStatus(ctx context.Context, args []string) error {
 		}
 	}
 	Stdout.Write(buf.Bytes())
+	if locBasedExitNode {
+		outln()
+		printf("# To see the full list of exit nodes, including location-based exit nodes, run `tailscale exit-node list`  \n")
+	}
+	if len(st.Health) > 0 {
+		outln()
+		printHealth()
+	}
+	printFunnelStatus(ctx)
 	return nil
+}
+
+// printFunnelStatus prints the status of the funnel, if it's running.
+// It prints nothing if the funnel is not running.
+func printFunnelStatus(ctx context.Context) {
+	sc, err := localClient.GetServeConfig(ctx)
+	if err != nil {
+		outln()
+		printf("# Funnel:\n")
+		printf("#     - Unable to get Funnel status: %v\n", err)
+		return
+	}
+	if !sc.IsFunnelOn() {
+		return
+	}
+	outln()
+	printf("# Funnel on:\n")
+	for hp, on := range sc.AllowFunnel {
+		if !on { // if present, should be on
+			continue
+		}
+		sni, portStr, _ := net.SplitHostPort(string(hp))
+		p, _ := strconv.ParseUint(portStr, 10, 16)
+		isTCP := sc.IsTCPForwardingOnPort(uint16(p))
+		url := "https://"
+		if isTCP {
+			url = "tcp://"
+		}
+		url += sni
+		if isTCP || p != 443 {
+			url += ":" + portStr
+		}
+		printf("#     - %s\n", url)
+	}
+	outln()
 }
 
 // isRunningOrStarting reports whether st is in state Running or Starting.
@@ -223,7 +289,7 @@ func isRunningOrStarting(st *ipnstate.Status) (description string, ok bool) {
 		}
 		return s, false
 	case ipn.NeedsMachineAuth.String():
-		return "Machine is not yet authorized by tailnet admin.", false
+		return "Machine is not yet approved by tailnet admin.", false
 	case ipn.Running.String(), ipn.Starting.String():
 		return st.BackendState, true
 	}
@@ -232,18 +298,31 @@ func isRunningOrStarting(st *ipnstate.Status) (description string, ok bool) {
 func dnsOrQuoteHostname(st *ipnstate.Status, ps *ipnstate.PeerStatus) string {
 	baseName := dnsname.TrimSuffix(ps.DNSName, st.MagicDNSSuffix)
 	if baseName != "" {
+		if strings.HasPrefix(baseName, "xn-") {
+			if u, err := idna.ToUnicode(baseName); err == nil {
+				return fmt.Sprintf("%s (%s)", baseName, u)
+			}
+		}
 		return baseName
 	}
 	return fmt.Sprintf("(%q)", dnsname.SanitizeHostname(ps.HostName))
 }
 
 func ownerLogin(st *ipnstate.Status, ps *ipnstate.PeerStatus) string {
-	if ps.UserID.IsZero() {
+	// We prioritize showing the name of the sharer as the owner of a node if
+	// it's different from the node's user. This is less surprising: if user B
+	// from a company shares user's C node from the same company with user A who
+	// don't know user C, user A might be surprised to see user C listed in
+	// their netmap. We've historically (2021-01..2023-08) always shown the
+	// sharer's name in the UI. Perhaps we want to show both here? But the CLI's
+	// a bit space constrained.
+	uid := cmp.Or(ps.AltSharerUserID, ps.UserID)
+	if uid.IsZero() {
 		return "-"
 	}
-	u, ok := st.User[ps.UserID]
+	u, ok := st.User[uid]
 	if !ok {
-		return fmt.Sprint(ps.UserID)
+		return fmt.Sprint(uid)
 	}
 	if i := strings.Index(u.LoginName, "@"); i != -1 {
 		return u.LoginName[:i+1]
@@ -251,7 +330,7 @@ func ownerLogin(st *ipnstate.Status, ps *ipnstate.PeerStatus) string {
 	return u.LoginName
 }
 
-func firstIPString(v []netaddr.IP) string {
+func firstIPString(v []netip.Addr) string {
 	if len(v) == 0 {
 		return ""
 	}
